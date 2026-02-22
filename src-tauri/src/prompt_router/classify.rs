@@ -1,0 +1,295 @@
+use crate::prompt_router::{ModeInfo, RouterInput, RouterOutput};
+
+#[derive(Debug)]
+pub struct ClassificationError {
+    pub message: String,
+}
+
+impl std::fmt::Display for ClassificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Classification error: {}", self.message)
+    }
+}
+
+impl std::error::Error for ClassificationError {}
+
+/// Trait for making LLM completion calls. Implementations will wrap actual
+/// provider APIs (OpenAI, Anthropic, etc.)
+pub trait LlmClient: Send + Sync {
+    fn complete(&self, prompt: &str, model: &str) -> Result<String, ClassificationError>;
+}
+
+/// Build the classification prompt using mode metadata and compacted context.
+pub fn build_classification_prompt(input: &RouterInput) -> String {
+    let modes = if input.available_modes.is_empty() {
+        "- (none provided)".to_string()
+    } else {
+        input
+            .available_modes
+            .iter()
+            .map(|mode| format!("- {}: {}", mode.name, mode.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let languages = list_or_none(&input.project_context.languages);
+    let frameworks = list_or_none(&input.project_context.frameworks);
+    let file_structure = list_or_none(&input.project_context.file_structure_hints);
+
+    format!(
+        "You are a prompt router. Given the user's prompt and project context, select the best mode and model.\n\n\
+Available modes:\n\
+{}\n\n\
+Project context:\n\
+Languages: [{}]\n\
+Frameworks: [{}]\n\
+File structure: [{}]\n\n\
+Conversation so far: {}\n\n\
+User prompt: {}\n\n\
+Respond with ONLY a JSON object:\n\
+{{\"mode\": \"<mode_name>\", \"model\": \"<model_id>\", \"confidence\": <0.0-1.0>}}",
+        modes,
+        languages,
+        frameworks,
+        file_structure,
+        input.conversation_history.messages_summary,
+        input.prompt
+    )
+}
+
+pub fn classify(
+    input: &RouterInput,
+    llm_client: &dyn LlmClient,
+    router_model: &str,
+) -> Result<RouterOutput, ClassificationError> {
+    let prompt = build_classification_prompt(input);
+    let response = llm_client.complete(&prompt, router_model)?;
+    parse_classification_response(&response, &input.available_modes)
+}
+
+pub fn parse_classification_response(
+    response: &str,
+    available_modes: &[ModeInfo],
+) -> Result<RouterOutput, ClassificationError> {
+    let trimmed = response.trim();
+
+    let mut output = match serde_json::from_str::<RouterOutput>(trimmed) {
+        Ok(parsed) => parsed,
+        Err(primary_err) => {
+            let first_brace = trimmed.find('{');
+            let last_brace = trimmed.rfind('}');
+
+            if let (Some(start), Some(end)) = (first_brace, last_brace) {
+                if start <= end {
+                    let candidate = &trimmed[start..=end];
+                    serde_json::from_str::<RouterOutput>(candidate).map_err(|fallback_err| {
+                        ClassificationError {
+                            message: format!(
+                                "failed to parse classification response as JSON (direct parse: {}; extracted parse: {}). raw response: {}",
+                                primary_err, fallback_err, response
+                            ),
+                        }
+                    })?
+                } else {
+                    return Err(ClassificationError {
+                        message: format!(
+                            "failed to parse classification response as JSON (direct parse: {}). raw response: {}",
+                            primary_err, response
+                        ),
+                    });
+                }
+            } else {
+                return Err(ClassificationError {
+                    message: format!(
+                        "failed to parse classification response as JSON (direct parse: {}). raw response: {}",
+                        primary_err, response
+                    ),
+                });
+            }
+        }
+    };
+
+    if !available_modes.iter().any(|mode| mode.name == output.mode) {
+        return Err(ClassificationError {
+            message: format!(
+                "classifier returned unknown mode '{}'. available modes: [{}]",
+                output.mode,
+                available_modes
+                    .iter()
+                    .map(|mode| mode.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&output.confidence) {
+        eprintln!(
+            "warning: classifier confidence {} is out of range; clamping to 0.0..=1.0",
+            output.confidence
+        );
+        output.confidence = output.confidence.clamp(0.0, 1.0);
+    }
+
+    Ok(output)
+}
+
+fn list_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prompt_router::{CompactedContext, ProjectContext, PromptSource, RouterInput};
+
+    struct MockLlmClient {
+        response: String,
+    }
+
+    impl LlmClient for MockLlmClient {
+        fn complete(&self, _prompt: &str, _model: &str) -> Result<String, ClassificationError> {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn sample_input() -> RouterInput {
+        RouterInput {
+            source: PromptSource::User,
+            prompt: "Implement auth middleware".to_string(),
+            available_modes: vec![
+                ModeInfo {
+                    name: "Plan".to_string(),
+                    description: "Structured decomposition".to_string(),
+                },
+                ModeInfo {
+                    name: "Implement".to_string(),
+                    description: "Code generation".to_string(),
+                },
+            ],
+            conversation_history: CompactedContext {
+                messages_summary: "User is building a Rust web service".to_string(),
+                learnings: vec![],
+                preserved_facts: vec![],
+                token_count: 42,
+            },
+            project_context: ProjectContext {
+                languages: vec!["Rust".to_string(), "TypeScript".to_string()],
+                frameworks: vec!["Tauri".to_string()],
+                file_structure_hints: vec!["src-tauri/src/".to_string(), "src/".to_string()],
+            },
+        }
+    }
+
+    #[test]
+    fn build_prompt_contains_required_sections() {
+        let input = sample_input();
+        let prompt = build_classification_prompt(&input);
+
+        assert!(prompt.contains("Available modes:"));
+        assert!(prompt.contains("- Plan: Structured decomposition"));
+        assert!(prompt.contains("- Implement: Code generation"));
+        assert!(prompt.contains("Project context:"));
+        assert!(prompt.contains("Languages: [Rust, TypeScript]"));
+        assert!(prompt.contains("Frameworks: [Tauri]"));
+        assert!(prompt.contains("File structure: [src-tauri/src/, src/]"));
+        assert!(prompt.contains("Conversation so far: User is building a Rust web service"));
+        assert!(prompt.contains("User prompt: Implement auth middleware"));
+    }
+
+    #[test]
+    fn parse_clean_json() {
+        let modes = vec![ModeInfo {
+            name: "Plan".to_string(),
+            description: "Structured decomposition".to_string(),
+        }];
+
+        let result = parse_classification_response(
+            r#"{"mode":"Plan","model":"claude-sonnet","confidence":0.75}"#,
+            &modes,
+        )
+        .unwrap();
+
+        assert_eq!(result.mode, "Plan");
+        assert_eq!(result.model, "claude-sonnet");
+        assert_eq!(result.confidence, 0.75);
+    }
+
+    #[test]
+    fn parse_json_with_surrounding_text() {
+        let modes = vec![ModeInfo {
+            name: "Implement".to_string(),
+            description: "Code generation".to_string(),
+        }];
+
+        let result = parse_classification_response(
+            "Here is your answer:\n{\"mode\":\"Implement\",\"model\":\"gpt-4.1\",\"confidence\":0.8}\nThanks!",
+            &modes,
+        )
+        .unwrap();
+
+        assert_eq!(result.mode, "Implement");
+        assert_eq!(result.model, "gpt-4.1");
+        assert_eq!(result.confidence, 0.8);
+    }
+
+    #[test]
+    fn parse_invalid_response_returns_error() {
+        let modes = vec![ModeInfo {
+            name: "Plan".to_string(),
+            description: "Structured decomposition".to_string(),
+        }];
+
+        let err = parse_classification_response("not json", &modes).unwrap_err();
+        assert!(err.message.contains("raw response: not json"));
+    }
+
+    #[test]
+    fn rejects_unknown_mode() {
+        let modes = vec![ModeInfo {
+            name: "Plan".to_string(),
+            description: "Structured decomposition".to_string(),
+        }];
+
+        let err = parse_classification_response(
+            r#"{"mode":"Debug","model":"claude","confidence":0.5}"#,
+            &modes,
+        )
+        .unwrap_err();
+
+        assert!(err.message.contains("unknown mode 'Debug'"));
+    }
+
+    #[test]
+    fn clamps_confidence_above_one() {
+        let modes = vec![ModeInfo {
+            name: "Plan".to_string(),
+            description: "Structured decomposition".to_string(),
+        }];
+
+        let result = parse_classification_response(
+            r#"{"mode":"Plan","model":"claude","confidence":1.5}"#,
+            &modes,
+        )
+        .unwrap();
+
+        assert_eq!(result.confidence, 1.0);
+    }
+
+    #[test]
+    fn classify_calls_client_and_parses_result() {
+        let input = sample_input();
+        let llm = MockLlmClient {
+            response: r#"{"mode":"Plan","model":"claude-3-7-sonnet","confidence":0.6}"#.to_string(),
+        };
+
+        let result = classify(&input, &llm, "router-model").unwrap();
+        assert_eq!(result.mode, "Plan");
+        assert_eq!(result.model, "claude-3-7-sonnet");
+        assert_eq!(result.confidence, 0.6);
+    }
+}
