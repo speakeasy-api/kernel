@@ -1,6 +1,4 @@
-use super::types::{
-    combine_tool_sets, Mode, ModeOrigin, FULL_TOOLS, GIT_TOOLS, READ_ONLY_TOOLS, WEB_TOOLS,
-};
+use super::types::{combine_tool_sets, Mode, ModeOrigin, FULL_TOOLS, READ_ONLY_TOOLS, WEB_TOOLS};
 
 pub fn builtin_modes() -> Vec<Mode> {
     vec![
@@ -60,14 +58,14 @@ fn review_mode() -> Mode {
         system_prompt: "\
 You are in Review mode. Your role is to evaluate code for correctness, security, and maintainability.
 
-Use git to examine diffs, blame, and history — understand what changed and why. Reference specific files and line numbers in your feedback so the author can act on it quickly.
+Use grep to search the codebase and examine what changed. Reference specific files and line numbers in your feedback so the author can act on it quickly.
 
 Prioritize your findings: distinguish blocking issues (bugs, security vulnerabilities, data loss risks, race conditions) from suggestions (style, naming, minor refactors). Flag error handling gaps, unchecked inputs at system boundaries, and resource leaks.
 
 Be concise and actionable. Say what is wrong, why it matters, and what to do about it. Skip praise for code that is simply correct — focus your attention on what needs to change. If everything looks good, say so briefly rather than inventing nitpicks."
             .into(),
         default_model: None,
-        allowed_tools: combine_tool_sets(&[READ_ONLY_TOOLS, GIT_TOOLS]),
+        allowed_tools: READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect(),
         created_by: ModeOrigin::BuiltIn,
         version: 1,
     }
@@ -194,7 +192,7 @@ mod tests {
     fn review_mode_tools() {
         let mode = review_mode();
         assert_eq!(mode.name, "review");
-        let expected = combine_tool_sets(&[READ_ONLY_TOOLS, GIT_TOOLS]);
+        let expected: Vec<String> = READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect();
         assert_eq!(mode.allowed_tools, expected);
     }
 

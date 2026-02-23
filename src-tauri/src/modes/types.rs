@@ -48,9 +48,8 @@ impl FromStr for ModeOrigin {
 
 pub const READ_ONLY_TOOLS: &[&str] = &["fs_read", "glob", "grep"];
 pub const READ_WRITE_TOOLS: &[&str] = &["fs_read", "fs_write", "glob", "grep"];
-pub const FULL_TOOLS: &[&str] = &["fs_read", "fs_write", "glob", "grep", "shell", "git"];
+pub const FULL_TOOLS: &[&str] = &["fs_read", "fs_write", "glob", "grep", "shell"];
 pub const WEB_TOOLS: &[&str] = &["web_search", "web_fetch"];
-pub const GIT_TOOLS: &[&str] = &["git"];
 
 pub fn combine_tool_sets(sets: &[&[&str]]) -> Vec<String> {
     let mut tools: Vec<String> = sets
@@ -120,8 +119,11 @@ mod tests {
 
     #[test]
     fn combine_tool_sets_deduplicates_and_sorts() {
-        let combined = combine_tool_sets(&[READ_ONLY_TOOLS, GIT_TOOLS]);
-        assert_eq!(combined, vec!["fs_read", "git", "glob", "grep"]);
+        let combined = combine_tool_sets(&[READ_ONLY_TOOLS, WEB_TOOLS]);
+        assert_eq!(
+            combined,
+            vec!["fs_read", "glob", "grep", "web_fetch", "web_search"]
+        );
     }
 
     #[test]
@@ -129,7 +131,7 @@ mod tests {
         let combined = combine_tool_sets(&[READ_ONLY_TOOLS, FULL_TOOLS]);
         assert_eq!(
             combined,
-            vec!["fs_read", "fs_write", "git", "glob", "grep", "shell"]
+            vec!["fs_read", "fs_write", "glob", "grep", "shell"]
         );
     }
 

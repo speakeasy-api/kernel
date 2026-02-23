@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use sqlx::SqlitePool;
+
 use super::db;
 use super::types::{Mode, ModeOrigin};
 
@@ -184,7 +186,7 @@ pub fn scan_mode_files(project_root: &Path) -> Vec<Mode> {
         match parse_mode_file(&path) {
             Ok(mode) => modes.push(mode),
             Err(e) => {
-                eprintln!("warning: skipping mode file {}: {e}", path.display());
+                tracing::warn!(path = %path.display(), error = %e, "skipping mode file");
             }
         }
     }
@@ -194,11 +196,12 @@ pub fn scan_mode_files(project_root: &Path) -> Vec<Mode> {
 /// Sync mode files to database. For each file-based mode, upsert into DB.
 /// File-based modes take precedence over DB state.
 /// Returns the number of modes synced.
-pub fn sync_modes_to_db(conn: &rusqlite::Connection, project_root: &Path) -> Result<usize, String> {
+pub async fn sync_modes_to_db(pool: &SqlitePool, project_root: &Path) -> Result<usize, String> {
     let modes = scan_mode_files(project_root);
     let count = modes.len();
     for mode in &modes {
-        db::upsert_mode(conn, mode)
+        db::upsert_mode(pool, mode)
+            .await
             .map_err(|e| format!("failed to upsert mode '{}': {e}", mode.name))?;
     }
     Ok(count)
@@ -207,7 +210,7 @@ pub fn sync_modes_to_db(conn: &rusqlite::Connection, project_root: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modes::db::ensure_modes_table;
+    use crate::db::test_pool;
     use std::fs;
     use tempfile::TempDir;
 
@@ -217,7 +220,7 @@ mod tests {
 name = "database"
 description = "Database migration and schema work"
 default_model = "claude-sonnet-4-20250514"
-allowed_tools = ["fs_read", "fs_write", "glob", "grep", "shell", "git"]
+allowed_tools = ["fs_read", "fs_write", "glob", "grep", "shell"]
 system_prompt = """
 You are a database specialist.
 """
@@ -233,7 +236,7 @@ version = 1
             mode.default_model,
             Some("claude-sonnet-4-20250514".to_string())
         );
-        assert_eq!(mode.allowed_tools.len(), 6);
+        assert_eq!(mode.allowed_tools.len(), 5);
         assert_eq!(mode.created_by, ModeOrigin::User);
         assert_eq!(mode.version, 1);
         assert!(mode.system_prompt.contains("database specialist"));
@@ -289,7 +292,6 @@ allowed_tools:
   - glob
   - grep
   - shell
-  - git
 origin: user
 version: 1
 ---
@@ -304,9 +306,9 @@ Focus on migrations and schema design."#;
             mode.default_model,
             Some("claude-sonnet-4-20250514".to_string())
         );
-        assert_eq!(mode.allowed_tools.len(), 6);
+        assert_eq!(mode.allowed_tools.len(), 5);
         assert_eq!(mode.allowed_tools[0], "fs_read");
-        assert_eq!(mode.allowed_tools[5], "git");
+        assert_eq!(mode.allowed_tools[4], "shell");
         assert_eq!(mode.created_by, ModeOrigin::User);
         assert_eq!(mode.version, 1);
         assert!(mode.system_prompt.contains("database specialist"));
@@ -484,8 +486,8 @@ system_prompt = "You are good."
         assert!(modes.is_empty());
     }
 
-    #[test]
-    fn sync_modes_to_db_upserts() {
+    #[tokio::test]
+    async fn sync_modes_to_db_upserts() {
         let dir = TempDir::new().unwrap();
         let modes_dir = dir.path().join(".kernel").join("modes");
         fs::create_dir_all(&modes_dir).unwrap();
@@ -501,25 +503,23 @@ system_prompt = "You sync."
         )
         .unwrap();
 
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_modes_table(&conn).unwrap();
+        let pool = test_pool().await;
 
-        let count = sync_modes_to_db(&conn, dir.path()).unwrap();
+        let count = sync_modes_to_db(&pool, dir.path()).await.unwrap();
         assert_eq!(count, 1);
 
-        let mode = crate::modes::db::get_mode(&conn, "sync").unwrap().unwrap();
+        let mode = crate::modes::db::get_mode(&pool, "sync").await.unwrap().unwrap();
         assert_eq!(mode.description, "Sync mode");
         assert_eq!(mode.allowed_tools, vec!["fs_read", "grep"]);
     }
 
-    #[test]
-    fn sync_modes_overwrites_existing() {
+    #[tokio::test]
+    async fn sync_modes_overwrites_existing() {
         let dir = TempDir::new().unwrap();
         let modes_dir = dir.path().join(".kernel").join("modes");
         fs::create_dir_all(&modes_dir).unwrap();
 
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_modes_table(&conn).unwrap();
+        let pool = test_pool().await;
 
         // Insert a mode into DB first
         let existing = Mode {
@@ -531,7 +531,7 @@ system_prompt = "You sync."
             created_by: ModeOrigin::User,
             version: 1,
         };
-        crate::modes::db::create_mode(&conn, &existing).unwrap();
+        crate::modes::db::create_mode(&pool, &existing).await.unwrap();
 
         // Now create a file that should overwrite it
         fs::write(
@@ -545,10 +545,11 @@ system_prompt = "new prompt"
         )
         .unwrap();
 
-        let count = sync_modes_to_db(&conn, dir.path()).unwrap();
+        let count = sync_modes_to_db(&pool, dir.path()).await.unwrap();
         assert_eq!(count, 1);
 
-        let mode = crate::modes::db::get_mode(&conn, "overwrite")
+        let mode = crate::modes::db::get_mode(&pool, "overwrite")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(mode.description, "new description");
@@ -557,13 +558,12 @@ system_prompt = "new prompt"
         assert_eq!(mode.version, 2); // upsert increments version
     }
 
-    #[test]
-    fn sync_empty_dir() {
+    #[tokio::test]
+    async fn sync_empty_dir() {
         let dir = TempDir::new().unwrap();
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        ensure_modes_table(&conn).unwrap();
+        let pool = test_pool().await;
 
-        let count = sync_modes_to_db(&conn, dir.path()).unwrap();
+        let count = sync_modes_to_db(&pool, dir.path()).await.unwrap();
         assert_eq!(count, 0);
     }
 }

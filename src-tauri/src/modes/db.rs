@@ -1,5 +1,6 @@
+use sqlx::SqlitePool;
+
 use super::types::{Mode, ModeOrigin};
-use rusqlite::{params, Connection, Result as SqlResult};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModeError {
@@ -8,119 +9,128 @@ pub enum ModeError {
     #[error("mode not found: {0}")]
     NotFound(String),
     #[error("database error: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] sqlx::Error),
 }
 
-pub fn ensure_modes_table(conn: &Connection) -> SqlResult<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS modes (
-            name TEXT PRIMARY KEY,
-            description TEXT NOT NULL,
-            system_prompt TEXT NOT NULL,
-            default_model TEXT,
-            allowed_tools TEXT NOT NULL,
-            origin TEXT NOT NULL,
-            version INTEGER NOT NULL DEFAULT 1,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );",
-    )?;
-    Ok(())
+#[derive(sqlx::FromRow)]
+struct ModeRow {
+    name: String,
+    description: String,
+    system_prompt: String,
+    default_model: Option<String>,
+    allowed_tools: String,
+    origin: String,
+    version: i32,
 }
 
-fn row_to_mode(row: &rusqlite::Row) -> SqlResult<Mode> {
-    let tools_json: String = row.get("allowed_tools")?;
-    let origin_str: String = row.get("origin")?;
-    Ok(Mode {
-        name: row.get("name")?,
-        description: row.get("description")?,
-        system_prompt: row.get("system_prompt")?,
-        default_model: row.get("default_model")?,
-        allowed_tools: serde_json::from_str(&tools_json).unwrap_or_default(),
-        created_by: origin_str.parse::<ModeOrigin>().unwrap_or(ModeOrigin::User),
-        version: row.get("version")?,
-    })
-}
-
-pub fn list_modes(conn: &Connection) -> SqlResult<Vec<Mode>> {
-    let mut stmt = conn.prepare("SELECT * FROM modes")?;
-    let modes = stmt
-        .query_map([], |row| row_to_mode(row))?
-        .collect::<SqlResult<Vec<_>>>()?;
-    Ok(modes)
-}
-
-pub fn get_mode(conn: &Connection, name: &str) -> SqlResult<Option<Mode>> {
-    let mut stmt = conn.prepare("SELECT * FROM modes WHERE name = ?1")?;
-    let mut rows = stmt.query_map(params![name], |row| row_to_mode(row))?;
-    match rows.next() {
-        Some(row) => Ok(Some(row?)),
-        None => Ok(None),
+fn row_to_mode(row: ModeRow) -> Mode {
+    let allowed_tools: Vec<String> =
+        serde_json::from_str(&row.allowed_tools).unwrap_or_default();
+    let created_by = row
+        .origin
+        .parse::<ModeOrigin>()
+        .unwrap_or(ModeOrigin::User);
+    Mode {
+        name: row.name,
+        description: row.description,
+        system_prompt: row.system_prompt,
+        default_model: row.default_model,
+        allowed_tools,
+        created_by,
+        version: row.version as u32,
     }
 }
 
-pub fn create_mode(conn: &Connection, mode: &Mode) -> SqlResult<()> {
+pub async fn list_modes(pool: &SqlitePool) -> Result<Vec<Mode>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ModeRow>(
+        "SELECT name, description, system_prompt, default_model, allowed_tools, origin, version
+         FROM modes",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(row_to_mode).collect())
+}
+
+pub async fn get_mode(pool: &SqlitePool, name: &str) -> Result<Option<Mode>, sqlx::Error> {
+    let row = sqlx::query_as::<_, ModeRow>(
+        "SELECT name, description, system_prompt, default_model, allowed_tools, origin, version
+         FROM modes WHERE name = ?1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(row_to_mode))
+}
+
+pub async fn create_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Error> {
     let tools_json = serde_json::to_string(&mode.allowed_tools).unwrap();
-    conn.execute(
+    sqlx::query(
         "INSERT INTO modes (name, description, system_prompt, default_model, allowed_tools, origin, version)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            mode.name,
-            mode.description,
-            mode.system_prompt,
-            mode.default_model,
-            tools_json,
-            mode.created_by.to_string(),
-            mode.version,
-        ],
-    )?;
+    )
+    .bind(&mode.name)
+    .bind(&mode.description)
+    .bind(&mode.system_prompt)
+    .bind(&mode.default_model)
+    .bind(&tools_json)
+    .bind(mode.created_by.to_string())
+    .bind(mode.version)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub fn update_mode(conn: &Connection, name: &str, mode: &Mode) -> Result<(), ModeError> {
+pub async fn update_mode(
+    pool: &SqlitePool,
+    name: &str,
+    mode: &Mode,
+) -> Result<(), ModeError> {
     let tools_json = serde_json::to_string(&mode.allowed_tools).unwrap();
-    let updated = conn.execute(
+    let result = sqlx::query(
         "UPDATE modes SET description = ?1, system_prompt = ?2, default_model = ?3,
          allowed_tools = ?4, origin = ?5, version = version + 1,
          updated_at = CURRENT_TIMESTAMP
          WHERE name = ?6",
-        params![
-            mode.description,
-            mode.system_prompt,
-            mode.default_model,
-            tools_json,
-            mode.created_by.to_string(),
-            name,
-        ],
-    )?;
-    if updated == 0 {
+    )
+    .bind(&mode.description)
+    .bind(&mode.system_prompt)
+    .bind(&mode.default_model)
+    .bind(&tools_json)
+    .bind(mode.created_by.to_string())
+    .bind(name)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
         return Err(ModeError::NotFound(name.to_string()));
     }
     Ok(())
 }
 
-pub fn delete_mode(conn: &Connection, name: &str) -> Result<bool, ModeError> {
-    let origin: Option<String> = conn
-        .query_row(
-            "SELECT origin FROM modes WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )
-        .ok();
+pub async fn delete_mode(pool: &SqlitePool, name: &str) -> Result<bool, ModeError> {
+    let origin: Option<(String,)> =
+        sqlx::query_as("SELECT origin FROM modes WHERE name = ?1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
 
-    match origin.as_deref() {
+    match origin {
         None => Ok(false),
-        Some("builtin") => Err(ModeError::CannotDeleteBuiltin(name.to_string())),
+        Some((ref o,)) if o == "builtin" => {
+            Err(ModeError::CannotDeleteBuiltin(name.to_string()))
+        }
         Some(_) => {
-            conn.execute("DELETE FROM modes WHERE name = ?1", params![name])?;
+            sqlx::query("DELETE FROM modes WHERE name = ?1")
+                .bind(name)
+                .execute(pool)
+                .await?;
             Ok(true)
         }
     }
 }
 
-pub fn upsert_mode(conn: &Connection, mode: &Mode) -> SqlResult<()> {
+pub async fn upsert_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Error> {
     let tools_json = serde_json::to_string(&mode.allowed_tools).unwrap();
-    conn.execute(
+    sqlx::query(
         "INSERT INTO modes (name, description, system_prompt, default_model, allowed_tools, origin, version)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(name) DO UPDATE SET
@@ -131,28 +141,23 @@ pub fn upsert_mode(conn: &Connection, mode: &Mode) -> SqlResult<()> {
             origin = excluded.origin,
             version = modes.version + 1,
             updated_at = CURRENT_TIMESTAMP",
-        params![
-            mode.name,
-            mode.description,
-            mode.system_prompt,
-            mode.default_model,
-            tools_json,
-            mode.created_by.to_string(),
-            mode.version,
-        ],
-    )?;
+    )
+    .bind(&mode.name)
+    .bind(&mode.description)
+    .bind(&mode.system_prompt)
+    .bind(&mode.default_model)
+    .bind(&tools_json)
+    .bind(mode.created_by.to_string())
+    .bind(mode.version)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn setup() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_modes_table(&conn).unwrap();
-        conn
-    }
+    use crate::db::test_pool;
 
     fn test_mode(name: &str, origin: ModeOrigin) -> Mode {
         Mode {
@@ -166,13 +171,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_and_get_mode() {
-        let conn = setup();
+    #[tokio::test]
+    async fn create_and_get_mode() {
+        let pool = test_pool().await;
         let mode = test_mode("test", ModeOrigin::User);
-        create_mode(&conn, &mode).unwrap();
+        create_mode(&pool, &mode).await.unwrap();
 
-        let fetched = get_mode(&conn, "test").unwrap().unwrap();
+        let fetched = get_mode(&pool, "test").await.unwrap().unwrap();
         assert_eq!(fetched.name, "test");
         assert_eq!(fetched.description, "test description");
         assert_eq!(fetched.allowed_tools, vec!["fs_read", "grep"]);
@@ -180,115 +185,115 @@ mod tests {
         assert_eq!(fetched.version, 1);
     }
 
-    #[test]
-    fn get_mode_not_found() {
-        let conn = setup();
-        assert!(get_mode(&conn, "nonexistent").unwrap().is_none());
+    #[tokio::test]
+    async fn get_mode_not_found() {
+        let pool = test_pool().await;
+        assert!(get_mode(&pool, "nonexistent").await.unwrap().is_none());
     }
 
-    #[test]
-    fn list_modes_returns_all() {
-        let conn = setup();
-        create_mode(&conn, &test_mode("a", ModeOrigin::BuiltIn)).unwrap();
-        create_mode(&conn, &test_mode("b", ModeOrigin::User)).unwrap();
-        create_mode(&conn, &test_mode("c", ModeOrigin::UxAgent)).unwrap();
+    #[tokio::test]
+    async fn list_modes_returns_all() {
+        let pool = test_pool().await;
+        create_mode(&pool, &test_mode("a", ModeOrigin::BuiltIn)).await.unwrap();
+        create_mode(&pool, &test_mode("b", ModeOrigin::User)).await.unwrap();
+        create_mode(&pool, &test_mode("c", ModeOrigin::UxAgent)).await.unwrap();
 
-        let modes = list_modes(&conn).unwrap();
+        let modes = list_modes(&pool).await.unwrap();
         assert_eq!(modes.len(), 3);
     }
 
-    #[test]
-    fn update_mode_increments_version() {
-        let conn = setup();
+    #[tokio::test]
+    async fn update_mode_increments_version() {
+        let pool = test_pool().await;
         let mode = test_mode("updatable", ModeOrigin::User);
-        create_mode(&conn, &mode).unwrap();
+        create_mode(&pool, &mode).await.unwrap();
 
         let mut updated = mode.clone();
         updated.description = "updated description".into();
-        update_mode(&conn, "updatable", &updated).unwrap();
+        update_mode(&pool, "updatable", &updated).await.unwrap();
 
-        let fetched = get_mode(&conn, "updatable").unwrap().unwrap();
+        let fetched = get_mode(&pool, "updatable").await.unwrap().unwrap();
         assert_eq!(fetched.description, "updated description");
         assert_eq!(fetched.version, 2);
     }
 
-    #[test]
-    fn update_mode_not_found() {
-        let conn = setup();
+    #[tokio::test]
+    async fn update_mode_not_found() {
+        let pool = test_pool().await;
         let mode = test_mode("ghost", ModeOrigin::User);
-        let err = update_mode(&conn, "ghost", &mode).unwrap_err();
+        let err = update_mode(&pool, "ghost", &mode).await.unwrap_err();
         assert!(matches!(err, ModeError::NotFound(_)));
     }
 
-    #[test]
-    fn delete_builtin_mode_fails() {
-        let conn = setup();
-        create_mode(&conn, &test_mode("plan", ModeOrigin::BuiltIn)).unwrap();
+    #[tokio::test]
+    async fn delete_builtin_mode_fails() {
+        let pool = test_pool().await;
+        create_mode(&pool, &test_mode("plan", ModeOrigin::BuiltIn)).await.unwrap();
 
-        let err = delete_mode(&conn, "plan").unwrap_err();
+        let err = delete_mode(&pool, "plan").await.unwrap_err();
         assert!(matches!(err, ModeError::CannotDeleteBuiltin(_)));
 
         // mode should still exist
-        assert!(get_mode(&conn, "plan").unwrap().is_some());
+        assert!(get_mode(&pool, "plan").await.unwrap().is_some());
     }
 
-    #[test]
-    fn delete_user_mode_succeeds() {
-        let conn = setup();
-        create_mode(&conn, &test_mode("custom", ModeOrigin::User)).unwrap();
+    #[tokio::test]
+    async fn delete_user_mode_succeeds() {
+        let pool = test_pool().await;
+        create_mode(&pool, &test_mode("custom", ModeOrigin::User)).await.unwrap();
 
-        assert!(delete_mode(&conn, "custom").unwrap());
-        assert!(get_mode(&conn, "custom").unwrap().is_none());
+        assert!(delete_mode(&pool, "custom").await.unwrap());
+        assert!(get_mode(&pool, "custom").await.unwrap().is_none());
     }
 
-    #[test]
-    fn delete_nonexistent_returns_false() {
-        let conn = setup();
-        assert!(!delete_mode(&conn, "nope").unwrap());
+    #[tokio::test]
+    async fn delete_nonexistent_returns_false() {
+        let pool = test_pool().await;
+        assert!(!delete_mode(&pool, "nope").await.unwrap());
     }
 
-    #[test]
-    fn upsert_inserts_new() {
-        let conn = setup();
+    #[tokio::test]
+    async fn upsert_inserts_new() {
+        let pool = test_pool().await;
         let mode = test_mode("fresh", ModeOrigin::UxAgent);
-        upsert_mode(&conn, &mode).unwrap();
+        upsert_mode(&pool, &mode).await.unwrap();
 
-        let fetched = get_mode(&conn, "fresh").unwrap().unwrap();
+        let fetched = get_mode(&pool, "fresh").await.unwrap().unwrap();
         assert_eq!(fetched.created_by, ModeOrigin::UxAgent);
         assert_eq!(fetched.version, 1);
     }
 
-    #[test]
-    fn upsert_updates_existing() {
-        let conn = setup();
+    #[tokio::test]
+    async fn upsert_updates_existing() {
+        let pool = test_pool().await;
         let mode = test_mode("sync", ModeOrigin::BuiltIn);
-        create_mode(&conn, &mode).unwrap();
+        create_mode(&pool, &mode).await.unwrap();
 
         let mut updated = mode.clone();
         updated.description = "synced from file".into();
-        upsert_mode(&conn, &updated).unwrap();
+        upsert_mode(&pool, &updated).await.unwrap();
 
-        let fetched = get_mode(&conn, "sync").unwrap().unwrap();
+        let fetched = get_mode(&pool, "sync").await.unwrap().unwrap();
         assert_eq!(fetched.description, "synced from file");
         assert_eq!(fetched.version, 2);
     }
 
-    #[test]
-    fn create_duplicate_fails() {
-        let conn = setup();
+    #[tokio::test]
+    async fn create_duplicate_fails() {
+        let pool = test_pool().await;
         let mode = test_mode("dup", ModeOrigin::User);
-        create_mode(&conn, &mode).unwrap();
-        assert!(create_mode(&conn, &mode).is_err());
+        create_mode(&pool, &mode).await.unwrap();
+        assert!(create_mode(&pool, &mode).await.is_err());
     }
 
-    #[test]
-    fn default_model_none_roundtrip() {
-        let conn = setup();
+    #[tokio::test]
+    async fn default_model_none_roundtrip() {
+        let pool = test_pool().await;
         let mut mode = test_mode("nomodel", ModeOrigin::User);
         mode.default_model = None;
-        create_mode(&conn, &mode).unwrap();
+        create_mode(&pool, &mode).await.unwrap();
 
-        let fetched = get_mode(&conn, "nomodel").unwrap().unwrap();
+        let fetched = get_mode(&pool, "nomodel").await.unwrap().unwrap();
         assert_eq!(fetched.default_model, None);
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
-use rusqlite::Connection;
+use crate::db::test_pool;
+use sqlx::SqlitePool;
 use std::fs as stdfs;
 use tempfile::TempDir;
 
@@ -7,10 +8,8 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn setup_test_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    db::ensure_modes_table(&conn).unwrap();
-    conn
+async fn setup_test_db() -> SqlitePool {
+    test_pool().await
 }
 
 fn test_mode(name: &str) -> Mode {
@@ -87,16 +86,18 @@ fn tool_permission_sets_contents() {
     assert_eq!(READ_WRITE_TOOLS, &["fs_read", "fs_write", "glob", "grep"]);
     assert_eq!(
         FULL_TOOLS,
-        &["fs_read", "fs_write", "glob", "grep", "shell", "git"]
+        &["fs_read", "fs_write", "glob", "grep", "shell"]
     );
     assert_eq!(WEB_TOOLS, &["web_search", "web_fetch"]);
-    assert_eq!(GIT_TOOLS, &["git"]);
 }
 
 #[test]
 fn combine_tool_sets_union() {
-    let combined = combine_tool_sets(&[READ_ONLY_TOOLS, GIT_TOOLS]);
-    assert_eq!(combined, vec!["fs_read", "git", "glob", "grep"]);
+    let combined = combine_tool_sets(&[READ_ONLY_TOOLS, WEB_TOOLS]);
+    assert_eq!(
+        combined,
+        vec!["fs_read", "glob", "grep", "web_fetch", "web_search"]
+    );
 }
 
 #[test]
@@ -195,12 +196,11 @@ fn plan_mode_tools_are_read_only() {
 }
 
 #[test]
-fn review_mode_tools_include_git() {
+fn review_mode_tools_are_read_only() {
     let modes = builtin::builtin_modes();
     let review = modes.iter().find(|m| m.name == "review").unwrap();
-    let expected = combine_tool_sets(&[READ_ONLY_TOOLS, GIT_TOOLS]);
+    let expected: Vec<String> = READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect();
     assert_eq!(review.allowed_tools, expected);
-    assert!(review.allowed_tools.contains(&"git".to_string()));
 }
 
 #[test]
@@ -225,13 +225,13 @@ fn implement_mode_has_full_tools() {
 // 4. CRUD tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn create_and_get_mode() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn create_and_get_mode() {
+    let pool = setup_test_db().await;
     let mode = test_mode("crud_test");
-    db::create_mode(&conn, &mode).unwrap();
+    db::create_mode(&pool, &mode).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "crud_test").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "crud_test").await.unwrap().unwrap();
     assert_eq!(fetched.name, "crud_test");
     assert_eq!(fetched.description, "Test mode: crud_test");
     assert_eq!(fetched.system_prompt, "You are a test mode.");
@@ -241,124 +241,124 @@ fn create_and_get_mode() {
     assert_eq!(fetched.version, 1);
 }
 
-#[test]
-fn get_nonexistent_mode() {
-    let conn = setup_test_db();
-    assert!(db::get_mode(&conn, "no_such_mode").unwrap().is_none());
+#[tokio::test]
+async fn get_nonexistent_mode() {
+    let pool = setup_test_db().await;
+    assert!(db::get_mode(&pool, "no_such_mode").await.unwrap().is_none());
 }
 
-#[test]
-fn list_modes_empty() {
-    let conn = setup_test_db();
-    let modes = db::list_modes(&conn).unwrap();
+#[tokio::test]
+async fn list_modes_empty() {
+    let pool = setup_test_db().await;
+    let modes = db::list_modes(&pool).await.unwrap();
     assert!(modes.is_empty());
 }
 
-#[test]
-fn list_modes_returns_all() {
-    let conn = setup_test_db();
-    db::create_mode(&conn, &test_mode("x")).unwrap();
-    db::create_mode(&conn, &test_mode("y")).unwrap();
-    db::create_mode(&conn, &test_mode("z")).unwrap();
+#[tokio::test]
+async fn list_modes_returns_all() {
+    let pool = setup_test_db().await;
+    db::create_mode(&pool, &test_mode("x")).await.unwrap();
+    db::create_mode(&pool, &test_mode("y")).await.unwrap();
+    db::create_mode(&pool, &test_mode("z")).await.unwrap();
 
-    let modes = db::list_modes(&conn).unwrap();
+    let modes = db::list_modes(&pool).await.unwrap();
     assert_eq!(modes.len(), 3);
 }
 
-#[test]
-fn create_duplicate_mode_fails() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn create_duplicate_mode_fails() {
+    let pool = setup_test_db().await;
     let mode = test_mode("dup");
-    db::create_mode(&conn, &mode).unwrap();
-    assert!(db::create_mode(&conn, &mode).is_err());
+    db::create_mode(&pool, &mode).await.unwrap();
+    assert!(db::create_mode(&pool, &mode).await.is_err());
 }
 
-#[test]
-fn update_mode_increments_version() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn update_mode_increments_version() {
+    let pool = setup_test_db().await;
     let mode = test_mode("versioned");
-    db::create_mode(&conn, &mode).unwrap();
+    db::create_mode(&pool, &mode).await.unwrap();
 
     let mut updated = mode.clone();
     updated.description = "updated".into();
-    db::update_mode(&conn, "versioned", &updated).unwrap();
+    db::update_mode(&pool, "versioned", &updated).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "versioned").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "versioned").await.unwrap().unwrap();
     assert_eq!(fetched.version, 2);
 }
 
-#[test]
-fn update_mode_changes_fields() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn update_mode_changes_fields() {
+    let pool = setup_test_db().await;
     let mode = test_mode("mutable");
-    db::create_mode(&conn, &mode).unwrap();
+    db::create_mode(&pool, &mode).await.unwrap();
 
     let mut changed = mode.clone();
     changed.description = "new desc".into();
     changed.system_prompt = "new prompt".into();
-    db::update_mode(&conn, "mutable", &changed).unwrap();
+    db::update_mode(&pool, "mutable", &changed).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "mutable").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "mutable").await.unwrap().unwrap();
     assert_eq!(fetched.description, "new desc");
     assert_eq!(fetched.system_prompt, "new prompt");
 }
 
-#[test]
-fn delete_builtin_mode_fails() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn delete_builtin_mode_fails() {
+    let pool = setup_test_db().await;
     let mode = test_mode_with_origin("protected", ModeOrigin::BuiltIn);
-    db::create_mode(&conn, &mode).unwrap();
+    db::create_mode(&pool, &mode).await.unwrap();
 
-    let err = db::delete_mode(&conn, "protected").unwrap_err();
+    let err = db::delete_mode(&pool, "protected").await.unwrap_err();
     assert!(matches!(err, db::ModeError::CannotDeleteBuiltin(_)));
-    assert!(db::get_mode(&conn, "protected").unwrap().is_some());
+    assert!(db::get_mode(&pool, "protected").await.unwrap().is_some());
 }
 
-#[test]
-fn delete_user_mode_succeeds() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn delete_user_mode_succeeds() {
+    let pool = setup_test_db().await;
     let mode = test_mode_with_origin("removable", ModeOrigin::User);
-    db::create_mode(&conn, &mode).unwrap();
+    db::create_mode(&pool, &mode).await.unwrap();
 
-    assert!(db::delete_mode(&conn, "removable").unwrap());
-    assert!(db::get_mode(&conn, "removable").unwrap().is_none());
+    assert!(db::delete_mode(&pool, "removable").await.unwrap());
+    assert!(db::get_mode(&pool, "removable").await.unwrap().is_none());
 }
 
-#[test]
-fn delete_nonexistent_mode() {
-    let conn = setup_test_db();
-    assert!(!db::delete_mode(&conn, "ghost").unwrap());
+#[tokio::test]
+async fn delete_nonexistent_mode() {
+    let pool = setup_test_db().await;
+    assert!(!db::delete_mode(&pool, "ghost").await.unwrap());
 }
 
-#[test]
-fn upsert_inserts_new_mode() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn upsert_inserts_new_mode() {
+    let pool = setup_test_db().await;
     let mode = test_mode("upsert_new");
-    db::upsert_mode(&conn, &mode).unwrap();
+    db::upsert_mode(&pool, &mode).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "upsert_new").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "upsert_new").await.unwrap().unwrap();
     assert_eq!(fetched.version, 1);
     assert_eq!(fetched.description, "Test mode: upsert_new");
 }
 
-#[test]
-fn upsert_updates_existing_mode() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn upsert_updates_existing_mode() {
+    let pool = setup_test_db().await;
     let mode = test_mode("upsert_upd");
-    db::create_mode(&conn, &mode).unwrap();
+    db::create_mode(&pool, &mode).await.unwrap();
 
     let mut changed = mode.clone();
     changed.description = "upserted".into();
-    db::upsert_mode(&conn, &changed).unwrap();
+    db::upsert_mode(&pool, &changed).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "upsert_upd").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "upsert_upd").await.unwrap().unwrap();
     assert_eq!(fetched.description, "upserted");
     assert_eq!(fetched.version, 2);
 }
 
-#[test]
-fn allowed_tools_json_roundtrip() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn allowed_tools_json_roundtrip() {
+    let pool = setup_test_db().await;
     let mut mode = test_mode("tools_rt");
     mode.allowed_tools = vec![
         "fs_read".into(),
@@ -366,11 +366,10 @@ fn allowed_tools_json_roundtrip() {
         "glob".into(),
         "grep".into(),
         "shell".into(),
-        "git".into(),
     ];
-    db::create_mode(&conn, &mode).unwrap();
+    db::create_mode(&pool, &mode).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "tools_rt").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "tools_rt").await.unwrap().unwrap();
     assert_eq!(fetched.allowed_tools, mode.allowed_tools);
 }
 
@@ -427,7 +426,7 @@ description: Code review
 default_model: claude-sonnet-4-6
 allowed_tools:
   - fs_read
-  - git
+  - grep
 origin: user
 version: 1
 ---
@@ -439,7 +438,7 @@ Focus on correctness and security."#;
     assert_eq!(mode.name, "reviewer");
     assert_eq!(mode.description, "Code review");
     assert_eq!(mode.default_model, Some("claude-sonnet-4-6".to_string()));
-    assert_eq!(mode.allowed_tools, vec!["fs_read", "git"]);
+    assert_eq!(mode.allowed_tools, vec!["fs_read", "grep"]);
     assert_eq!(mode.created_by, ModeOrigin::User);
     assert!(mode.system_prompt.contains("code reviewer"));
     assert!(mode.system_prompt.contains("security"));
@@ -570,8 +569,8 @@ system_prompt = "Real."
     assert_eq!(modes[0].name, "real");
 }
 
-#[test]
-fn sync_modes_to_db() {
+#[tokio::test]
+async fn sync_modes_to_db() {
     let dir = TempDir::new().unwrap();
     let modes_dir = dir.path().join(".kernel").join("modes");
     stdfs::create_dir_all(&modes_dir).unwrap();
@@ -600,17 +599,17 @@ Beta."#,
     )
     .unwrap();
 
-    let conn = setup_test_db();
-    let count = fs::sync_modes_to_db(&conn, dir.path()).unwrap();
+    let pool = setup_test_db().await;
+    let count = fs::sync_modes_to_db(&pool, dir.path()).await.unwrap();
     assert_eq!(count, 2);
 
-    let all = db::list_modes(&conn).unwrap();
+    let all = db::list_modes(&pool).await.unwrap();
     assert_eq!(all.len(), 2);
 }
 
-#[test]
-fn sync_modes_overrides_db() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn sync_modes_overrides_db() {
+    let pool = setup_test_db().await;
     let existing = Mode {
         name: "override_me".to_string(),
         description: "old".to_string(),
@@ -620,7 +619,7 @@ fn sync_modes_overrides_db() {
         created_by: ModeOrigin::User,
         version: 1,
     };
-    db::create_mode(&conn, &existing).unwrap();
+    db::create_mode(&pool, &existing).await.unwrap();
 
     let dir = TempDir::new().unwrap();
     let modes_dir = dir.path().join(".kernel").join("modes");
@@ -637,9 +636,9 @@ system_prompt = "new prompt"
     )
     .unwrap();
 
-    fs::sync_modes_to_db(&conn, dir.path()).unwrap();
+    fs::sync_modes_to_db(&pool, dir.path()).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "override_me").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "override_me").await.unwrap().unwrap();
     assert_eq!(fetched.description, "new");
     assert_eq!(fetched.system_prompt, "new prompt");
     assert_eq!(fetched.allowed_tools, vec!["fs_read", "fs_write"]);
@@ -650,40 +649,40 @@ system_prompt = "new prompt"
 // 6. Cross-module integration tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn builtin_modes_persist_to_db() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn builtin_modes_persist_to_db() {
+    let pool = setup_test_db().await;
     for mode in builtin::builtin_modes() {
-        db::create_mode(&conn, &mode).unwrap();
+        db::create_mode(&pool, &mode).await.unwrap();
     }
 
-    let all = db::list_modes(&conn).unwrap();
+    let all = db::list_modes(&pool).await.unwrap();
     assert_eq!(all.len(), 6);
 
-    let plan = db::get_mode(&conn, "plan").unwrap().unwrap();
+    let plan = db::get_mode(&pool, "plan").await.unwrap().unwrap();
     assert_eq!(plan.created_by, ModeOrigin::BuiltIn);
     assert!(!plan.system_prompt.is_empty());
 }
 
-#[test]
-fn builtin_mode_cannot_be_deleted_from_db() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn builtin_mode_cannot_be_deleted_from_db() {
+    let pool = setup_test_db().await;
     for mode in builtin::builtin_modes() {
-        db::create_mode(&conn, &mode).unwrap();
+        db::create_mode(&pool, &mode).await.unwrap();
     }
 
-    let err = db::delete_mode(&conn, "plan").unwrap_err();
+    let err = db::delete_mode(&pool, "plan").await.unwrap_err();
     assert!(matches!(err, db::ModeError::CannotDeleteBuiltin(_)));
-    assert!(db::get_mode(&conn, "plan").unwrap().is_some());
+    assert!(db::get_mode(&pool, "plan").await.unwrap().is_some());
 }
 
-#[test]
-fn file_mode_overrides_builtin_in_db_via_sync() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn file_mode_overrides_builtin_in_db_via_sync() {
+    let pool = setup_test_db().await;
     // Seed DB with builtin plan mode
     let builtins = builtin::builtin_modes();
     let plan = builtins.iter().find(|m| m.name == "plan").unwrap();
-    db::create_mode(&conn, plan).unwrap();
+    db::create_mode(&pool, plan).await.unwrap();
 
     // Create a file-based plan mode that should override
     let dir = TempDir::new().unwrap();
@@ -705,46 +704,46 @@ version = 1
     )
     .unwrap();
 
-    fs::sync_modes_to_db(&conn, dir.path()).unwrap();
+    fs::sync_modes_to_db(&pool, dir.path()).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "plan").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "plan").await.unwrap().unwrap();
     assert_eq!(fetched.description, "Custom plan mode");
     assert_eq!(fetched.system_prompt, "You are a custom planner.");
     assert_eq!(fetched.version, 2);
 }
 
-#[test]
-fn end_to_end_mode_lifecycle() {
-    let conn = setup_test_db();
+#[tokio::test]
+async fn end_to_end_mode_lifecycle() {
+    let pool = setup_test_db().await;
 
     // 1. Start with empty DB
-    assert!(db::list_modes(&conn).unwrap().is_empty());
+    assert!(db::list_modes(&pool).await.unwrap().is_empty());
 
     // 2. Create a user mode
     let mode = test_mode("workflow");
-    db::create_mode(&conn, &mode).unwrap();
-    assert_eq!(db::list_modes(&conn).unwrap().len(), 1);
+    db::create_mode(&pool, &mode).await.unwrap();
+    assert_eq!(db::list_modes(&pool).await.unwrap().len(), 1);
 
     // 3. Update it
     let mut updated = mode.clone();
     updated.description = "Updated workflow".into();
     updated.system_prompt = "Updated prompt.".into();
-    db::update_mode(&conn, "workflow", &updated).unwrap();
+    db::update_mode(&pool, "workflow", &updated).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "workflow").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "workflow").await.unwrap().unwrap();
     assert_eq!(fetched.version, 2);
     assert_eq!(fetched.description, "Updated workflow");
 
     // 4. Upsert overwrites again
     let mut v3 = updated.clone();
     v3.description = "V3 workflow".into();
-    db::upsert_mode(&conn, &v3).unwrap();
+    db::upsert_mode(&pool, &v3).await.unwrap();
 
-    let fetched = db::get_mode(&conn, "workflow").unwrap().unwrap();
+    let fetched = db::get_mode(&pool, "workflow").await.unwrap().unwrap();
     assert_eq!(fetched.version, 3);
     assert_eq!(fetched.description, "V3 workflow");
 
     // 5. Delete user mode
-    assert!(db::delete_mode(&conn, "workflow").unwrap());
-    assert!(db::get_mode(&conn, "workflow").unwrap().is_none());
+    assert!(db::delete_mode(&pool, "workflow").await.unwrap());
+    assert!(db::get_mode(&pool, "workflow").await.unwrap().is_none());
 }
