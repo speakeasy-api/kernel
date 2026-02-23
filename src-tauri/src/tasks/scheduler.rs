@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::types::{Priority, Task, TaskOutcome, TaskStatus};
@@ -22,12 +22,12 @@ impl Scheduler {
 
     /// Given the current state of tasks, return which tasks should be dispatched next.
     /// This is a pure function that reads from DB and returns task IDs to start.
-    pub fn select_next(
+    pub async fn select_next(
         &self,
-        conn: &Connection,
+        pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Vec<Task>, SchedulerError> {
-        let candidates = super::db::next_unblocked(conn, session_id)?;
+        let candidates = super::db::next_unblocked(pool, session_id).await?;
         let available_slots = self.max_concurrent.saturating_sub(self.active_tasks.len());
         if available_slots == 0 {
             return Ok(Vec::new());
@@ -62,15 +62,16 @@ impl Scheduler {
     }
 
     /// Run one scheduling cycle: pick tasks, transition them to InProgress, return them.
-    pub fn dispatch_cycle(
+    pub async fn dispatch_cycle(
         &mut self,
-        conn: &Connection,
+        pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Vec<Task>, SchedulerError> {
-        let tasks_to_start = self.select_next(conn, session_id)?;
+        let tasks_to_start = self.select_next(pool, session_id).await?;
 
         for task in &tasks_to_start {
-            super::lifecycle::apply_transition(conn, task.id, TaskStatus::InProgress, None)
+            super::lifecycle::apply_transition(pool, task.id, TaskStatus::InProgress, None)
+                .await
                 .map_err(map_lifecycle_err)?;
             self.mark_active(task.id);
         }
@@ -80,20 +81,23 @@ impl Scheduler {
 
     /// Called when a task finishes (success, failure, or block).
     /// Removes from active set and triggers cascade unblock for successful completion.
-    pub fn on_task_complete(
+    pub async fn on_task_complete(
         &mut self,
-        conn: &Connection,
+        pool: &SqlitePool,
         task_id: Uuid,
         status: TaskStatus,
         outcome: Option<&TaskOutcome>,
     ) -> Result<Vec<Uuid>, SchedulerError> {
         self.mark_inactive(task_id);
 
-        super::lifecycle::apply_transition(conn, task_id, status, outcome)
+        super::lifecycle::apply_transition(pool, task_id, status, outcome)
+            .await
             .map_err(map_lifecycle_err)?;
 
         if status == TaskStatus::Done {
-            super::lifecycle::cascade_unblock(conn, task_id).map_err(map_lifecycle_err)
+            super::lifecycle::cascade_unblock(pool, task_id)
+                .await
+                .map_err(map_lifecycle_err)
         } else {
             Ok(Vec::new())
         }
@@ -201,7 +205,7 @@ impl PartialOrd for PrioritizedTask {
 fn map_lifecycle_err(err: super::lifecycle::LifecycleError) -> SchedulerError {
     match err {
         super::lifecycle::LifecycleError::DbError(db_err) => SchedulerError::DbError(db_err),
-        other => SchedulerError::DbError(rusqlite::Error::InvalidParameterName(other.to_string())),
+        other => SchedulerError::DbError(sqlx::Error::Protocol(other.to_string())),
     }
 }
 
@@ -210,7 +214,7 @@ pub enum SchedulerError {
     #[error("Dependency cycle detected involving tasks: {0:?}")]
     CycleDetected(Vec<Uuid>),
     #[error("Database error: {0}")]
-    DbError(#[from] rusqlite::Error),
+    DbError(#[from] sqlx::Error),
 }
 
 #[cfg(test)]
@@ -218,10 +222,10 @@ mod tests {
     use std::collections::HashSet;
 
     use chrono::{Duration, Utc};
-    use rusqlite::Connection;
     use uuid::Uuid;
 
     use super::*;
+    use crate::db::test_pool;
     use crate::tasks::db;
     use crate::tasks::types::{DiffStat, Priority, Task};
 
@@ -350,10 +354,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn select_next_respects_priority_fifo_and_max_concurrent() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn select_next_respects_priority_fifo_and_max_concurrent() {
+        let pool = test_pool().await;
 
         let session_id = Uuid::new_v4();
         let base = Utc::now();
@@ -391,22 +394,21 @@ mod tests {
             vec![],
         );
 
-        db::insert_task(&conn, &high_new).unwrap();
-        db::insert_task(&conn, &high_old).unwrap();
-        db::insert_task(&conn, &critical).unwrap();
-        db::insert_task(&conn, &medium).unwrap();
+        db::insert_task(&pool, &high_new).await.unwrap();
+        db::insert_task(&pool, &high_old).await.unwrap();
+        db::insert_task(&pool, &critical).await.unwrap();
+        db::insert_task(&pool, &medium).await.unwrap();
 
         let scheduler = Scheduler::new(2);
-        let selected = scheduler.select_next(&conn, session_id).unwrap();
+        let selected = scheduler.select_next(&pool, session_id).await.unwrap();
         let selected_ids: Vec<_> = selected.iter().map(|task| task.id).collect();
 
         assert_eq!(selected_ids, vec![critical.id, high_old.id]);
     }
 
-    #[test]
-    fn select_next_returns_empty_when_at_capacity() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn select_next_returns_empty_when_at_capacity() {
+        let pool = test_pool().await;
 
         let session_id = Uuid::new_v4();
         let task = sample_task(
@@ -417,18 +419,17 @@ mod tests {
             Utc::now(),
             vec![],
         );
-        db::insert_task(&conn, &task).unwrap();
+        db::insert_task(&pool, &task).await.unwrap();
 
         let mut scheduler = Scheduler::new(1);
         scheduler.mark_active(Uuid::new_v4());
-        let selected = scheduler.select_next(&conn, session_id).unwrap();
+        let selected = scheduler.select_next(&pool, session_id).await.unwrap();
         assert!(selected.is_empty());
     }
 
-    #[test]
-    fn dispatch_cycle_moves_tasks_to_in_progress_and_marks_active() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn dispatch_cycle_moves_tasks_to_in_progress_and_marks_active() {
+        let pool = test_pool().await;
 
         let session_id = Uuid::new_v4();
         let base = Utc::now();
@@ -449,25 +450,24 @@ mod tests {
             vec![],
         );
 
-        db::insert_task(&conn, &low).unwrap();
-        db::insert_task(&conn, &critical).unwrap();
+        db::insert_task(&pool, &low).await.unwrap();
+        db::insert_task(&pool, &critical).await.unwrap();
 
         let mut scheduler = Scheduler::new(1);
-        let started = scheduler.dispatch_cycle(&conn, session_id).unwrap();
+        let started = scheduler.dispatch_cycle(&pool, session_id).await.unwrap();
 
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].id, critical.id);
         assert!(scheduler.is_active(critical.id));
         assert_eq!(scheduler.active_count(), 1);
 
-        let updated = db::get_task(&conn, critical.id).unwrap().unwrap();
+        let updated = db::get_task(&pool, critical.id).await.unwrap().unwrap();
         assert_eq!(updated.status, TaskStatus::InProgress);
     }
 
-    #[test]
-    fn on_task_complete_marks_inactive_and_cascades_unblock_for_done() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn on_task_complete_marks_inactive_and_cascades_unblock_for_done() {
+        let pool = test_pool().await;
 
         let session_id = Uuid::new_v4();
         let base = Utc::now();
@@ -489,8 +489,8 @@ mod tests {
             vec![dependency.id],
         );
 
-        db::insert_task(&conn, &dependency).unwrap();
-        db::insert_task(&conn, &blocked).unwrap();
+        db::insert_task(&pool, &dependency).await.unwrap();
+        db::insert_task(&pool, &blocked).await.unwrap();
 
         let mut scheduler = Scheduler::new(2);
         scheduler.mark_active(dependency.id);
@@ -498,16 +498,17 @@ mod tests {
 
         let outcome = done_outcome();
         let unblocked = scheduler
-            .on_task_complete(&conn, dependency.id, TaskStatus::Done, Some(&outcome))
+            .on_task_complete(&pool, dependency.id, TaskStatus::Done, Some(&outcome))
+            .await
             .unwrap();
 
         assert!(!scheduler.is_active(dependency.id));
         assert_eq!(unblocked, vec![blocked.id]);
 
-        let done_task = db::get_task(&conn, dependency.id).unwrap().unwrap();
+        let done_task = db::get_task(&pool, dependency.id).await.unwrap().unwrap();
         assert_eq!(done_task.status, TaskStatus::Done);
 
-        let unblocked_task = db::get_task(&conn, blocked.id).unwrap().unwrap();
+        let unblocked_task = db::get_task(&pool, blocked.id).await.unwrap().unwrap();
         assert_eq!(unblocked_task.status, TaskStatus::Pending);
     }
 }

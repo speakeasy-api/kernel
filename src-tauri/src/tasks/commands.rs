@@ -1,12 +1,10 @@
-use chrono::Utc;
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use tauri::State;
 use uuid::Uuid;
 
 use super::decomposition::{DecompositionRequest, DecompositionResult};
 use super::types::{EngagementLevel, Priority, Task, TaskOutcome, TaskStatus};
-use crate::DbState;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTaskInput {
@@ -28,9 +26,11 @@ pub struct TaskTree {
 }
 
 #[tauri::command]
-pub fn create_task(state: State<'_, DbState>, input: CreateTaskInput) -> Result<Task, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let now = Utc::now();
+pub async fn create_task(
+    pool: State<'_, SqlitePool>,
+    input: CreateTaskInput,
+) -> Result<Task, String> {
+    let now = chrono::Utc::now();
     let task = Task {
         id: Uuid::new_v4(),
         session_id: input.session_id,
@@ -51,88 +51,113 @@ pub fn create_task(state: State<'_, DbState>, input: CreateTaskInput) -> Result<
         created_at: now,
         updated_at: now,
     };
-    super::db::insert_task(&conn, &task).map_err(|e| e.to_string())?;
+    super::db::insert_task(&pool, &task)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(task)
 }
 
 #[tauri::command]
-pub fn persist_task_plan(
-    state: State<'_, DbState>,
+pub async fn persist_task_plan(
+    pool: State<'_, SqlitePool>,
     request: DecompositionRequest,
     result: DecompositionResult,
 ) -> Result<Vec<Task>, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    super::decomposition::persist_decomposition(&conn, &request, &result).map_err(|e| e.to_string())
+    super::decomposition::persist_decomposition(&pool, &request, &result)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn list_tasks(
-    state: State<'_, DbState>,
+pub async fn list_tasks(
+    pool: State<'_, SqlitePool>,
     session_id: Uuid,
     status_filter: Option<TaskStatus>,
 ) -> Result<Vec<Task>, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    super::db::list_tasks(&conn, session_id, status_filter).map_err(|e| e.to_string())
+    super::db::list_tasks(&pool, session_id, status_filter)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_task(state: State<'_, DbState>, task_id: Uuid) -> Result<Option<Task>, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    super::db::get_task(&conn, task_id).map_err(|e| e.to_string())
+pub async fn get_task(
+    pool: State<'_, SqlitePool>,
+    task_id: Uuid,
+) -> Result<Option<Task>, String> {
+    super::db::get_task(&pool, task_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn update_task_status(
-    state: State<'_, DbState>,
+pub async fn update_task_status(
+    pool: State<'_, SqlitePool>,
     task_id: Uuid,
     status: TaskStatus,
     outcome: Option<TaskOutcome>,
 ) -> Result<(), String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    super::lifecycle::apply_transition(&conn, task_id, status, outcome.as_ref())
+    super::lifecycle::apply_transition(&pool, task_id, status, outcome.as_ref())
+        .await
         .map_err(|e| e.to_string())?;
     if status == TaskStatus::Done {
-        super::lifecycle::cascade_unblock(&conn, task_id).map_err(|e| e.to_string())?;
+        super::lifecycle::cascade_unblock(&pool, task_id)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-pub fn get_task_tree(state: State<'_, DbState>, session_id: Uuid) -> Result<TaskTree, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let (tasks, edges) = super::db::get_task_tree(&conn, session_id).map_err(|e| e.to_string())?;
+pub async fn get_task_tree(
+    pool: State<'_, SqlitePool>,
+    session_id: Uuid,
+) -> Result<TaskTree, String> {
+    let (tasks, edges) = super::db::get_task_tree(&pool, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(TaskTree { tasks, edges })
 }
 
 #[tauri::command]
-pub fn next_unblocked(state: State<'_, DbState>, session_id: Uuid) -> Result<Vec<Task>, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    super::db::next_unblocked(&conn, session_id).map_err(|e| e.to_string())
+pub async fn next_unblocked(
+    pool: State<'_, SqlitePool>,
+    session_id: Uuid,
+) -> Result<Vec<Task>, String> {
+    super::db::next_unblocked(&pool, session_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn set_task_engagement(
-    state: State<'_, DbState>,
+pub async fn set_task_engagement(
+    pool: State<'_, SqlitePool>,
     task_id: Uuid,
     engagement: Option<EngagementLevel>,
 ) -> Result<(), String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    super::db::update_task_engagement(&conn, task_id, engagement).map_err(|e| e.to_string())
+    super::db::update_task_engagement(&pool, task_id, engagement)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_task_cost(state: State<'_, DbState>, task_id: Uuid) -> Result<f64, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    conn.query_row(
-        "SELECT cost_usd FROM tasks WHERE id = ?1",
-        params![task_id.to_string()],
-        |row| row.get(0),
-    )
-    .map_err(|e| e.to_string())
+pub async fn get_task_cost(
+    pool: State<'_, SqlitePool>,
+    task_id: Uuid,
+) -> Result<f64, String> {
+    let row: (f64,) = sqlx::query_as("SELECT cost_usd FROM tasks WHERE id = ?1")
+        .bind(task_id.to_string())
+        .fetch_one(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(row.0)
 }
 
 #[tauri::command]
-pub fn get_session_cost(state: State<'_, DbState>, session_id: Uuid) -> Result<f64, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    super::costs::session_cost(&conn, session_id).map_err(|e| e.to_string())
+pub async fn get_session_cost(
+    pool: State<'_, SqlitePool>,
+    session_id: Uuid,
+) -> Result<f64, String> {
+    super::costs::session_cost(&pool, session_id)
+        .await
+        .map_err(|e| e.to_string())
 }

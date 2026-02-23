@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -49,7 +49,7 @@ pub enum DecompositionError {
     #[error("Dependency cycle detected")]
     CycleDetected,
     #[error("Database error: {0}")]
-    DbError(#[from] rusqlite::Error),
+    DbError(#[from] sqlx::Error),
 }
 
 pub fn validate_decomposition(result: &DecompositionResult) -> Result<(), DecompositionError> {
@@ -132,8 +132,8 @@ pub fn validate_decomposition(result: &DecompositionResult) -> Result<(), Decomp
     }
 }
 
-pub fn persist_decomposition(
-    conn: &Connection,
+pub async fn persist_decomposition(
+    pool: &SqlitePool,
     request: &DecompositionRequest,
     result: &DecompositionResult,
 ) -> Result<Vec<Task>, DecompositionError> {
@@ -187,20 +187,19 @@ pub fn persist_decomposition(
         });
     }
 
-    let tx = conn.unchecked_transaction()?;
+    let mut tx = pool.begin().await?;
     for task in &tasks {
-        super::db::insert_task_in_transaction(&tx, task)?;
+        super::db::insert_task_in_tx(&mut tx, task).await?;
     }
-    tx.commit()?;
+    tx.commit().await?;
 
     Ok(tasks)
 }
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
-
     use super::*;
+    use crate::db::test_pool;
     use crate::tasks::db;
 
     fn planned(
@@ -244,10 +243,9 @@ mod tests {
         assert!(matches!(err, DecompositionError::CycleDetected));
     }
 
-    #[test]
-    fn persist_materializes_title_references() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn persist_materializes_title_references() {
+        let pool = test_pool().await;
 
         let session_id = Uuid::new_v4();
         let request = DecompositionRequest {
@@ -263,13 +261,15 @@ mod tests {
             ],
         };
 
-        let persisted = persist_decomposition(&conn, &request, &result).unwrap();
+        let persisted = persist_decomposition(&pool, &request, &result)
+            .await
+            .unwrap();
         assert_eq!(persisted.len(), 2);
         assert!(persisted
             .iter()
             .all(|task| task.status == TaskStatus::Pending));
 
-        let all_tasks = db::list_tasks(&conn, session_id, None).unwrap();
+        let all_tasks = db::list_tasks(&pool, session_id, None).await.unwrap();
         assert_eq!(all_tasks.len(), 2);
         let root = all_tasks.iter().find(|task| task.title == "root").unwrap();
         let child = all_tasks.iter().find(|task| task.title == "child").unwrap();

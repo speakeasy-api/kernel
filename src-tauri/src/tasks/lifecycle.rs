@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::db;
@@ -18,7 +18,7 @@ pub enum LifecycleError {
     #[error("Transition to Done requires an outcome")]
     MissingOutcome,
     #[error("Database error: {0}")]
-    DbError(#[from] rusqlite::Error),
+    DbError(#[from] sqlx::Error),
     #[error("Task not found: {0}")]
     TaskNotFound(Uuid),
 }
@@ -52,27 +52,30 @@ pub fn validate_transition(
     Ok(())
 }
 
-pub fn apply_transition(
-    conn: &Connection,
+pub async fn apply_transition(
+    pool: &SqlitePool,
     task_id: Uuid,
     to: TaskStatus,
     outcome: Option<&TaskOutcome>,
 ) -> Result<(), LifecycleError> {
-    let task = db::get_task(conn, task_id)?.ok_or(LifecycleError::TaskNotFound(task_id))?;
+    let task = db::get_task(pool, task_id)
+        .await?
+        .ok_or(LifecycleError::TaskNotFound(task_id))?;
     validate_transition(task.status, to, outcome)?;
-    db::update_task_status(conn, task_id, to, outcome)?;
+    db::update_task_status(pool, task_id, to, outcome).await?;
     Ok(())
 }
 
-pub fn cascade_unblock(
-    conn: &Connection,
+pub async fn cascade_unblock(
+    pool: &SqlitePool,
     completed_task_id: Uuid,
 ) -> Result<Vec<Uuid>, LifecycleError> {
-    let dependents = db::find_dependents(conn, completed_task_id)?;
+    let dependents = db::find_dependents(pool, completed_task_id).await?;
     let mut unblocked = Vec::new();
 
     for dependent_task_id in dependents {
-        let task = db::get_task(conn, dependent_task_id)?
+        let task = db::get_task(pool, dependent_task_id)
+            .await?
             .ok_or(LifecycleError::TaskNotFound(dependent_task_id))?;
 
         if task.status != TaskStatus::Blocked {
@@ -81,7 +84,8 @@ pub fn cascade_unblock(
 
         let mut all_done = true;
         for dependency_id in task.depends_on {
-            let dependency = db::get_task(conn, dependency_id)?
+            let dependency = db::get_task(pool, dependency_id)
+                .await?
                 .ok_or(LifecycleError::TaskNotFound(dependency_id))?;
             if dependency.status != TaskStatus::Done {
                 all_done = false;
@@ -90,7 +94,7 @@ pub fn cascade_unblock(
         }
 
         if all_done {
-            db::update_task_status(conn, dependent_task_id, TaskStatus::Pending, None)?;
+            db::update_task_status(pool, dependent_task_id, TaskStatus::Pending, None).await?;
             unblocked.push(dependent_task_id);
         }
     }
@@ -101,10 +105,10 @@ pub fn cascade_unblock(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use rusqlite::Connection;
     use uuid::Uuid;
 
     use super::*;
+    use crate::db::test_pool;
     use crate::tasks::db;
     use crate::tasks::types::{DiffStat, Priority, Task};
 
@@ -204,25 +208,25 @@ mod tests {
         assert!(matches!(err, LifecycleError::MissingOutcome));
     }
 
-    #[test]
-    fn apply_transition_loads_validates_and_persists() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn apply_transition_loads_validates_and_persists() {
+        let pool = test_pool().await;
 
         let session_id = Uuid::new_v4();
         let task = sample_task(session_id, "t1", TaskStatus::Pending, vec![]);
-        db::insert_task(&conn, &task).unwrap();
+        db::insert_task(&pool, &task).await.unwrap();
 
-        apply_transition(&conn, task.id, TaskStatus::InProgress, None).unwrap();
+        apply_transition(&pool, task.id, TaskStatus::InProgress, None)
+            .await
+            .unwrap();
 
-        let updated = db::get_task(&conn, task.id).unwrap().unwrap();
+        let updated = db::get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(updated.status, TaskStatus::InProgress);
     }
 
-    #[test]
-    fn cascade_unblock_moves_blocked_dependents_to_pending_when_ready() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn cascade_unblock_moves_blocked_dependents_to_pending_when_ready() {
+        let pool = test_pool().await;
 
         let session_id = Uuid::new_v4();
         let dep1 = sample_task(session_id, "dep1", TaskStatus::Done, vec![]);
@@ -240,25 +244,24 @@ mod tests {
             vec![dep1.id, dep2.id],
         );
 
-        db::insert_task(&conn, &dep1).unwrap();
-        db::insert_task(&conn, &dep2).unwrap();
-        db::insert_task(&conn, &blocked).unwrap();
-        db::insert_task(&conn, &in_review).unwrap();
+        db::insert_task(&pool, &dep1).await.unwrap();
+        db::insert_task(&pool, &dep2).await.unwrap();
+        db::insert_task(&pool, &blocked).await.unwrap();
+        db::insert_task(&pool, &in_review).await.unwrap();
 
-        let unblocked = cascade_unblock(&conn, dep1.id).unwrap();
+        let unblocked = cascade_unblock(&pool, dep1.id).await.unwrap();
         assert_eq!(unblocked, vec![blocked.id]);
 
-        let blocked_now = db::get_task(&conn, blocked.id).unwrap().unwrap();
+        let blocked_now = db::get_task(&pool, blocked.id).await.unwrap().unwrap();
         assert_eq!(blocked_now.status, TaskStatus::Pending);
 
-        let review_now = db::get_task(&conn, in_review.id).unwrap().unwrap();
+        let review_now = db::get_task(&pool, in_review.id).await.unwrap().unwrap();
         assert_eq!(review_now.status, TaskStatus::Review);
     }
 
-    #[test]
-    fn cascade_unblock_keeps_task_blocked_when_other_dependencies_not_done() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn cascade_unblock_keeps_task_blocked_when_other_dependencies_not_done() {
+        let pool = test_pool().await;
 
         let session_id = Uuid::new_v4();
         let dep1 = sample_task(session_id, "dep1", TaskStatus::Done, vec![]);
@@ -270,14 +273,14 @@ mod tests {
             vec![dep1.id, dep2.id],
         );
 
-        db::insert_task(&conn, &dep1).unwrap();
-        db::insert_task(&conn, &dep2).unwrap();
-        db::insert_task(&conn, &blocked).unwrap();
+        db::insert_task(&pool, &dep1).await.unwrap();
+        db::insert_task(&pool, &dep2).await.unwrap();
+        db::insert_task(&pool, &blocked).await.unwrap();
 
-        let unblocked = cascade_unblock(&conn, dep1.id).unwrap();
+        let unblocked = cascade_unblock(&pool, dep1.id).await.unwrap();
         assert!(unblocked.is_empty());
 
-        let blocked_now = db::get_task(&conn, blocked.id).unwrap().unwrap();
+        let blocked_now = db::get_task(&pool, blocked.id).await.unwrap().unwrap();
         assert_eq!(blocked_now.status, TaskStatus::Blocked);
     }
 }

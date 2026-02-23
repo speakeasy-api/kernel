@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::Utc;
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::costs::{self, CostAction, CostCheckResult, CostThresholds};
@@ -13,10 +13,10 @@ use super::lifecycle::{self, LifecycleError};
 use super::scheduler::{self, Scheduler, SchedulerError};
 use super::*;
 
-fn setup_db() -> Connection {
-    let conn = Connection::open_in_memory().expect("in-memory db should open");
-    db::init_schema(&conn).expect("task schema should initialize");
-    conn
+use crate::db::test_pool;
+
+async fn setup_db() -> SqlitePool {
+    test_pool().await
 }
 
 fn make_task(title: &str, session_id: Uuid) -> Task {
@@ -131,64 +131,64 @@ mod type_tests {
 mod db_tests {
     use super::*;
 
-    #[test]
-    fn insert_and_get_task() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn insert_and_get_task() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let task = make_task("Test task", session_id);
 
-        db::insert_task(&conn, &task).unwrap();
-        let loaded = db::get_task(&conn, task.id).unwrap().unwrap();
+        db::insert_task(&pool, &task).await.unwrap();
+        let loaded = db::get_task(&pool, task.id).await.unwrap().unwrap();
 
         assert_eq!(loaded.title, "Test task");
         assert_eq!(loaded.status, TaskStatus::Pending);
         assert_eq!(loaded.depends_on, Vec::<Uuid>::new());
     }
 
-    #[test]
-    fn insert_task_with_dependencies() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn insert_task_with_dependencies() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let dependency = make_task("Dependency", session_id);
-        db::insert_task(&conn, &dependency).unwrap();
+        db::insert_task(&pool, &dependency).await.unwrap();
 
         let mut dependent = make_task("Dependent", session_id);
         dependent.depends_on = vec![dependency.id];
-        db::insert_task(&conn, &dependent).unwrap();
+        db::insert_task(&pool, &dependent).await.unwrap();
 
-        let loaded = db::get_task(&conn, dependent.id).unwrap().unwrap();
+        let loaded = db::get_task(&pool, dependent.id).await.unwrap().unwrap();
         assert_eq!(loaded.depends_on, vec![dependency.id]);
     }
 
-    #[test]
-    fn list_tasks_with_status_filter() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn list_tasks_with_status_filter() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let pending = make_task("Pending", session_id);
-        db::insert_task(&conn, &pending).unwrap();
+        db::insert_task(&pool, &pending).await.unwrap();
 
         let mut in_progress = make_task("In progress", session_id);
         in_progress.status = TaskStatus::InProgress;
-        db::insert_task(&conn, &in_progress).unwrap();
+        db::insert_task(&pool, &in_progress).await.unwrap();
 
-        let filtered = db::list_tasks(&conn, session_id, Some(TaskStatus::Pending)).unwrap();
+        let filtered = db::list_tasks(&pool, session_id, Some(TaskStatus::Pending)).await.unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, pending.id);
         assert_eq!(filtered[0].status, TaskStatus::Pending);
     }
 
-    #[test]
-    fn update_task_status_with_outcome() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn update_task_status_with_outcome() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let task = make_task("Target", session_id);
-        db::insert_task(&conn, &task).unwrap();
+        db::insert_task(&pool, &task).await.unwrap();
 
         let outcome = success_outcome();
-        db::update_task_status(&conn, task.id, TaskStatus::Done, Some(&outcome)).unwrap();
+        db::update_task_status(&pool, task.id, TaskStatus::Done, Some(&outcome)).await.unwrap();
 
-        let loaded = db::get_task(&conn, task.id).unwrap().unwrap();
+        let loaded = db::get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(loaded.status, TaskStatus::Done);
         assert!(matches!(
             loaded.outcome,
@@ -196,69 +196,69 @@ mod db_tests {
         ));
     }
 
-    #[test]
-    fn next_unblocked_respects_dependencies() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn next_unblocked_respects_dependencies() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let dependency = make_task("A", session_id);
-        db::insert_task(&conn, &dependency).unwrap();
+        db::insert_task(&pool, &dependency).await.unwrap();
 
         let mut dependent = make_task("B", session_id);
         dependent.depends_on = vec![dependency.id];
-        db::insert_task(&conn, &dependent).unwrap();
+        db::insert_task(&pool, &dependent).await.unwrap();
 
-        let initial = db::next_unblocked(&conn, session_id).unwrap();
+        let initial = db::next_unblocked(&pool, session_id).await.unwrap();
         assert_eq!(initial.len(), 1);
         assert_eq!(initial[0].id, dependency.id);
 
         let outcome = success_outcome();
-        db::update_task_status(&conn, dependency.id, TaskStatus::Done, Some(&outcome)).unwrap();
+        db::update_task_status(&pool, dependency.id, TaskStatus::Done, Some(&outcome)).await.unwrap();
 
-        let after = db::next_unblocked(&conn, session_id).unwrap();
+        let after = db::next_unblocked(&pool, session_id).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, dependent.id);
     }
 
-    #[test]
-    fn next_unblocked_priority_ordering() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn next_unblocked_priority_ordering() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let mut low = make_task("Low", session_id);
         low.priority = Priority::Low;
-        db::insert_task(&conn, &low).unwrap();
+        db::insert_task(&pool, &low).await.unwrap();
 
         let mut critical = make_task("Critical", session_id);
         critical.priority = Priority::Critical;
-        db::insert_task(&conn, &critical).unwrap();
+        db::insert_task(&pool, &critical).await.unwrap();
 
-        let unblocked = db::next_unblocked(&conn, session_id).unwrap();
+        let unblocked = db::next_unblocked(&pool, session_id).await.unwrap();
         assert_eq!(unblocked[0].id, critical.id);
     }
 
-    #[test]
-    fn get_task_tree_returns_edges() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn get_task_tree_returns_edges() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let parent = make_task("Parent", session_id);
-        db::insert_task(&conn, &parent).unwrap();
+        db::insert_task(&pool, &parent).await.unwrap();
 
         let mut child = make_task("Child", session_id);
         child.depends_on = vec![parent.id];
-        db::insert_task(&conn, &child).unwrap();
+        db::insert_task(&pool, &child).await.unwrap();
 
-        let (tasks, edges) = db::get_task_tree(&conn, session_id).unwrap();
+        let (tasks, edges) = db::get_task_tree(&pool, session_id).await.unwrap();
 
         assert_eq!(tasks.len(), 2);
         assert!(edges.contains(&(child.id, parent.id)));
     }
 
-    #[test]
-    fn get_task_returns_none_for_missing() {
-        let conn = setup_db();
-        let task = db::get_task(&conn, Uuid::new_v4()).unwrap();
+    #[tokio::test]
+    async fn get_task_returns_none_for_missing() {
+        let pool = setup_db().await;
+        let task = db::get_task(&pool, Uuid::new_v4()).await.unwrap();
         assert!(task.is_none());
     }
 }
@@ -318,50 +318,50 @@ mod lifecycle_tests {
         }
     }
 
-    #[test]
-    fn cascade_unblock() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn cascade_unblock() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let mut completed = make_task("A", session_id);
         completed.status = TaskStatus::Done;
         completed.outcome = Some(success_outcome());
-        db::insert_task(&conn, &completed).unwrap();
+        db::insert_task(&pool, &completed).await.unwrap();
 
         let mut blocked = make_task("B", session_id);
         blocked.status = TaskStatus::Blocked;
         blocked.depends_on = vec![completed.id];
-        db::insert_task(&conn, &blocked).unwrap();
+        db::insert_task(&pool, &blocked).await.unwrap();
 
-        let unblocked = lifecycle::cascade_unblock(&conn, completed.id).unwrap();
+        let unblocked = lifecycle::cascade_unblock(&pool, completed.id).await.unwrap();
         assert_eq!(unblocked, vec![blocked.id]);
 
-        let loaded = db::get_task(&conn, blocked.id).unwrap().unwrap();
+        let loaded = db::get_task(&pool, blocked.id).await.unwrap().unwrap();
         assert_eq!(loaded.status, TaskStatus::Pending);
     }
 
-    #[test]
-    fn cascade_unblock_partial_deps() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn cascade_unblock_partial_deps() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let mut dep_done = make_task("A", session_id);
         dep_done.status = TaskStatus::Done;
         dep_done.outcome = Some(success_outcome());
-        db::insert_task(&conn, &dep_done).unwrap();
+        db::insert_task(&pool, &dep_done).await.unwrap();
 
         let dep_pending = make_task("C", session_id);
-        db::insert_task(&conn, &dep_pending).unwrap();
+        db::insert_task(&pool, &dep_pending).await.unwrap();
 
         let mut blocked = make_task("B", session_id);
         blocked.status = TaskStatus::Blocked;
         blocked.depends_on = vec![dep_done.id, dep_pending.id];
-        db::insert_task(&conn, &blocked).unwrap();
+        db::insert_task(&pool, &blocked).await.unwrap();
 
-        let unblocked = lifecycle::cascade_unblock(&conn, dep_done.id).unwrap();
+        let unblocked = lifecycle::cascade_unblock(&pool, dep_done.id).await.unwrap();
         assert!(unblocked.is_empty());
 
-        let loaded = db::get_task(&conn, blocked.id).unwrap().unwrap();
+        let loaded = db::get_task(&pool, blocked.id).await.unwrap().unwrap();
         assert_eq!(loaded.status, TaskStatus::Blocked);
     }
 }
@@ -369,57 +369,57 @@ mod lifecycle_tests {
 mod scheduler_tests {
     use super::*;
 
-    #[test]
-    fn select_next_respects_max_concurrent() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn select_next_respects_max_concurrent() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         for idx in 0..5 {
             let task = make_task(&format!("Task {idx}"), session_id);
-            db::insert_task(&conn, &task).unwrap();
+            db::insert_task(&pool, &task).await.unwrap();
         }
 
         let scheduler = Scheduler::new(2);
-        let selected = scheduler.select_next(&conn, session_id).unwrap();
+        let selected = scheduler.select_next(&pool, session_id).await.unwrap();
         assert_eq!(selected.len(), 2);
     }
 
-    #[test]
-    fn select_next_returns_empty_at_capacity() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn select_next_returns_empty_at_capacity() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let task = make_task("T", session_id);
-        db::insert_task(&conn, &task).unwrap();
+        db::insert_task(&pool, &task).await.unwrap();
 
         let mut scheduler = Scheduler::new(1);
         scheduler.mark_active(Uuid::new_v4());
-        let selected = scheduler.select_next(&conn, session_id).unwrap();
+        let selected = scheduler.select_next(&pool, session_id).await.unwrap();
         assert!(selected.is_empty());
     }
 
-    #[test]
-    fn select_next_priority_ordering() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn select_next_priority_ordering() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let mut low = make_task("Low", session_id);
         low.priority = Priority::Low;
-        db::insert_task(&conn, &low).unwrap();
+        db::insert_task(&pool, &low).await.unwrap();
 
         let mut medium = make_task("Medium", session_id);
         medium.priority = Priority::Medium;
-        db::insert_task(&conn, &medium).unwrap();
+        db::insert_task(&pool, &medium).await.unwrap();
 
         let mut high = make_task("High", session_id);
         high.priority = Priority::High;
-        db::insert_task(&conn, &high).unwrap();
+        db::insert_task(&pool, &high).await.unwrap();
 
         let mut critical = make_task("Critical", session_id);
         critical.priority = Priority::Critical;
-        db::insert_task(&conn, &critical).unwrap();
+        db::insert_task(&pool, &critical).await.unwrap();
 
         let scheduler = Scheduler::new(4);
-        let selected = scheduler.select_next(&conn, session_id).unwrap();
+        let selected = scheduler.select_next(&pool, session_id).await.unwrap();
         assert_eq!(selected[0].id, critical.id);
     }
 
@@ -459,50 +459,51 @@ mod scheduler_tests {
         assert!(a_idx < b_idx && b_idx < c_idx);
     }
 
-    #[test]
-    fn dispatch_cycle_transitions_to_in_progress() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn dispatch_cycle_transitions_to_in_progress() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let first = make_task("First", session_id);
         let second = make_task("Second", session_id);
-        db::insert_task(&conn, &first).unwrap();
-        db::insert_task(&conn, &second).unwrap();
+        db::insert_task(&pool, &first).await.unwrap();
+        db::insert_task(&pool, &second).await.unwrap();
 
         let mut scheduler = Scheduler::new(2);
-        let started = scheduler.dispatch_cycle(&conn, session_id).unwrap();
+        let started = scheduler.dispatch_cycle(&pool, session_id).await.unwrap();
         assert_eq!(started.len(), 2);
 
         for task in started {
-            let loaded = db::get_task(&conn, task.id).unwrap().unwrap();
+            let loaded = db::get_task(&pool, task.id).await.unwrap().unwrap();
             assert_eq!(loaded.status, TaskStatus::InProgress);
         }
     }
 
-    #[test]
-    fn on_task_complete_unblocks_dependents() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn on_task_complete_unblocks_dependents() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
 
         let mut dependency = make_task("Dependency", session_id);
         dependency.status = TaskStatus::InProgress;
-        db::insert_task(&conn, &dependency).unwrap();
+        db::insert_task(&pool, &dependency).await.unwrap();
 
         let mut blocked = make_task("Blocked", session_id);
         blocked.status = TaskStatus::Blocked;
         blocked.depends_on = vec![dependency.id];
-        db::insert_task(&conn, &blocked).unwrap();
+        db::insert_task(&pool, &blocked).await.unwrap();
 
         let mut scheduler = Scheduler::new(2);
         scheduler.mark_active(dependency.id);
 
         let outcome = success_outcome();
         let unblocked = scheduler
-            .on_task_complete(&conn, dependency.id, TaskStatus::Done, Some(&outcome))
+            .on_task_complete(&pool, dependency.id, TaskStatus::Done, Some(&outcome))
+            .await
             .unwrap();
         assert_eq!(unblocked, vec![blocked.id]);
 
-        let loaded = db::get_task(&conn, blocked.id).unwrap().unwrap();
+        let loaded = db::get_task(&pool, blocked.id).await.unwrap().unwrap();
         assert_eq!(loaded.status, TaskStatus::Pending);
     }
 }
@@ -555,9 +556,9 @@ mod decomposition_tests {
         ));
     }
 
-    #[test]
-    fn persist_decomposition_creates_tasks() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn persist_decomposition_creates_tasks() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let request = DecompositionRequest {
             session_id,
@@ -584,7 +585,7 @@ mod decomposition_tests {
             ],
         };
 
-        let tasks = decomposition::persist_decomposition(&conn, &request, &result).unwrap();
+        let tasks = decomposition::persist_decomposition(&pool, &request, &result).await.unwrap();
         assert_eq!(tasks.len(), 2);
 
         let a = tasks.iter().find(|task| task.title == "A").unwrap();
@@ -663,51 +664,51 @@ mod engagement_tests {
 mod cost_tests {
     use super::*;
 
-    #[test]
-    fn record_and_read_cost() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn record_and_read_cost() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let task = make_task("T", session_id);
-        db::insert_task(&conn, &task).unwrap();
+        db::insert_task(&pool, &task).await.unwrap();
 
-        let total = costs::record_task_cost(&conn, task.id, 1.5).unwrap();
+        let total = costs::record_task_cost(&pool, task.id, 1.5).await.unwrap();
         assert!((total - 1.5).abs() < f64::EPSILON);
 
-        let total = costs::record_task_cost(&conn, task.id, 0.5).unwrap();
+        let total = costs::record_task_cost(&pool, task.id, 0.5).await.unwrap();
         assert!((total - 2.0).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn session_cost_sums_all_tasks() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn session_cost_sums_all_tasks() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let other_session = Uuid::new_v4();
 
         let t1 = make_task("T1", session_id);
         let t2 = make_task("T2", session_id);
         let t3 = make_task("T3", other_session);
-        db::insert_task(&conn, &t1).unwrap();
-        db::insert_task(&conn, &t2).unwrap();
-        db::insert_task(&conn, &t3).unwrap();
+        db::insert_task(&pool, &t1).await.unwrap();
+        db::insert_task(&pool, &t2).await.unwrap();
+        db::insert_task(&pool, &t3).await.unwrap();
 
-        costs::record_task_cost(&conn, t1.id, 1.0).unwrap();
-        costs::record_task_cost(&conn, t2.id, 2.0).unwrap();
-        costs::record_task_cost(&conn, t3.id, 9.0).unwrap();
+        costs::record_task_cost(&pool, t1.id, 1.0).await.unwrap();
+        costs::record_task_cost(&pool, t2.id, 2.0).await.unwrap();
+        costs::record_task_cost(&pool, t3.id, 9.0).await.unwrap();
 
-        let total = costs::session_cost(&conn, session_id).unwrap();
+        let total = costs::session_cost(&pool, session_id).await.unwrap();
         assert!((total - 3.0).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn check_cost_task_hard_limit() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn check_cost_task_hard_limit() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let task = make_task("T", session_id);
-        db::insert_task(&conn, &task).unwrap();
+        db::insert_task(&pool, &task).await.unwrap();
 
-        costs::record_task_cost(&conn, task.id, 6.0).unwrap();
+        costs::record_task_cost(&pool, task.id, 6.0).await.unwrap();
         let thresholds = CostThresholds::default();
-        let result = costs::check_cost(&conn, task.id, session_id, &thresholds).unwrap();
+        let result = costs::check_cost(&pool, task.id, session_id, &thresholds).await.unwrap();
 
         assert!(matches!(
             result,
@@ -719,17 +720,17 @@ mod cost_tests {
         ));
     }
 
-    #[test]
-    fn check_cost_session_warning() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn check_cost_session_warning() {
+        let pool = setup_db().await;
         let session_id = Uuid::new_v4();
         let task = make_task("T", session_id);
         let other = make_task("Other", session_id);
-        db::insert_task(&conn, &task).unwrap();
-        db::insert_task(&conn, &other).unwrap();
+        db::insert_task(&pool, &task).await.unwrap();
+        db::insert_task(&pool, &other).await.unwrap();
 
-        costs::record_task_cost(&conn, task.id, 1.0).unwrap();
-        costs::record_task_cost(&conn, other.id, 4.5).unwrap();
+        costs::record_task_cost(&pool, task.id, 1.0).await.unwrap();
+        costs::record_task_cost(&pool, other.id, 4.5).await.unwrap();
 
         let thresholds = CostThresholds {
             warn_at_task_usd: 10.0,
@@ -737,7 +738,7 @@ mod cost_tests {
             warn_at_session_usd: 5.0,
             hard_limit_session_usd: 100.0,
         };
-        let result = costs::check_cost(&conn, task.id, session_id, &thresholds).unwrap();
+        let result = costs::check_cost(&pool, task.id, session_id, &thresholds).await.unwrap();
 
         assert!(matches!(
             result,

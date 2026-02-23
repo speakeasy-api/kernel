@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 /// Cost thresholds from configuration.
@@ -53,45 +53,49 @@ pub enum CostCheckResult {
 }
 
 /// Add cost to a task and return the new total cost for that task.
-pub fn record_task_cost(
-    conn: &Connection,
+pub async fn record_task_cost(
+    pool: &SqlitePool,
     task_id: Uuid,
     cost_increment_usd: f64,
-) -> rusqlite::Result<f64> {
-    conn.execute(
+) -> Result<f64, sqlx::Error> {
+    sqlx::query(
         "UPDATE tasks SET cost_usd = cost_usd + ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-        params![cost_increment_usd, task_id.to_string()],
-    )?;
-
-    conn.query_row(
-        "SELECT cost_usd FROM tasks WHERE id = ?1",
-        params![task_id.to_string()],
-        |row| row.get(0),
     )
+    .bind(cost_increment_usd)
+    .bind(task_id.to_string())
+    .execute(pool)
+    .await?;
+
+    let row: (f64,) = sqlx::query_as("SELECT cost_usd FROM tasks WHERE id = ?1")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
 }
 
 /// Get total cost for all tasks in a session.
-pub fn session_cost(conn: &Connection, session_id: Uuid) -> rusqlite::Result<f64> {
-    conn.query_row(
-        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM tasks WHERE session_id = ?1",
-        params![session_id.to_string()],
-        |row| row.get(0),
-    )
+pub async fn session_cost(pool: &SqlitePool, session_id: Uuid) -> Result<f64, sqlx::Error> {
+    let row: (f64,) =
+        sqlx::query_as("SELECT COALESCE(SUM(cost_usd), 0.0) FROM tasks WHERE session_id = ?1")
+            .bind(session_id.to_string())
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0)
 }
 
 /// Check thresholds for a specific task and its session.
 /// Returns the most severe violation found: hard limit > warning > ok.
-pub fn check_cost(
-    conn: &Connection,
+pub async fn check_cost(
+    pool: &SqlitePool,
     task_id: Uuid,
     session_id: Uuid,
     thresholds: &CostThresholds,
-) -> rusqlite::Result<CostCheckResult> {
-    let task_cost: f64 = conn.query_row(
-        "SELECT cost_usd FROM tasks WHERE id = ?1",
-        params![task_id.to_string()],
-        |row| row.get(0),
-    )?;
+) -> Result<CostCheckResult, sqlx::Error> {
+    let row: (f64,) = sqlx::query_as("SELECT cost_usd FROM tasks WHERE id = ?1")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await?;
+    let task_cost = row.0;
 
     // Hard limits are enforced immediately (>=) with no grace period.
     if task_cost >= thresholds.hard_limit_task_usd {
@@ -102,7 +106,7 @@ pub fn check_cost(
         });
     }
 
-    let session_cost_total = session_cost(conn, session_id)?;
+    let session_cost_total = session_cost(pool, session_id).await?;
 
     if session_cost_total >= thresholds.hard_limit_session_usd {
         return Ok(CostCheckResult::SessionHardLimit {
@@ -168,23 +172,18 @@ pub fn enforcement_action(check: &CostCheckResult) -> CostAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::test_pool;
 
-    fn open_task_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::tasks::db::init_schema(&conn).unwrap();
-        conn
-    }
-
-    fn insert_task(conn: &Connection, task_id: Uuid, session_id: Uuid, cost_usd: f64) {
-        conn.execute(
+    async fn insert_task(pool: &SqlitePool, task_id: Uuid, session_id: Uuid, cost_usd: f64) {
+        sqlx::query(
             "INSERT INTO tasks (id, session_id, title, cost_usd) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                task_id.to_string(),
-                session_id.to_string(),
-                format!("task-{task_id}"),
-                cost_usd
-            ],
         )
+        .bind(task_id.to_string())
+        .bind(session_id.to_string())
+        .bind(format!("task-{task_id}"))
+        .bind(cost_usd)
+        .execute(pool)
+        .await
         .unwrap();
     }
 
@@ -197,39 +196,39 @@ mod tests {
         assert_eq!(defaults.hard_limit_session_usd, 50.0);
     }
 
-    #[test]
-    fn record_task_cost_increments_and_returns_total() {
-        let conn = open_task_db();
+    #[tokio::test]
+    async fn record_task_cost_increments_and_returns_total() {
+        let pool = test_pool().await;
         let session_id = Uuid::new_v4();
         let task_id = Uuid::new_v4();
-        insert_task(&conn, task_id, session_id, 1.25);
+        insert_task(&pool, task_id, session_id, 1.25).await;
 
-        let total = record_task_cost(&conn, task_id, 0.75).unwrap();
+        let total = record_task_cost(&pool, task_id, 0.75).await.unwrap();
         assert!((total - 2.0).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn session_cost_sums_all_tasks_in_session() {
-        let conn = open_task_db();
+    #[tokio::test]
+    async fn session_cost_sums_all_tasks_in_session() {
+        let pool = test_pool().await;
         let target_session = Uuid::new_v4();
         let other_session = Uuid::new_v4();
 
-        insert_task(&conn, Uuid::new_v4(), target_session, 1.10);
-        insert_task(&conn, Uuid::new_v4(), target_session, 2.40);
-        insert_task(&conn, Uuid::new_v4(), other_session, 9.99);
+        insert_task(&pool, Uuid::new_v4(), target_session, 1.10).await;
+        insert_task(&pool, Uuid::new_v4(), target_session, 2.40).await;
+        insert_task(&pool, Uuid::new_v4(), other_session, 9.99).await;
 
-        let total = session_cost(&conn, target_session).unwrap();
+        let total = session_cost(&pool, target_session).await.unwrap();
         assert!((total - 3.50).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn check_cost_prioritizes_task_hard_limit() {
-        let conn = open_task_db();
+    #[tokio::test]
+    async fn check_cost_prioritizes_task_hard_limit() {
+        let pool = test_pool().await;
         let session_id = Uuid::new_v4();
         let target_task = Uuid::new_v4();
 
-        insert_task(&conn, target_task, session_id, 5.0);
-        insert_task(&conn, Uuid::new_v4(), session_id, 100.0);
+        insert_task(&pool, target_task, session_id, 5.0).await;
+        insert_task(&pool, Uuid::new_v4(), session_id, 100.0).await;
 
         let thresholds = CostThresholds {
             warn_at_task_usd: 2.0,
@@ -238,7 +237,9 @@ mod tests {
             hard_limit_session_usd: 50.0,
         };
 
-        let result = check_cost(&conn, target_task, session_id, &thresholds).unwrap();
+        let result = check_cost(&pool, target_task, session_id, &thresholds)
+            .await
+            .unwrap();
         assert_eq!(
             result,
             CostCheckResult::TaskHardLimit {
@@ -249,14 +250,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn check_cost_prioritizes_session_hard_limit_over_warnings() {
-        let conn = open_task_db();
+    #[tokio::test]
+    async fn check_cost_prioritizes_session_hard_limit_over_warnings() {
+        let pool = test_pool().await;
         let session_id = Uuid::new_v4();
         let target_task = Uuid::new_v4();
 
-        insert_task(&conn, target_task, session_id, 3.0);
-        insert_task(&conn, Uuid::new_v4(), session_id, 8.0);
+        insert_task(&pool, target_task, session_id, 3.0).await;
+        insert_task(&pool, Uuid::new_v4(), session_id, 8.0).await;
 
         let thresholds = CostThresholds {
             warn_at_task_usd: 2.0,
@@ -265,7 +266,9 @@ mod tests {
             hard_limit_session_usd: 11.0,
         };
 
-        let result = check_cost(&conn, target_task, session_id, &thresholds).unwrap();
+        let result = check_cost(&pool, target_task, session_id, &thresholds)
+            .await
+            .unwrap();
         assert_eq!(
             result,
             CostCheckResult::SessionHardLimit {
@@ -276,14 +279,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn check_cost_returns_warning_when_limits_not_hit() {
-        let conn = open_task_db();
+    #[tokio::test]
+    async fn check_cost_returns_warning_when_limits_not_hit() {
+        let pool = test_pool().await;
         let session_id = Uuid::new_v4();
         let target_task = Uuid::new_v4();
 
-        insert_task(&conn, target_task, session_id, 2.5);
-        insert_task(&conn, Uuid::new_v4(), session_id, 1.0);
+        insert_task(&pool, target_task, session_id, 2.5).await;
+        insert_task(&pool, Uuid::new_v4(), session_id, 1.0).await;
 
         let thresholds = CostThresholds {
             warn_at_task_usd: 2.0,
@@ -292,7 +295,9 @@ mod tests {
             hard_limit_session_usd: 50.0,
         };
 
-        let result = check_cost(&conn, target_task, session_id, &thresholds).unwrap();
+        let result = check_cost(&pool, target_task, session_id, &thresholds)
+            .await
+            .unwrap();
         assert_eq!(
             result,
             CostCheckResult::TaskWarning {

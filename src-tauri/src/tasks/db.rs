@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::types::*;
@@ -12,61 +12,21 @@ const TASK_COLUMNS: &str = "id, session_id, title, description, status, priority
      parent_task, worktree_branch, base_ref, base_commit, merge_target_ref, outcome_kind, \
      outcome_data, engagement_override, cost_usd, created_at, updated_at";
 
-const SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending',
-    priority TEXT NOT NULL DEFAULT 'medium',
-    assigned_agent TEXT,
-    parent_task TEXT,
-    worktree_branch TEXT,
-    base_ref TEXT NOT NULL DEFAULT 'main',
-    base_commit TEXT NOT NULL DEFAULT '',
-    merge_target_ref TEXT NOT NULL DEFAULT 'main',
-    outcome_kind TEXT,
-    outcome_data TEXT,
-    engagement_override TEXT,
-    cost_usd REAL NOT NULL DEFAULT 0.0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS task_deps (
-    task_id TEXT NOT NULL,
-    depends_on_task_id TEXT NOT NULL,
-    PRIMARY KEY (task_id, depends_on_task_id),
-    FOREIGN KEY (task_id) REFERENCES tasks(id),
-    FOREIGN KEY (depends_on_task_id) REFERENCES tasks(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_parent_task ON tasks(parent_task);
-CREATE INDEX IF NOT EXISTS idx_task_deps_task_id ON task_deps(task_id);
-CREATE INDEX IF NOT EXISTS idx_task_deps_depends_on ON task_deps(depends_on_task_id);
-"#;
-
-pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA_SQL)
+pub async fn insert_task(pool: &SqlitePool, task: &Task) -> Result<(), sqlx::Error> {
+    insert_task_rows(pool, task).await
 }
 
-pub fn insert_task(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
-    let tx: Transaction<'_> = conn.unchecked_transaction()?;
-    insert_task_in_transaction(&tx, task)?;
-    tx.commit()
+pub async fn insert_task_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task: &Task,
+) -> Result<(), sqlx::Error> {
+    insert_task_rows_tx(&mut **tx, task).await
 }
 
-pub fn insert_task_in_transaction(tx: &Transaction<'_>, task: &Task) -> rusqlite::Result<()> {
-    insert_task_rows(tx, task)
-}
+async fn insert_task_rows(pool: &SqlitePool, task: &Task) -> Result<(), sqlx::Error> {
+    let (outcome_kind, outcome_data) = outcome_to_columns(task.outcome.as_ref());
 
-fn insert_task_rows(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
-    let (outcome_kind, outcome_data) = outcome_to_columns(task.outcome.as_ref())?;
-
-    conn.execute(
+    sqlx::query(
         "INSERT INTO tasks (
             id, session_id, title, description, status, priority, assigned_agent, parent_task,
             worktree_branch, base_ref, base_commit, merge_target_ref, outcome_kind, outcome_data,
@@ -76,88 +36,143 @@ fn insert_task_rows(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
             ?9, ?10, ?11, ?12, ?13, ?14,
             ?15, ?16, ?17, ?18
         )",
-        params![
-            task.id.to_string(),
-            task.session_id.to_string(),
-            task.title,
-            task.description,
-            task.status.as_str(),
-            task.priority.as_str(),
-            task.assigned_agent.map(|id| id.to_string()),
-            task.parent_task.map(|id| id.to_string()),
-            task.worktree_branch,
-            task.base_ref,
-            task.base_commit,
-            task.merge_target_ref,
-            outcome_kind,
-            outcome_data,
-            task.engagement_override.map(|level| level.as_str()),
-            task.cost_usd,
-            format_sqlite_timestamp(task.created_at),
-            format_sqlite_timestamp(task.updated_at),
-        ],
-    )?;
+    )
+    .bind(task.id.to_string())
+    .bind(task.session_id.to_string())
+    .bind(&task.title)
+    .bind(&task.description)
+    .bind(task.status.as_str())
+    .bind(task.priority.as_str())
+    .bind(task.assigned_agent.map(|id| id.to_string()))
+    .bind(task.parent_task.map(|id| id.to_string()))
+    .bind(&task.worktree_branch)
+    .bind(&task.base_ref)
+    .bind(&task.base_commit)
+    .bind(&task.merge_target_ref)
+    .bind(&outcome_kind)
+    .bind(&outcome_data)
+    .bind(task.engagement_override.map(|level| level.as_str()))
+    .bind(task.cost_usd)
+    .bind(format_sqlite_timestamp(task.created_at))
+    .bind(format_sqlite_timestamp(task.updated_at))
+    .execute(pool)
+    .await?;
 
     for dep in &task.depends_on {
-        conn.execute(
-            "INSERT INTO task_deps (task_id, depends_on_task_id) VALUES (?1, ?2)",
-            params![task.id.to_string(), dep.to_string()],
-        )?;
+        sqlx::query("INSERT INTO task_deps (task_id, depends_on_task_id) VALUES (?1, ?2)")
+            .bind(task.id.to_string())
+            .bind(dep.to_string())
+            .execute(pool)
+            .await?;
     }
 
     Ok(())
 }
 
-pub fn get_task(conn: &Connection, task_id: Uuid) -> rusqlite::Result<Option<Task>> {
-    let task = conn
-        .query_row(
-            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
-            params![task_id.to_string()],
-            row_to_task,
-        )
-        .optional()?;
+async fn insert_task_rows_tx(
+    conn: &mut sqlx::SqliteConnection,
+    task: &Task,
+) -> Result<(), sqlx::Error> {
+    let (outcome_kind, outcome_data) = outcome_to_columns(task.outcome.as_ref());
 
-    match task {
-        Some(mut task) => {
-            task.depends_on = load_dependencies(conn, task.id)?;
+    sqlx::query(
+        "INSERT INTO tasks (
+            id, session_id, title, description, status, priority, assigned_agent, parent_task,
+            worktree_branch, base_ref, base_commit, merge_target_ref, outcome_kind, outcome_data,
+            engagement_override, cost_usd, created_at, updated_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18
+        )",
+    )
+    .bind(task.id.to_string())
+    .bind(task.session_id.to_string())
+    .bind(&task.title)
+    .bind(&task.description)
+    .bind(task.status.as_str())
+    .bind(task.priority.as_str())
+    .bind(task.assigned_agent.map(|id| id.to_string()))
+    .bind(task.parent_task.map(|id| id.to_string()))
+    .bind(&task.worktree_branch)
+    .bind(&task.base_ref)
+    .bind(&task.base_commit)
+    .bind(&task.merge_target_ref)
+    .bind(&outcome_kind)
+    .bind(&outcome_data)
+    .bind(task.engagement_override.map(|level| level.as_str()))
+    .bind(task.cost_usd)
+    .bind(format_sqlite_timestamp(task.created_at))
+    .bind(format_sqlite_timestamp(task.updated_at))
+    .execute(&mut *conn)
+    .await?;
+
+    for dep in &task.depends_on {
+        sqlx::query("INSERT INTO task_deps (task_id, depends_on_task_id) VALUES (?1, ?2)")
+            .bind(task.id.to_string())
+            .bind(dep.to_string())
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn get_task(pool: &SqlitePool, task_id: Uuid) -> Result<Option<Task>, sqlx::Error> {
+    let row = sqlx::query_as::<_, TaskRow>(&format!(
+        "SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"
+    ))
+    .bind(task_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(row) => {
+            let mut task = row_to_task(row)?;
+            task.depends_on = load_dependencies(pool, task.id).await?;
             Ok(Some(task))
         }
         None => Ok(None),
     }
 }
 
-pub fn list_tasks(
-    conn: &Connection,
+pub async fn list_tasks(
+    pool: &SqlitePool,
     session_id: Uuid,
     status_filter: Option<TaskStatus>,
-) -> rusqlite::Result<Vec<Task>> {
-    let mut tasks = match status_filter {
+) -> Result<Vec<Task>, sqlx::Error> {
+    let rows = match status_filter {
         Some(status) => {
-            let mut stmt = conn.prepare(&format!(
+            sqlx::query_as::<_, TaskRow>(&format!(
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
                  WHERE session_id = ?1 AND status = ?2
                  ORDER BY created_at ASC"
-            ))?;
-            let rows = stmt.query_map(
-                params![session_id.to_string(), status.as_str()],
-                row_to_task,
-            )?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+            ))
+            .bind(session_id.to_string())
+            .bind(status.as_str())
+            .fetch_all(pool)
+            .await?
         }
         None => {
-            let mut stmt = conn.prepare(&format!(
+            sqlx::query_as::<_, TaskRow>(&format!(
                 "SELECT {TASK_COLUMNS}
                  FROM tasks
                  WHERE session_id = ?1
                  ORDER BY created_at ASC"
-            ))?;
-            let rows = stmt.query_map(params![session_id.to_string()], row_to_task)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+            ))
+            .bind(session_id.to_string())
+            .fetch_all(pool)
+            .await?
         }
     };
 
-    let mut dep_map = load_dependency_map(conn, session_id)?;
+    let mut tasks: Vec<Task> = rows
+        .into_iter()
+        .map(row_to_task)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut dep_map = load_dependency_map(pool, session_id).await?;
     for task in &mut tasks {
         task.depends_on = dep_map.remove(&task.id).unwrap_or_default();
     }
@@ -165,68 +180,78 @@ pub fn list_tasks(
     Ok(tasks)
 }
 
-pub fn update_task_status(
-    conn: &Connection,
+pub async fn update_task_status(
+    pool: &SqlitePool,
     task_id: Uuid,
     status: TaskStatus,
     outcome: Option<&TaskOutcome>,
-) -> rusqlite::Result<()> {
-    let (outcome_kind, outcome_data) = outcome_to_columns(outcome)?;
-    conn.execute(
+) -> Result<(), sqlx::Error> {
+    let (outcome_kind, outcome_data) = outcome_to_columns(outcome);
+    sqlx::query(
         "UPDATE tasks
          SET status = ?1, outcome_kind = ?2, outcome_data = ?3, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?4",
-        params![
-            status.as_str(),
-            outcome_kind,
-            outcome_data,
-            task_id.to_string(),
-        ],
-    )?;
+    )
+    .bind(status.as_str())
+    .bind(&outcome_kind)
+    .bind(&outcome_data)
+    .bind(task_id.to_string())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub fn update_task_engagement(
-    conn: &Connection,
+pub async fn update_task_engagement(
+    pool: &SqlitePool,
     task_id: Uuid,
     engagement: Option<EngagementLevel>,
-) -> rusqlite::Result<()> {
-    conn.execute(
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
         "UPDATE tasks
          SET engagement_override = ?1, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?2",
-        params![engagement.map(|level| level.as_str()), task_id.to_string()],
-    )?;
+    )
+    .bind(engagement.map(|level| level.as_str()))
+    .bind(task_id.to_string())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub fn get_task_tree(
-    conn: &Connection,
+pub async fn get_task_tree(
+    pool: &SqlitePool,
     session_id: Uuid,
-) -> rusqlite::Result<(Vec<Task>, Vec<(Uuid, Uuid)>)> {
-    let tasks = list_tasks(conn, session_id, None)?;
+) -> Result<(Vec<Task>, Vec<(Uuid, Uuid)>), sqlx::Error> {
+    let tasks = list_tasks(pool, session_id, None).await?;
 
-    let mut stmt = conn.prepare(
+    let edge_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT td.task_id, td.depends_on_task_id
          FROM task_deps td
          JOIN tasks t ON t.id = td.task_id
          WHERE t.session_id = ?1",
-    )?;
-    let rows = stmt.query_map(params![session_id.to_string()], |row| {
-        let task_id_raw: String = row.get(0)?;
-        let depends_on_raw: String = row.get(1)?;
-        Ok((
-            parse_uuid(&task_id_raw, "task_deps.task_id")?,
-            parse_uuid(&depends_on_raw, "task_deps.depends_on_task_id")?,
-        ))
-    })?;
-    let edges = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    )
+    .bind(session_id.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    let edges: Vec<(Uuid, Uuid)> = edge_rows
+        .into_iter()
+        .map(|(tid, did)| {
+            Ok((
+                parse_uuid(&tid, "task_deps.task_id")?,
+                parse_uuid(&did, "task_deps.depends_on_task_id")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     Ok((tasks, edges))
 }
 
-pub fn next_unblocked(conn: &Connection, session_id: Uuid) -> rusqlite::Result<Vec<Task>> {
-    let mut stmt = conn.prepare(&format!(
+pub async fn next_unblocked(
+    pool: &SqlitePool,
+    session_id: Uuid,
+) -> Result<Vec<Task>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, TaskRow>(&format!(
         "SELECT {TASK_COLUMNS}
          FROM tasks t
          WHERE t.session_id = ?1
@@ -247,11 +272,17 @@ pub fn next_unblocked(conn: &Connection, session_id: Uuid) -> rusqlite::Result<V
              ELSE 0
            END DESC,
            t.created_at ASC"
-    ))?;
-    let rows = stmt.query_map(params![session_id.to_string()], row_to_task)?;
-    let mut tasks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    ))
+    .bind(session_id.to_string())
+    .fetch_all(pool)
+    .await?;
 
-    let mut dep_map = load_dependency_map(conn, session_id)?;
+    let mut tasks: Vec<Task> = rows
+        .into_iter()
+        .map(row_to_task)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut dep_map = load_dependency_map(pool, session_id).await?;
     for task in &mut tasks {
         task.depends_on = dep_map.remove(&task.id).unwrap_or_default();
     }
@@ -259,127 +290,135 @@ pub fn next_unblocked(conn: &Connection, session_id: Uuid) -> rusqlite::Result<V
     Ok(tasks)
 }
 
-pub fn find_dependents(conn: &Connection, task_id: Uuid) -> rusqlite::Result<Vec<Uuid>> {
-    let mut stmt = conn.prepare(
+pub async fn find_dependents(pool: &SqlitePool, task_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT task_id
          FROM task_deps
          WHERE depends_on_task_id = ?1
          ORDER BY task_id ASC",
-    )?;
-    let rows = stmt.query_map(params![task_id.to_string()], |row| {
-        let task_id_raw: String = row.get(0)?;
-        parse_uuid(&task_id_raw, "task_deps.task_id")
-    })?;
-    rows.collect()
+    )
+    .bind(task_id.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(tid,)| parse_uuid(&tid, "task_deps.task_id"))
+        .collect()
 }
 
-fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
-    let id_raw: String = row.get(0)?;
-    let session_id_raw: String = row.get(1)?;
-    let status_raw: String = row.get(4)?;
-    let priority_raw: String = row.get(5)?;
-    let assigned_agent_raw: Option<String> = row.get(6)?;
-    let parent_task_raw: Option<String> = row.get(7)?;
-    let outcome_kind: Option<String> = row.get(12)?;
-    let outcome_data: Option<String> = row.get(13)?;
-    let engagement_override_raw: Option<String> = row.get(14)?;
-    let created_at_raw: String = row.get(16)?;
-    let updated_at_raw: String = row.get(17)?;
+// ---- Internal types and helpers ----
 
+#[derive(sqlx::FromRow)]
+struct TaskRow {
+    id: String,
+    session_id: String,
+    title: String,
+    description: String,
+    status: String,
+    priority: String,
+    assigned_agent: Option<String>,
+    parent_task: Option<String>,
+    worktree_branch: Option<String>,
+    base_ref: String,
+    base_commit: String,
+    merge_target_ref: String,
+    outcome_kind: Option<String>,
+    outcome_data: Option<String>,
+    engagement_override: Option<String>,
+    cost_usd: f64,
+    created_at: String,
+    updated_at: String,
+}
+
+fn row_to_task(row: TaskRow) -> Result<Task, sqlx::Error> {
     Ok(Task {
-        id: parse_uuid(&id_raw, "tasks.id")?,
-        session_id: parse_uuid(&session_id_raw, "tasks.session_id")?,
-        title: row.get(2)?,
-        description: row.get(3)?,
-        status: TaskStatus::try_from(status_raw.as_str()).map_err(invalid_data)?,
-        priority: Priority::try_from(priority_raw.as_str()).map_err(invalid_data)?,
-        assigned_agent: parse_optional_uuid(assigned_agent_raw.as_deref(), "tasks.assigned_agent")?,
-        parent_task: parse_optional_uuid(parent_task_raw.as_deref(), "tasks.parent_task")?,
+        id: parse_uuid(&row.id, "tasks.id")?,
+        session_id: parse_uuid(&row.session_id, "tasks.session_id")?,
+        title: row.title,
+        description: row.description,
+        status: TaskStatus::try_from(row.status.as_str()).map_err(invalid_data)?,
+        priority: Priority::try_from(row.priority.as_str()).map_err(invalid_data)?,
+        assigned_agent: parse_optional_uuid(row.assigned_agent.as_deref(), "tasks.assigned_agent")?,
+        parent_task: parse_optional_uuid(row.parent_task.as_deref(), "tasks.parent_task")?,
         depends_on: Vec::new(),
-        worktree_branch: row.get(8)?,
-        base_ref: row.get(9)?,
-        base_commit: row.get(10)?,
-        merge_target_ref: row.get(11)?,
-        outcome: outcome_from_columns(outcome_kind, outcome_data)?,
-        engagement_override: match engagement_override_raw.as_deref() {
+        worktree_branch: row.worktree_branch,
+        base_ref: row.base_ref,
+        base_commit: row.base_commit,
+        merge_target_ref: row.merge_target_ref,
+        outcome: outcome_from_columns(row.outcome_kind, row.outcome_data)?,
+        engagement_override: match row.engagement_override.as_deref() {
             Some(level) => Some(EngagementLevel::try_from(level).map_err(invalid_data)?),
             None => None,
         },
-        cost_usd: row.get(15)?,
-        created_at: parse_timestamp(&created_at_raw, "tasks.created_at")?,
-        updated_at: parse_timestamp(&updated_at_raw, "tasks.updated_at")?,
+        cost_usd: row.cost_usd,
+        created_at: parse_timestamp(&row.created_at, "tasks.created_at")?,
+        updated_at: parse_timestamp(&row.updated_at, "tasks.updated_at")?,
     })
 }
 
-fn load_dependencies(conn: &Connection, task_id: Uuid) -> rusqlite::Result<Vec<Uuid>> {
-    let mut stmt = conn.prepare(
+async fn load_dependencies(pool: &SqlitePool, task_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT depends_on_task_id
          FROM task_deps
          WHERE task_id = ?1
          ORDER BY depends_on_task_id ASC",
-    )?;
-    let rows = stmt.query_map(params![task_id.to_string()], |row| {
-        let dep_raw: String = row.get(0)?;
-        parse_uuid(&dep_raw, "task_deps.depends_on_task_id")
-    })?;
-    rows.collect()
+    )
+    .bind(task_id.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(dep,)| parse_uuid(&dep, "task_deps.depends_on_task_id"))
+        .collect()
 }
 
-fn load_dependency_map(
-    conn: &Connection,
+async fn load_dependency_map(
+    pool: &SqlitePool,
     session_id: Uuid,
-) -> rusqlite::Result<HashMap<Uuid, Vec<Uuid>>> {
-    let mut stmt = conn.prepare(
+) -> Result<HashMap<Uuid, Vec<Uuid>>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT td.task_id, td.depends_on_task_id
          FROM task_deps td
          JOIN tasks t ON t.id = td.task_id
          WHERE t.session_id = ?1
          ORDER BY td.task_id ASC, td.depends_on_task_id ASC",
-    )?;
-    let rows = stmt.query_map(params![session_id.to_string()], |row| {
-        let task_id_raw: String = row.get(0)?;
-        let depends_on_raw: String = row.get(1)?;
-        Ok((
-            parse_uuid(&task_id_raw, "task_deps.task_id")?,
-            parse_uuid(&depends_on_raw, "task_deps.depends_on_task_id")?,
-        ))
-    })?;
+    )
+    .bind(session_id.to_string())
+    .fetch_all(pool)
+    .await?;
 
     let mut map: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-    for edge in rows {
-        let (task_id, depends_on_task_id) = edge?;
+    for (task_id_raw, depends_on_raw) in rows {
+        let task_id = parse_uuid(&task_id_raw, "task_deps.task_id")?;
+        let depends_on_task_id = parse_uuid(&depends_on_raw, "task_deps.depends_on_task_id")?;
         map.entry(task_id).or_default().push(depends_on_task_id);
     }
     Ok(map)
 }
 
-fn outcome_to_columns(
-    outcome: Option<&TaskOutcome>,
-) -> rusqlite::Result<(Option<String>, Option<String>)> {
+fn outcome_to_columns(outcome: Option<&TaskOutcome>) -> (Option<String>, Option<String>) {
     let Some(outcome) = outcome else {
-        return Ok((None, None));
+        return (None, None);
     };
 
-    let encoded = serde_json::to_value(outcome)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let encoded = serde_json::to_value(outcome).expect("TaskOutcome serialization should not fail");
     let kind = encoded
         .get("kind")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| invalid_data("task outcome serialized without kind".to_string()))?;
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
     let data = encoded
         .get("data")
-        .cloned()
-        .ok_or_else(|| invalid_data("task outcome serialized without data".to_string()))?;
-    let data_json = serde_json::to_string(&data)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        .map(|v| serde_json::to_string(v).unwrap_or_default())
+        .unwrap_or_default();
 
-    Ok((Some(kind.to_string()), Some(data_json)))
+    (Some(kind), Some(data))
 }
 
 fn outcome_from_columns(
     outcome_kind: Option<String>,
     outcome_data: Option<String>,
-) -> rusqlite::Result<Option<TaskOutcome>> {
+) -> Result<Option<TaskOutcome>, sqlx::Error> {
     match (outcome_kind, outcome_data) {
         (None, None) => Ok(None),
         (Some(_), None) | (None, Some(_)) => Err(invalid_data(
@@ -399,18 +438,18 @@ fn outcome_from_columns(
     }
 }
 
-fn parse_uuid(value: &str, field: &str) -> rusqlite::Result<Uuid> {
+fn parse_uuid(value: &str, field: &str) -> Result<Uuid, sqlx::Error> {
     Uuid::parse_str(value).map_err(|e| invalid_data(format!("invalid UUID in {field}: {e}")))
 }
 
-fn parse_optional_uuid(value: Option<&str>, field: &str) -> rusqlite::Result<Option<Uuid>> {
+fn parse_optional_uuid(value: Option<&str>, field: &str) -> Result<Option<Uuid>, sqlx::Error> {
     match value {
         Some(raw) => parse_uuid(raw, field).map(Some),
         None => Ok(None),
     }
 }
 
-fn parse_timestamp(value: &str, field: &str) -> rusqlite::Result<DateTime<Utc>> {
+fn parse_timestamp(value: &str, field: &str) -> Result<DateTime<Utc>, sqlx::Error> {
     NaiveDateTime::parse_from_str(value, SQLITE_TIMESTAMP_FORMAT)
         .map(|naive| naive.and_utc())
         .map_err(|e| invalid_data(format!("invalid timestamp in {field}: {e}")))
@@ -420,24 +459,17 @@ fn format_sqlite_timestamp(value: DateTime<Utc>) -> String {
     value.format(SQLITE_TIMESTAMP_FORMAT).to_string()
 }
 
-fn invalid_data(message: String) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            message,
-        )),
-    )
+fn invalid_data(message: String) -> sqlx::Error {
+    sqlx::Error::Protocol(message)
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use rusqlite::Connection;
     use uuid::Uuid;
 
     use super::*;
+    use crate::db::test_pool;
 
     fn sample_task(session_id: Uuid) -> Task {
         let now = Utc::now();
@@ -463,23 +495,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_task_engagement_handles_some_and_none() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
+    #[tokio::test]
+    async fn update_task_engagement_handles_some_and_none() {
+        let pool = test_pool().await;
 
         let task = sample_task(Uuid::new_v4());
-        insert_task(&conn, &task).unwrap();
+        insert_task(&pool, &task).await.unwrap();
 
-        update_task_engagement(&conn, task.id, Some(EngagementLevel::ReviewGates)).unwrap();
-        let updated = get_task(&conn, task.id).unwrap().unwrap();
+        update_task_engagement(&pool, task.id, Some(EngagementLevel::ReviewGates))
+            .await
+            .unwrap();
+        let updated = get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(
             updated.engagement_override,
             Some(EngagementLevel::ReviewGates)
         );
 
-        update_task_engagement(&conn, task.id, None).unwrap();
-        let cleared = get_task(&conn, task.id).unwrap().unwrap();
+        update_task_engagement(&pool, task.id, None).await.unwrap();
+        let cleared = get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(cleared.engagement_override, None);
     }
 }
