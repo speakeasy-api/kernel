@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 
 use super::types::{Event, EventData};
 use crate::db::queries::{get_ux_state, update_ux_state};
@@ -137,19 +137,19 @@ impl EventAccumulator {
 
     /// Save the cursor to the `ux_agent_state` table so we can resume after
     /// restart.
-    pub fn persist_cursor(&self, conn: &Connection) -> Result<(), rusqlite::Error> {
+    pub async fn persist_cursor(&self, pool: &SqlitePool) -> Result<(), sqlx::Error> {
         if let (Some(id), Some(at)) = (&self.cursor.last_event_id, &self.cursor.last_event_at) {
-            update_ux_state(conn, "accumulator", id, at)?;
+            update_ux_state(pool, "accumulator", id, at).await?;
         }
         Ok(())
     }
 
     /// Load a previously-persisted cursor from the database.
-    pub fn restore_cursor(conn: &Connection) -> Result<AccumulatorCursor, rusqlite::Error> {
-        match get_ux_state(conn, "accumulator")? {
-            Some(state) => Ok(AccumulatorCursor {
-                last_event_id: state.last_event_id,
-                last_event_at: state.last_event_at,
+    pub async fn restore_cursor(pool: &SqlitePool) -> Result<AccumulatorCursor, sqlx::Error> {
+        match get_ux_state(pool, "accumulator").await? {
+            Some((last_event_id, last_event_at)) => Ok(AccumulatorCursor {
+                last_event_id,
+                last_event_at,
             }),
             None => Ok(AccumulatorCursor::default()),
         }
@@ -167,7 +167,7 @@ impl EventAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migrations;
+    use crate::db::test_pool;
     use crate::events::{EventData, EventMetadata};
     use chrono::Utc;
     use uuid::Uuid;
@@ -500,15 +500,9 @@ mod tests {
 
     // --- Cursor persistence ---
 
-    fn setup_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        migrations::run_migrations(&conn).unwrap();
-        conn
-    }
-
-    #[test]
-    fn cursor_persist_and_restore() {
-        let conn = setup_db();
+    #[tokio::test]
+    async fn cursor_persist_and_restore() {
+        let pool = test_pool().await;
         let mut acc = EventAccumulator::new();
 
         // Feed one event so cursor is populated
@@ -518,17 +512,17 @@ mod tests {
             duration_ms: 1,
         }));
 
-        acc.persist_cursor(&conn).unwrap();
+        acc.persist_cursor(&pool).await.unwrap();
 
-        let restored = EventAccumulator::restore_cursor(&conn).unwrap();
+        let restored = EventAccumulator::restore_cursor(&pool).await.unwrap();
         assert_eq!(restored.last_event_id, acc.cursor.last_event_id);
         assert_eq!(restored.last_event_at, acc.cursor.last_event_at);
     }
 
-    #[test]
-    fn restore_cursor_returns_default_when_empty() {
-        let conn = setup_db();
-        let cursor = EventAccumulator::restore_cursor(&conn).unwrap();
+    #[tokio::test]
+    async fn restore_cursor_returns_default_when_empty() {
+        let pool = test_pool().await;
+        let cursor = EventAccumulator::restore_cursor(&pool).await.unwrap();
         assert!(cursor.last_event_id.is_none());
         assert!(cursor.last_event_at.is_none());
     }

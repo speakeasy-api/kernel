@@ -71,12 +71,12 @@ pub fn default_tools_for_role(role: &AgentRole) -> Vec<String> {
             .map(String::from)
             .collect(),
         AgentRole::Implementation | AgentRole::Test | AgentRole::Unstuck => {
-            vec!["fs_read", "fs_write", "glob", "grep", "shell", "git"]
+            vec!["fs_read", "fs_write", "glob", "grep", "shell"]
                 .into_iter()
                 .map(String::from)
                 .collect()
         }
-        AgentRole::Review => vec!["fs_read", "glob", "grep", "git"]
+        AgentRole::Review => vec!["fs_read", "glob", "grep"]
             .into_iter()
             .map(String::from)
             .collect(),
@@ -149,19 +149,19 @@ mod tests {
         );
         assert_eq!(
             default_tools_for_role(&AgentRole::Implementation),
-            vec!["fs_read", "fs_write", "glob", "grep", "shell", "git"]
+            vec!["fs_read", "fs_write", "glob", "grep", "shell"]
         );
         assert_eq!(
             default_tools_for_role(&AgentRole::Test),
-            vec!["fs_read", "fs_write", "glob", "grep", "shell", "git"]
+            vec!["fs_read", "fs_write", "glob", "grep", "shell"]
         );
         assert_eq!(
             default_tools_for_role(&AgentRole::Review),
-            vec!["fs_read", "glob", "grep", "git"]
+            vec!["fs_read", "glob", "grep"]
         );
         assert_eq!(
             default_tools_for_role(&AgentRole::Unstuck),
-            vec!["fs_read", "fs_write", "glob", "grep", "shell", "git"]
+            vec!["fs_read", "fs_write", "glob", "grep", "shell"]
         );
     }
 

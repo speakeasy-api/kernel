@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDateTime;
-use rusqlite::{params, Connection};
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::db::queries as db_queries;
@@ -9,7 +9,7 @@ use crate::events::{Event, EventData, EventMetadata};
 
 #[derive(Debug)]
 pub enum QueryError {
-    Db(rusqlite::Error),
+    Db(sqlx::Error),
     Json(serde_json::Error),
     InvalidUuid(uuid::Error),
     InvalidTimestamp(String),
@@ -28,8 +28,8 @@ impl std::fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
-impl From<rusqlite::Error> for QueryError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<sqlx::Error> for QueryError {
+    fn from(e: sqlx::Error) -> Self {
         Self::Db(e)
     }
 }
@@ -77,56 +77,45 @@ fn to_typed(db_event: &crate::db::models::Event) -> Result<Event, QueryError> {
     })
 }
 
-/// Map a rusqlite row (id, kind, session_id, agent_id, data, created_at) to a db Event.
-fn row_to_db_event(row: &rusqlite::Row) -> Result<crate::db::models::Event, rusqlite::Error> {
-    Ok(crate::db::models::Event {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        session_id: row.get(2)?,
-        agent_id: row.get(3)?,
-        data: row.get(4)?,
-        created_at: row.get(5)?,
-    })
-}
-
 /// All events in a session after the given timestamp, deserialized to typed events.
-pub fn events_since(
-    conn: &Connection,
+pub async fn events_since(
+    pool: &SqlitePool,
     session_id: &str,
     since: &str,
 ) -> Result<Vec<Event>, QueryError> {
-    let db_events = db_queries::events_since(conn, session_id, since)?;
+    let db_events = db_queries::events_since(pool, session_id, since).await?;
     db_events.iter().map(to_typed).collect()
 }
 
 /// All events matching a variant name (the `kind` column) after the given timestamp.
-pub fn events_by_variant(
-    conn: &Connection,
+pub async fn events_by_variant(
+    pool: &SqlitePool,
     variant: &str,
     since: &str,
 ) -> Result<Vec<Event>, QueryError> {
-    let db_events = db_queries::events_by_kind(conn, variant, since)?;
+    let db_events = db_queries::events_by_kind(pool, variant, since).await?;
     db_events.iter().map(to_typed).collect()
 }
 
 /// Count of events per variant name within a session after the given timestamp.
-pub fn aggregate_by_variant(
-    conn: &Connection,
+pub async fn aggregate_by_variant(
+    pool: &SqlitePool,
     session_id: &str,
     since: &str,
 ) -> Result<HashMap<String, u64>, QueryError> {
-    let mut stmt = conn.prepare(
+    let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT kind, COUNT(*) FROM events
          WHERE session_id = ?1 AND created_at > ?2
          GROUP BY kind",
-    )?;
-    let rows = stmt.query_map(params![session_id, since], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-    })?;
+    )
+    .bind(session_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+
     let mut map = HashMap::new();
-    for row in rows {
-        let (kind, count) = row?;
-        map.insert(kind, count);
+    for (kind, count) in rows {
+        map.insert(kind, count as u64);
     }
     Ok(map)
 }
@@ -136,83 +125,89 @@ pub fn aggregate_by_variant(
 /// Review events: PlanAccepted, PlanRejected, DiffAccepted, DiffRejected, HunkRejected.
 /// Rejected: PlanRejected, DiffRejected, HunkRejected.
 /// Returns 0.0 when there are no review events in the window.
-pub fn rejection_rate(
-    conn: &Connection,
+pub async fn rejection_rate(
+    pool: &SqlitePool,
     session_id: &str,
     window_seconds: i64,
 ) -> Result<f32, QueryError> {
     let window_param = format!("-{window_seconds} seconds");
 
-    let total: u64 = conn.query_row(
+    let total: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM events
          WHERE session_id = ?1
            AND kind IN ('PlanAccepted', 'PlanRejected',
                         'DiffAccepted', 'DiffRejected', 'HunkRejected')
            AND created_at > datetime('now', ?2)",
-        params![session_id, window_param],
-        |row| row.get(0),
-    )?;
+    )
+    .bind(session_id)
+    .bind(&window_param)
+    .fetch_one(pool)
+    .await?;
 
-    if total == 0 {
+    if total.0 == 0 {
         return Ok(0.0);
     }
 
-    let rejected: u64 = conn.query_row(
+    let rejected: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM events
          WHERE session_id = ?1
            AND kind IN ('PlanRejected', 'DiffRejected', 'HunkRejected')
            AND created_at > datetime('now', ?2)",
-        params![session_id, window_param],
-        |row| row.get(0),
-    )?;
+    )
+    .bind(session_id)
+    .bind(&window_param)
+    .fetch_one(pool)
+    .await?;
 
-    Ok(rejected as f32 / total as f32)
+    Ok(rejected.0 as f32 / total.0 as f32)
 }
 
 /// Total cost (USD) from all CostIncurred events in a session.
-pub fn cost_total(conn: &Connection, session_id: &str) -> Result<f64, QueryError> {
-    let total: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(json_extract(data, '$.cost_usd')), 0.0)
+pub async fn cost_total(pool: &SqlitePool, session_id: &str) -> Result<f64, QueryError> {
+    let row: (f64,) = sqlx::query_as(
+        "SELECT CAST(COALESCE(SUM(json_extract(data, '$.cost_usd')), 0.0) AS REAL)
          FROM events
          WHERE session_id = ?1 AND kind = 'CostIncurred'",
-        params![session_id],
-        |row| row.get(0),
-    )?;
-    Ok(total)
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
 }
 
 /// Total cost (USD) for a specific task, joining through the agents table
 /// to find agents assigned to the task.
-pub fn cost_total_task(conn: &Connection, task_id: &str) -> Result<f64, QueryError> {
-    let total: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(json_extract(e.data, '$.cost_usd')), 0.0)
+pub async fn cost_total_task(pool: &SqlitePool, task_id: &str) -> Result<f64, QueryError> {
+    let row: (f64,) = sqlx::query_as(
+        "SELECT CAST(COALESCE(SUM(json_extract(e.data, '$.cost_usd')), 0.0) AS REAL)
          FROM events e
          JOIN agents a ON e.agent_id = a.id
          WHERE a.task_id = ?1 AND e.kind = 'CostIncurred'",
-        params![task_id],
-        |row| row.get(0),
-    )?;
-    Ok(total)
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
 }
 
 /// All AgentLooped events in a session after the given timestamp.
-pub fn loop_detections(
-    conn: &Connection,
+pub async fn loop_detections(
+    pool: &SqlitePool,
     session_id: &str,
     since: &str,
 ) -> Result<Vec<Event>, QueryError> {
-    let mut stmt = conn.prepare(
+    let db_events: Vec<crate::db::models::Event> = sqlx::query_as(
         "SELECT id, kind, session_id, agent_id, data, created_at
          FROM events
          WHERE session_id = ?1 AND kind = 'AgentLooped' AND created_at > ?2
          ORDER BY created_at ASC",
-    )?;
-    let rows = stmt.query_map(params![session_id, since], row_to_db_event)?;
-    let mut events = Vec::new();
-    for row in rows {
-        events.push(to_typed(&row?)?);
-    }
-    Ok(events)
+    )
+    .bind(session_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+
+    db_events.iter().map(to_typed).collect()
 }
 
 /// Aggregate raw events into the `stats_rollups` table for the given window period.
@@ -221,81 +216,94 @@ pub fn loop_detections(
 /// - `count.<VariantName>` — event count per variant
 /// - `cost.usd` — total cost from CostIncurred events
 /// - `tokens.total` — total tokens from TokensUsed events
-pub fn rollup_metrics(
-    conn: &Connection,
+pub async fn rollup_metrics(
+    pool: &SqlitePool,
     session_id: &str,
     window_seconds: i64,
 ) -> Result<(), QueryError> {
     let window_param = format!("-{window_seconds} seconds");
 
-    let (period_start, period_end): (String, String) = conn.query_row(
+    let row: (String, String) = sqlx::query_as(
         "SELECT datetime('now', ?1), datetime('now')",
-        params![window_param],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    )
+    .bind(&window_param)
+    .fetch_one(pool)
+    .await?;
+    let (period_start, period_end) = row;
 
     // Counts per variant
-    let mut stmt = conn.prepare(
+    let variant_counts: Vec<(String, i64)> = sqlx::query_as(
         "SELECT kind, COUNT(*) FROM events
          WHERE session_id = ?1 AND created_at > ?2 AND created_at <= ?3
          GROUP BY kind",
-    )?;
-    let variant_counts = stmt.query_map(params![session_id, period_start, period_end], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-    })?;
-    for row in variant_counts {
-        let (kind, count) = row?;
+    )
+    .bind(session_id)
+    .bind(&period_start)
+    .bind(&period_end)
+    .fetch_all(pool)
+    .await?;
+
+    for (kind, count) in variant_counts {
         db_queries::insert_rollup(
-            conn,
+            pool,
             "session",
             Some(session_id),
             &period_start,
             &period_end,
             &format!("count.{kind}"),
-            count,
-        )?;
+            count as f64,
+        )
+        .await?;
     }
 
     // Total cost
-    let total_cost: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(json_extract(data, '$.cost_usd')), 0.0)
+    let total_cost: (f64,) = sqlx::query_as(
+        "SELECT CAST(COALESCE(SUM(json_extract(data, '$.cost_usd')), 0.0) AS REAL)
          FROM events
          WHERE session_id = ?1 AND kind = 'CostIncurred'
            AND created_at > ?2 AND created_at <= ?3",
-        params![session_id, period_start, period_end],
-        |row| row.get(0),
-    )?;
+    )
+    .bind(session_id)
+    .bind(&period_start)
+    .bind(&period_end)
+    .fetch_one(pool)
+    .await?;
     db_queries::insert_rollup(
-        conn,
+        pool,
         "session",
         Some(session_id),
         &period_start,
         &period_end,
         "cost.usd",
-        total_cost,
-    )?;
+        total_cost.0,
+    )
+    .await?;
 
     // Total tokens
-    let total_tokens: f64 = conn.query_row(
-        "SELECT COALESCE(
+    let total_tokens: (f64,) = sqlx::query_as(
+        "SELECT CAST(COALESCE(
             SUM(json_extract(data, '$.input') + json_extract(data, '$.output')),
             0.0
-         )
+         ) AS REAL)
          FROM events
          WHERE session_id = ?1 AND kind = 'TokensUsed'
            AND created_at > ?2 AND created_at <= ?3",
-        params![session_id, period_start, period_end],
-        |row| row.get(0),
-    )?;
+    )
+    .bind(session_id)
+    .bind(&period_start)
+    .bind(&period_end)
+    .fetch_one(pool)
+    .await?;
     db_queries::insert_rollup(
-        conn,
+        pool,
         "session",
         Some(session_id),
         &period_start,
         &period_end,
         "tokens.total",
-        total_tokens,
-    )?;
+        total_tokens.0,
+    )
+    .await?;
 
     Ok(())
 }
@@ -303,69 +311,63 @@ pub fn rollup_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migrations;
-    use crate::db::models::Priority;
     use crate::db::queries::{create_agent, create_session, create_task, query_rollups};
+    use crate::db::test_pool;
     use crate::events::emit::emit;
     use crate::events::DiffStat;
 
-    fn setup() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        migrations::run_migrations(&conn).unwrap();
-        conn
-    }
-
     // ---- events_since ----
 
-    #[test]
-    fn events_since_returns_typed_events() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn events_since_returns_typed_events() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PromptSubmitted {
                 prompt: "hello".into(),
             },
         )
+        .await
         .unwrap();
 
-        let events = events_since(&conn, &session.id, "2000-01-01").unwrap();
+        let events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].data, EventData::PromptSubmitted { .. }));
     }
 
-    #[test]
-    fn events_since_preserves_metadata() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn events_since_preserves_metadata() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
         let emitted = emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PromptSubmitted {
                 prompt: "test".into(),
             },
         )
+        .await
         .unwrap();
 
-        let events = events_since(&conn, &session.id, "2000-01-01").unwrap();
+        let events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
         assert_eq!(events[0].metadata.id, emitted.metadata.id);
         assert_eq!(events[0].metadata.session_id, emitted.metadata.session_id);
     }
 
-    #[test]
-    fn events_since_deserializes_complex_variant() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn events_since_deserializes_complex_variant() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
         let task_id = Uuid::new_v4();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::TaskCompleted {
@@ -378,9 +380,10 @@ mod tests {
                 },
             },
         )
+        .await
         .unwrap();
 
-        let events = events_since(&conn, &session.id, "2000-01-01").unwrap();
+        let events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
         match &events[0].data {
             EventData::TaskCompleted {
                 task_id: tid,
@@ -397,20 +400,21 @@ mod tests {
 
     // ---- events_by_variant ----
 
-    #[test]
-    fn events_by_variant_filters_by_kind() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn events_by_variant_filters_by_kind() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PromptSubmitted { prompt: "a".into() },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PromptClassified {
@@ -419,16 +423,20 @@ mod tests {
                 confidence: 0.9,
             },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PromptSubmitted { prompt: "b".into() },
         )
+        .await
         .unwrap();
 
-        let events = events_by_variant(&conn, "PromptSubmitted", "2000-01-01").unwrap();
+        let events = events_by_variant(&pool, "PromptSubmitted", "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(events.len(), 2);
         assert!(events
             .iter()
@@ -437,22 +445,23 @@ mod tests {
 
     // ---- aggregate_by_variant ----
 
-    #[test]
-    fn aggregate_by_variant_counts() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn aggregate_by_variant_counts() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
         for _ in 0..3 {
             emit(
-                &conn,
+                &pool,
                 &session.id,
                 None,
                 EventData::PromptSubmitted { prompt: "x".into() },
             )
+            .await
             .unwrap();
         }
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PromptClassified {
@@ -461,50 +470,56 @@ mod tests {
                 confidence: 0.9,
             },
         )
+        .await
         .unwrap();
 
-        let counts = aggregate_by_variant(&conn, &session.id, "2000-01-01").unwrap();
+        let counts = aggregate_by_variant(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(counts.get("PromptSubmitted"), Some(&3));
         assert_eq!(counts.get("PromptClassified"), Some(&1));
         assert_eq!(counts.get("AgentLooped"), None);
     }
 
-    #[test]
-    fn aggregate_by_variant_empty_session() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn aggregate_by_variant_empty_session() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
-        let counts = aggregate_by_variant(&conn, &session.id, "2000-01-01").unwrap();
+        let counts = aggregate_by_variant(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert!(counts.is_empty());
     }
 
     // ---- rejection_rate ----
 
-    #[test]
-    fn rejection_rate_no_review_events() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn rejection_rate_no_review_events() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
-        let rate = rejection_rate(&conn, &session.id, 3600).unwrap();
+        let rate = rejection_rate(&pool, &session.id, 3600).await.unwrap();
         assert_eq!(rate, 0.0);
     }
 
-    #[test]
-    fn rejection_rate_computes_ratio() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn rejection_rate_computes_ratio() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
         let task_id = Uuid::new_v4();
 
         // 2 accepted, 2 rejected = 50% rejection rate
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PlanAccepted { task_id },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PlanRejected {
@@ -512,9 +527,10 @@ mod tests {
                 feedback: "needs work".into(),
             },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::DiffAccepted {
@@ -522,9 +538,10 @@ mod tests {
                 branch: "feat".into(),
             },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::DiffRejected {
@@ -533,20 +550,21 @@ mod tests {
                 feedback: "bad".into(),
             },
         )
+        .await
         .unwrap();
 
-        let rate = rejection_rate(&conn, &session.id, 3600).unwrap();
+        let rate = rejection_rate(&pool, &session.id, 3600).await.unwrap();
         assert!((rate - 0.5).abs() < f32::EPSILON);
     }
 
-    #[test]
-    fn rejection_rate_all_rejected() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn rejection_rate_all_rejected() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
         let task_id = Uuid::new_v4();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PlanRejected {
@@ -554,9 +572,10 @@ mod tests {
                 feedback: "no".into(),
             },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::HunkRejected {
@@ -566,22 +585,23 @@ mod tests {
                 reason: "wrong".into(),
             },
         )
+        .await
         .unwrap();
 
-        let rate = rejection_rate(&conn, &session.id, 3600).unwrap();
+        let rate = rejection_rate(&pool, &session.id, 3600).await.unwrap();
         assert!((rate - 1.0).abs() < f32::EPSILON);
     }
 
     // ---- cost_total ----
 
-    #[test]
-    fn cost_total_sums_costs() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn cost_total_sums_costs() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
         let agent_id = Uuid::new_v4();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent_id.to_string()),
             EventData::CostIncurred {
@@ -590,9 +610,10 @@ mod tests {
                 cost_usd: 0.05,
             },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent_id.to_string()),
             EventData::CostIncurred {
@@ -601,62 +622,66 @@ mod tests {
                 cost_usd: 0.15,
             },
         )
+        .await
         .unwrap();
 
-        let total = cost_total(&conn, &session.id).unwrap();
+        let total = cost_total(&pool, &session.id).await.unwrap();
         assert!((total - 0.20).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn cost_total_zero_when_no_events() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn cost_total_zero_when_no_events() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
-        let total = cost_total(&conn, &session.id).unwrap();
+        let total = cost_total(&pool, &session.id).await.unwrap();
         assert_eq!(total, 0.0);
     }
 
     // ---- cost_total_task ----
 
-    #[test]
-    fn cost_total_task_sums_via_agent() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn cost_total_task_sums_via_agent() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
         let task = create_task(
-            &conn,
+            &pool,
             &session.id,
             "Test task",
             None,
             None,
-            &Priority::Medium,
+            "medium",
             "main",
             "abc",
             "main",
         )
+        .await
         .unwrap();
 
         // Create an agent assigned to the task
         let agent = create_agent(
-            &conn,
+            &pool,
             &session.id,
             None,
             "implementation",
             "sonnet",
             "implement",
         )
+        .await
         .unwrap();
         // Assign agent to task
-        conn.execute(
-            "UPDATE agents SET task_id = ?1 WHERE id = ?2",
-            params![task.id, agent.id],
-        )
-        .unwrap();
+        sqlx::query("UPDATE agents SET task_id = ?1 WHERE id = ?2")
+            .bind(&task.id)
+            .bind(&agent.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let agent_uuid = Uuid::parse_str(&agent.id).unwrap();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent.id),
             EventData::CostIncurred {
@@ -665,9 +690,10 @@ mod tests {
                 cost_usd: 0.10,
             },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent.id),
             EventData::CostIncurred {
@@ -676,61 +702,70 @@ mod tests {
                 cost_usd: 0.25,
             },
         )
+        .await
         .unwrap();
 
-        let total = cost_total_task(&conn, &task.id).unwrap();
+        let total = cost_total_task(&pool, &task.id).await.unwrap();
         assert!((total - 0.35).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn cost_total_task_excludes_other_tasks() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn cost_total_task_excludes_other_tasks() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
         let task1 = create_task(
-            &conn,
+            &pool,
             &session.id,
             "Task 1",
             None,
             None,
-            &Priority::Medium,
+            "medium",
             "main",
             "abc",
             "main",
         )
+        .await
         .unwrap();
         let task2 = create_task(
-            &conn,
+            &pool,
             &session.id,
             "Task 2",
             None,
             None,
-            &Priority::Medium,
+            "medium",
             "main",
             "abc",
             "main",
         )
+        .await
         .unwrap();
 
-        let agent1 = create_agent(&conn, &session.id, None, "impl", "sonnet", "implement").unwrap();
-        conn.execute(
-            "UPDATE agents SET task_id = ?1 WHERE id = ?2",
-            params![task1.id, agent1.id],
-        )
-        .unwrap();
+        let agent1 = create_agent(&pool, &session.id, None, "impl", "sonnet", "implement")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agents SET task_id = ?1 WHERE id = ?2")
+            .bind(&task1.id)
+            .bind(&agent1.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
-        let agent2 = create_agent(&conn, &session.id, None, "impl", "sonnet", "implement").unwrap();
-        conn.execute(
-            "UPDATE agents SET task_id = ?1 WHERE id = ?2",
-            params![task2.id, agent2.id],
-        )
-        .unwrap();
+        let agent2 = create_agent(&pool, &session.id, None, "impl", "sonnet", "implement")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agents SET task_id = ?1 WHERE id = ?2")
+            .bind(&task2.id)
+            .bind(&agent2.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let agent1_uuid = Uuid::parse_str(&agent1.id).unwrap();
         let agent2_uuid = Uuid::parse_str(&agent2.id).unwrap();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent1.id),
             EventData::CostIncurred {
@@ -739,9 +774,10 @@ mod tests {
                 cost_usd: 1.00,
             },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent2.id),
             EventData::CostIncurred {
@@ -750,22 +786,23 @@ mod tests {
                 cost_usd: 2.00,
             },
         )
+        .await
         .unwrap();
 
-        assert!((cost_total_task(&conn, &task1.id).unwrap() - 1.00).abs() < f64::EPSILON);
-        assert!((cost_total_task(&conn, &task2.id).unwrap() - 2.00).abs() < f64::EPSILON);
+        assert!((cost_total_task(&pool, &task1.id).await.unwrap() - 1.00).abs() < f64::EPSILON);
+        assert!((cost_total_task(&pool, &task2.id).await.unwrap() - 2.00).abs() < f64::EPSILON);
     }
 
     // ---- loop_detections ----
 
-    #[test]
-    fn loop_detections_returns_agent_looped() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn loop_detections_returns_agent_looped() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
         let agent_id = Uuid::new_v4();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent_id.to_string()),
             EventData::AgentLooped {
@@ -774,19 +811,23 @@ mod tests {
                 count: 5,
             },
         )
+        .await
         .unwrap();
         // Non-loop event should be excluded
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PromptSubmitted {
                 prompt: "hi".into(),
             },
         )
+        .await
         .unwrap();
 
-        let loops = loop_detections(&conn, &session.id, "2000-01-01").unwrap();
+        let loops = loop_detections(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(loops.len(), 1);
         match &loops[0].data {
             EventData::AgentLooped {
@@ -801,44 +842,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn loop_detections_empty_when_none() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn loop_detections_empty_when_none() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
         emit(
-            &conn,
+            &pool,
             &session.id,
             None,
             EventData::PromptSubmitted {
                 prompt: "hi".into(),
             },
         )
+        .await
         .unwrap();
 
-        let loops = loop_detections(&conn, &session.id, "2000-01-01").unwrap();
+        let loops = loop_detections(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert!(loops.is_empty());
     }
 
     // ---- rollup_metrics ----
 
-    #[test]
-    fn rollup_metrics_persists_counts() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn rollup_metrics_persists_counts() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
         let agent_id = Uuid::new_v4();
 
         for _ in 0..3 {
             emit(
-                &conn,
+                &pool,
                 &session.id,
                 None,
                 EventData::PromptSubmitted { prompt: "x".into() },
             )
+            .await
             .unwrap();
         }
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent_id.to_string()),
             EventData::CostIncurred {
@@ -847,9 +892,10 @@ mod tests {
                 cost_usd: 0.50,
             },
         )
+        .await
         .unwrap();
         emit(
-            &conn,
+            &pool,
             &session.id,
             Some(&agent_id.to_string()),
             EventData::TokensUsed {
@@ -859,72 +905,78 @@ mod tests {
                 output: 500,
             },
         )
+        .await
         .unwrap();
 
-        rollup_metrics(&conn, &session.id, 3600).unwrap();
+        rollup_metrics(&pool, &session.id, 3600).await.unwrap();
 
         // Verify variant counts
         let prompt_counts = query_rollups(
-            &conn,
+            &pool,
             "session",
             Some(&session.id),
             "count.PromptSubmitted",
             "2000-01-01",
         )
+        .await
         .unwrap();
         assert_eq!(prompt_counts.len(), 1);
         assert!((prompt_counts[0].value - 3.0).abs() < f64::EPSILON);
 
         // Verify cost rollup
         let cost_rollups = query_rollups(
-            &conn,
+            &pool,
             "session",
             Some(&session.id),
             "cost.usd",
             "2000-01-01",
         )
+        .await
         .unwrap();
         assert_eq!(cost_rollups.len(), 1);
         assert!((cost_rollups[0].value - 0.50).abs() < f64::EPSILON);
 
         // Verify token rollup
         let token_rollups = query_rollups(
-            &conn,
+            &pool,
             "session",
             Some(&session.id),
             "tokens.total",
             "2000-01-01",
         )
+        .await
         .unwrap();
         assert_eq!(token_rollups.len(), 1);
         assert!((token_rollups[0].value - 1500.0).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn rollup_metrics_zero_when_no_events() {
-        let conn = setup();
-        let session = create_session(&conn, "/tmp/test").unwrap();
+    #[tokio::test]
+    async fn rollup_metrics_zero_when_no_events() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test").await.unwrap();
 
-        rollup_metrics(&conn, &session.id, 3600).unwrap();
+        rollup_metrics(&pool, &session.id, 3600).await.unwrap();
 
         let cost_rollups = query_rollups(
-            &conn,
+            &pool,
             "session",
             Some(&session.id),
             "cost.usd",
             "2000-01-01",
         )
+        .await
         .unwrap();
         assert_eq!(cost_rollups.len(), 1);
         assert_eq!(cost_rollups[0].value, 0.0);
 
         let token_rollups = query_rollups(
-            &conn,
+            &pool,
             "session",
             Some(&session.id),
             "tokens.total",
             "2000-01-01",
         )
+        .await
         .unwrap();
         assert_eq!(token_rollups.len(), 1);
         assert_eq!(token_rollups[0].value, 0.0);

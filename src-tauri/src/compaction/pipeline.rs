@@ -101,7 +101,7 @@ impl<C: LlmClient> CompactionPipeline<C> {
                     working_messages = compacted.messages;
                 }
                 Err(e) => {
-                    eprintln!("Deep compaction failed, using light compaction only: {e}");
+                    tracing::warn!(error = %e, "deep compaction failed, using light compaction only");
                 }
             }
         }
