@@ -1,3 +1,4 @@
+use crate::prompt_router::model_registry::ModelInfo;
 use crate::prompt_router::{ModeInfo, RouterInput, RouterOutput};
 
 #[derive(Debug)]
@@ -20,7 +21,11 @@ pub trait LlmClient: Send + Sync {
 }
 
 /// Build the classification prompt using mode metadata and compacted context.
-pub fn build_classification_prompt(input: &RouterInput) -> String {
+///
+/// When `available_models` is non-empty the prompt constrains the LLM to pick
+/// one of the listed model IDs. When empty (cold cache) it defaults to the
+/// fallback model.
+pub fn build_classification_prompt(input: &RouterInput, available_models: &[ModelInfo]) -> String {
     let modes = if input.available_modes.is_empty() {
         "- (none provided)".to_string()
     } else {
@@ -36,9 +41,32 @@ pub fn build_classification_prompt(input: &RouterInput) -> String {
     let frameworks = list_or_none(&input.project_context.frameworks);
     let file_structure = list_or_none(&input.project_context.file_structure_hints);
 
+    let model_section = if available_models.is_empty() {
+        "Use \"anthropic/claude-sonnet-4-6\" as the model.".to_string()
+    } else {
+        let list = available_models
+            .iter()
+            .map(|m| {
+                let ctx = if m.context_length > 0 {
+                    format!(" ({}k context)", m.context_length / 1000)
+                } else {
+                    String::new()
+                };
+                format!("- {}: {}{}", m.id, m.name, ctx)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Available models (you MUST pick one of these IDs exactly):\n{}\n\n\
+             If unsure, default to \"anthropic/claude-sonnet-4-6\".",
+            list
+        )
+    };
+
     format!(
         "You are a prompt router. Given the user's prompt and project context, select the best mode and model.\n\n\
 Available modes:\n\
+{}\n\n\
 {}\n\n\
 Project context:\n\
 Languages: [{}]\n\
@@ -47,8 +75,9 @@ File structure: [{}]\n\n\
 Conversation so far: {}\n\n\
 User prompt: {}\n\n\
 Respond with ONLY a JSON object:\n\
-{{\"mode\": \"<mode_name>\", \"model\": \"<model_id>\", \"confidence\": <0.0-1.0>}}",
+{{\"mode\": \"<mode_name>\", \"model\": \"<model_id_from_list>\", \"confidence\": <0.0-1.0>}}",
         modes,
+        model_section,
         languages,
         frameworks,
         file_structure,
@@ -61,8 +90,9 @@ pub fn classify(
     input: &RouterInput,
     llm_client: &dyn LlmClient,
     router_model: &str,
+    available_models: &[ModelInfo],
 ) -> Result<RouterOutput, ClassificationError> {
-    let prompt = build_classification_prompt(input);
+    let prompt = build_classification_prompt(input, available_models);
     let response = llm_client.complete(&prompt, router_model)?;
     parse_classification_response(&response, &input.available_modes)
 }
@@ -124,9 +154,9 @@ pub fn parse_classification_response(
     }
 
     if !(0.0..=1.0).contains(&output.confidence) {
-        eprintln!(
-            "warning: classifier confidence {} is out of range; clamping to 0.0..=1.0",
-            output.confidence
+        tracing::warn!(
+            confidence = output.confidence,
+            "classifier confidence out of range, clamping"
         );
         output.confidence = output.confidence.clamp(0.0, 1.0);
     }
@@ -188,7 +218,7 @@ mod tests {
     #[test]
     fn build_prompt_contains_required_sections() {
         let input = sample_input();
-        let prompt = build_classification_prompt(&input);
+        let prompt = build_classification_prompt(&input, &[]);
 
         assert!(prompt.contains("Available modes:"));
         assert!(prompt.contains("- Plan: Structured decomposition"));
@@ -199,6 +229,37 @@ mod tests {
         assert!(prompt.contains("File structure: [src-tauri/src/, src/]"));
         assert!(prompt.contains("Conversation so far: User is building a Rust web service"));
         assert!(prompt.contains("User prompt: Implement auth middleware"));
+    }
+
+    #[test]
+    fn build_prompt_empty_models_uses_fallback_text() {
+        let input = sample_input();
+        let prompt = build_classification_prompt(&input, &[]);
+        assert!(prompt.contains("Use \"anthropic/claude-sonnet-4-6\" as the model."));
+    }
+
+    #[test]
+    fn build_prompt_with_models_lists_ids() {
+        let input = sample_input();
+        let models = vec![
+            ModelInfo {
+                id: "anthropic/claude-sonnet-4-6".into(),
+                name: "Claude Sonnet 4.6".into(),
+                description: "".into(),
+                context_length: 200_000,
+            },
+            ModelInfo {
+                id: "google/gemini-2.5-pro".into(),
+                name: "Gemini 2.5 Pro".into(),
+                description: "".into(),
+                context_length: 1_000_000,
+            },
+        ];
+        let prompt = build_classification_prompt(&input, &models);
+        assert!(prompt.contains("Available models (you MUST pick one of these IDs exactly):"));
+        assert!(prompt.contains("- anthropic/claude-sonnet-4-6: Claude Sonnet 4.6 (200k context)"));
+        assert!(prompt.contains("- google/gemini-2.5-pro: Gemini 2.5 Pro (1000k context)"));
+        assert!(prompt.contains("model_id_from_list"));
     }
 
     #[test]
@@ -287,7 +348,7 @@ mod tests {
             response: r#"{"mode":"Plan","model":"claude-3-7-sonnet","confidence":0.6}"#.to_string(),
         };
 
-        let result = classify(&input, &llm, "router-model").unwrap();
+        let result = classify(&input, &llm, "router-model", &[]).unwrap();
         assert_eq!(result.mode, "Plan");
         assert_eq!(result.model, "claude-3-7-sonnet");
         assert_eq!(result.confidence, 0.6);

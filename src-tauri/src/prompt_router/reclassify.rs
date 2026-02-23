@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::classify::{classify, ClassificationError, LlmClient};
+use super::model_registry::ModelInfo;
 use super::types::*;
 
 /// What triggered a reclassification request.
@@ -53,6 +54,7 @@ pub fn reclassify(
     request: &ReclassificationRequest,
     llm_client: &dyn LlmClient,
     router_model: &str,
+    available_models: &[ModelInfo],
 ) -> Result<ReclassificationResult, ClassificationError> {
     let router_input = RouterInput {
         source: PromptSource::User,
@@ -62,7 +64,7 @@ pub fn reclassify(
         project_context: request.project_context.clone(),
     };
 
-    let new_output = classify(&router_input, llm_client, router_model)?;
+    let new_output = classify(&router_input, llm_client, router_model, available_models)?;
     let mode_changed = new_output.mode != request.current_mode;
 
     Ok(ReclassificationResult {
@@ -126,7 +128,7 @@ mod tests {
             response: r#"{"mode":"Plan","model":"claude-sonnet","confidence":0.85}"#.to_string(),
         };
 
-        let result = reclassify(&request, &llm, "router-model").unwrap();
+        let result = reclassify(&request, &llm, "router-model", &[]).unwrap();
 
         assert!(result.mode_changed);
         assert_eq!(result.previous_mode, "Implement");
@@ -142,7 +144,7 @@ mod tests {
                 .to_string(),
         };
 
-        let result = reclassify(&request, &llm, "router-model").unwrap();
+        let result = reclassify(&request, &llm, "router-model", &[]).unwrap();
 
         assert!(!result.mode_changed);
         assert_eq!(result.previous_mode, "Implement");
@@ -165,7 +167,7 @@ mod tests {
         }
 
         let request = sample_request("Plan");
-        let result = reclassify(&request, &FailingClient, "router-model");
+        let result = reclassify(&request, &FailingClient, "router-model", &[]);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("LLM unavailable"));
@@ -183,7 +185,7 @@ mod tests {
                 .to_string(),
         };
 
-        let result = reclassify(&request, &llm, "router-model").unwrap();
+        let result = reclassify(&request, &llm, "router-model", &[]).unwrap();
 
         assert!(result.mode_changed);
         assert_eq!(

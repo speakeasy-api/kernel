@@ -195,7 +195,7 @@ fn test_classify_clean_json() {
     let llm = MockLlmClient::new(
         r#"{"mode":"Implement","model":"claude-3","confidence":0.9}"#,
     );
-    let result = classify(&input, &llm, "router-model").unwrap();
+    let result = classify(&input, &llm, "router-model", &[]).unwrap();
     assert_eq!(result.mode, "Implement");
     assert_eq!(result.model, "claude-3");
     assert_eq!(result.confidence, 0.9);
@@ -207,7 +207,7 @@ fn test_classify_json_with_surrounding_text() {
     let llm = MockLlmClient::new(
         r#"Here is the result: {"mode":"Plan","model":"claude-3","confidence":0.85} hope that helps!"#,
     );
-    let result = classify(&input, &llm, "router-model").unwrap();
+    let result = classify(&input, &llm, "router-model", &[]).unwrap();
     assert_eq!(result.mode, "Plan");
     assert_eq!(result.model, "claude-3");
     assert_eq!(result.confidence, 0.85);
@@ -217,7 +217,7 @@ fn test_classify_json_with_surrounding_text() {
 fn test_classify_invalid_json() {
     let input = test_input();
     let llm = MockLlmClient::new("I don't know");
-    let result = classify(&input, &llm, "router-model");
+    let result = classify(&input, &llm, "router-model", &[]);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.message.contains("failed to parse"));
@@ -229,7 +229,7 @@ fn test_classify_invalid_mode() {
     let llm = MockLlmClient::new(
         r#"{"mode":"Nonexistent","model":"claude-3","confidence":0.9}"#,
     );
-    let result = classify(&input, &llm, "router-model");
+    let result = classify(&input, &llm, "router-model", &[]);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.message.contains("unknown mode 'Nonexistent'"));
@@ -241,7 +241,7 @@ fn test_classify_confidence_clamping() {
     let llm = MockLlmClient::new(
         r#"{"mode":"Plan","model":"claude-3","confidence":1.5}"#,
     );
-    let result = classify(&input, &llm, "router-model").unwrap();
+    let result = classify(&input, &llm, "router-model", &[]).unwrap();
     assert_eq!(result.confidence, 1.0);
 }
 
@@ -251,14 +251,14 @@ fn test_classify_negative_confidence() {
     let llm = MockLlmClient::new(
         r#"{"mode":"Plan","model":"claude-3","confidence":-0.5}"#,
     );
-    let result = classify(&input, &llm, "router-model").unwrap();
+    let result = classify(&input, &llm, "router-model", &[]).unwrap();
     assert_eq!(result.confidence, 0.0);
 }
 
 #[test]
 fn test_build_classification_prompt_contains_modes() {
     let input = test_input();
-    let prompt = build_classification_prompt(&input);
+    let prompt = build_classification_prompt(&input, &[]);
     for mode in &input.available_modes {
         assert!(
             prompt.contains(&mode.name),
@@ -276,14 +276,14 @@ fn test_build_classification_prompt_contains_modes() {
 #[test]
 fn test_build_classification_prompt_contains_user_prompt() {
     let input = test_input();
-    let prompt = build_classification_prompt(&input);
+    let prompt = build_classification_prompt(&input, &[]);
     assert!(prompt.contains("Refactor the event system to use channels"));
 }
 
 #[test]
 fn test_build_classification_prompt_contains_project_context() {
     let input = test_input();
-    let prompt = build_classification_prompt(&input);
+    let prompt = build_classification_prompt(&input, &[]);
     assert!(prompt.contains("Rust"));
     assert!(prompt.contains("Tauri"));
 }
@@ -373,7 +373,7 @@ fn test_reclassify_mode_changed() {
     let llm = MockLlmClient::new(
         r#"{"mode":"Plan","model":"claude-sonnet","confidence":0.85}"#,
     );
-    let result = reclassify::reclassify(&request, &llm, "router-model").unwrap();
+    let result = reclassify::reclassify(&request, &llm, "router-model", &[]).unwrap();
     assert!(result.mode_changed);
     assert_eq!(result.new_output.mode, "Plan");
     assert_eq!(result.previous_mode, "Implement");
@@ -385,7 +385,7 @@ fn test_reclassify_same_mode() {
     let llm = MockLlmClient::new(
         r#"{"mode":"Implement","model":"claude-sonnet","confidence":0.9}"#,
     );
-    let result = reclassify::reclassify(&request, &llm, "router-model").unwrap();
+    let result = reclassify::reclassify(&request, &llm, "router-model", &[]).unwrap();
     assert!(!result.mode_changed);
     assert_eq!(result.new_output.mode, "Implement");
 }
@@ -399,7 +399,7 @@ fn test_reclassify_preserves_trigger() {
     let llm = MockLlmClient::new(
         r#"{"mode":"Implement","model":"claude-sonnet","confidence":0.8}"#,
     );
-    let result = reclassify::reclassify(&request, &llm, "router-model").unwrap();
+    let result = reclassify::reclassify(&request, &llm, "router-model", &[]).unwrap();
     assert_eq!(
         result.trigger,
         ReclassificationTrigger::OrchestratorDetected {
@@ -412,7 +412,7 @@ fn test_reclassify_preserves_trigger() {
 fn test_reclassify_llm_error() {
     let request = test_reclass_request("Plan");
     let llm = MockLlmClient::failing("LLM unavailable");
-    let result = reclassify::reclassify(&request, &llm, "router-model");
+    let result = reclassify::reclassify(&request, &llm, "router-model", &[]);
     assert!(result.is_err());
 }
 
@@ -436,6 +436,7 @@ fn test_dispatch_classification_path() {
         &MockModeLoader,
         &sink,
         "sess-1",
+        &[],
     )
     .unwrap();
 
@@ -461,6 +462,7 @@ fn test_dispatch_override_path() {
         &MockModeLoader,
         &sink,
         "sess-1",
+        &[],
     )
     .unwrap();
 
@@ -490,6 +492,7 @@ fn test_dispatch_mode_not_found() {
         &MockModeLoader,
         &sink,
         "sess-1",
+        &[],
     )
     .unwrap_err();
 
@@ -510,6 +513,7 @@ fn test_dispatch_classification_error() {
         &MockModeLoader,
         &sink,
         "sess-1",
+        &[],
     )
     .unwrap_err();
 
@@ -531,6 +535,7 @@ fn test_dispatch_reclassification_mode_changed() {
         &MockModeLoader,
         &sink,
         "sess-1",
+        &[],
     )
     .unwrap();
 
@@ -556,6 +561,7 @@ fn test_dispatch_reclassification_no_change() {
         &MockModeLoader,
         &sink,
         "sess-1",
+        &[],
     )
     .unwrap();
 
@@ -578,6 +584,7 @@ fn test_dispatch_handoff_fields() {
         &MockModeLoader,
         &sink,
         "sess-1",
+        &[],
     )
     .unwrap();
 

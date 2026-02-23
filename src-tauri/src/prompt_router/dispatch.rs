@@ -1,4 +1,5 @@
 use super::classify::{classify, ClassificationError, LlmClient};
+use super::model_registry::{ModelInfo, FALLBACK_MODEL};
 use super::reclassify::{reclassify, ReclassificationRequest};
 use super::types::*;
 use super::user_override::{apply_override, ModeOverriddenEvent, OverrideError};
@@ -93,14 +94,35 @@ impl From<OverrideError> for DispatchError {
 }
 
 /// Resolve the model to use: prefer router-selected, fall back to mode default.
-fn resolve_model(router_model: &str, loaded_mode: &LoadedMode) -> String {
-    if !router_model.is_empty() {
+/// When `available_models` is non-empty, validates the candidate against the
+/// list and substitutes the fallback model if not found.
+fn resolve_model(
+    router_model: &str,
+    loaded_mode: &LoadedMode,
+    available_models: &[ModelInfo],
+) -> String {
+    let candidate = if !router_model.is_empty() {
         router_model.to_string()
     } else {
         loaded_mode
             .default_model
             .clone()
             .unwrap_or_default()
+    };
+
+    if available_models.is_empty() {
+        return candidate;
+    }
+
+    if available_models.iter().any(|m| m.id == candidate) {
+        candidate
+    } else {
+        tracing::warn!(
+            model = %candidate,
+            fallback = FALLBACK_MODEL,
+            "router selected unknown model, falling back"
+        );
+        FALLBACK_MODEL.to_string()
     }
 }
 
@@ -116,6 +138,7 @@ pub fn dispatch(
     mode_loader: &dyn ModeLoader,
     event_sink: &dyn RouterEventSink,
     session_id: &str,
+    available_models: &[ModelInfo],
 ) -> Result<AgentHandoff, DispatchError> {
     // Step 1: Classify or Override
     let output = if let Some(override_mode) = user_override {
@@ -133,7 +156,7 @@ pub fn dispatch(
         event_sink.emit_mode_overridden(session_id, &event);
         overridden
     } else {
-        let classified = classify(input, llm_client, router_model)?;
+        let classified = classify(input, llm_client, router_model, available_models)?;
         event_sink.emit_prompt_classified(session_id, &classified);
         classified
     };
@@ -142,7 +165,7 @@ pub fn dispatch(
     let loaded_mode = mode_loader.load_mode(&output.mode)?;
 
     // Step 3: Resolve the model
-    let model = resolve_model(&output.model, &loaded_mode);
+    let model = resolve_model(&output.model, &loaded_mode, available_models);
 
     // Step 4: Build AgentHandoff
     Ok(AgentHandoff {
@@ -167,8 +190,9 @@ pub fn dispatch_reclassification(
     mode_loader: &dyn ModeLoader,
     event_sink: &dyn RouterEventSink,
     session_id: &str,
+    available_models: &[ModelInfo],
 ) -> Result<Option<AgentHandoff>, DispatchError> {
-    let result = reclassify(request, llm_client, router_model)?;
+    let result = reclassify(request, llm_client, router_model, available_models)?;
 
     event_sink.emit_prompt_classified(session_id, &result.new_output);
 
@@ -177,7 +201,7 @@ pub fn dispatch_reclassification(
     }
 
     let loaded_mode = mode_loader.load_mode(&result.new_output.mode)?;
-    let model = resolve_model(&result.new_output.model, &loaded_mode);
+    let model = resolve_model(&result.new_output.model, &loaded_mode, available_models);
 
     Ok(Some(AgentHandoff {
         mode_name: result.new_output.mode,
@@ -297,6 +321,7 @@ mod tests {
             &MockModeLoader,
             &sink,
             "sess-1",
+            &[],
         )
         .unwrap();
 
@@ -326,6 +351,7 @@ mod tests {
             &MockModeLoader,
             &sink,
             "sess-1",
+            &[],
         )
         .unwrap();
 
@@ -354,6 +380,7 @@ mod tests {
             &MockModeLoader,
             &sink,
             "sess-1",
+            &[],
         )
         .unwrap_err();
 
@@ -382,6 +409,7 @@ mod tests {
             &MockModeLoader,
             &sink,
             "sess-1",
+            &[],
         )
         .unwrap_err();
 
@@ -404,10 +432,55 @@ mod tests {
             &MockModeLoader,
             &sink,
             "sess-1",
+            &[],
         )
         .unwrap();
 
         assert_eq!(handoff.model, "fallback-model");
+    }
+
+    #[test]
+    fn resolve_model_substitutes_fallback_for_unknown() {
+        let loaded = LoadedMode {
+            name: "Plan".into(),
+            system_prompt: String::new(),
+            default_model: None,
+            allowed_tools: vec![],
+        };
+        let models = vec![ModelInfo {
+            id: "anthropic/claude-sonnet-4-6".into(),
+            name: "Claude Sonnet".into(),
+            description: String::new(),
+            context_length: 200_000,
+        }];
+
+        // Known model passes through
+        assert_eq!(
+            resolve_model("anthropic/claude-sonnet-4-6", &loaded, &models),
+            "anthropic/claude-sonnet-4-6"
+        );
+
+        // Unknown model gets substituted
+        assert_eq!(
+            resolve_model("hallucinated/model-9000", &loaded, &models),
+            FALLBACK_MODEL
+        );
+    }
+
+    #[test]
+    fn resolve_model_skips_validation_when_no_models() {
+        let loaded = LoadedMode {
+            name: "Plan".into(),
+            system_prompt: String::new(),
+            default_model: None,
+            allowed_tools: vec![],
+        };
+
+        // With empty models slice, any model passes through (existing behavior)
+        assert_eq!(
+            resolve_model("any/model", &loaded, &[]),
+            "any/model"
+        );
     }
 
     #[test]
@@ -448,6 +521,7 @@ mod tests {
             &MockModeLoader,
             &sink,
             "sess-1",
+            &[],
         )
         .unwrap();
 
@@ -493,6 +567,7 @@ mod tests {
             &MockModeLoader,
             &sink,
             "sess-1",
+            &[],
         )
         .unwrap();
 
