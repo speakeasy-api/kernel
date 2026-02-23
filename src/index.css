@@ -1,0 +1,115 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@theme {
+  --spacing: 0.25rem;
+  --color-surface-0: #0a0a0b;
+  --color-surface-1: #111113;
+  --color-surface-2: #19191d;
+  --color-surface-3: #222228;
+  --color-surface-4: #2c2c34;
+
+  --color-text-primary: #ededef;
+  --color-text-secondary: #8b8b95;
+  --color-text-tertiary: #55555e;
+  --color-text-ghost: #3a3a42;
+
+  --color-border-subtle: #1e1e24;
+  --color-border-default: #2a2a32;
+  --color-border-strong: #3a3a44;
+
+  --color-accent: #7c6aef;
+  --color-accent-dim: #6355c2;
+  --color-accent-subtle: rgba(124, 106, 239, 0.08);
+  --color-accent-glow: rgba(124, 106, 239, 0.15);
+
+  --font-sans: "Inter Variable", "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "SF Mono", "Menlo", monospace;
+
+  --animate-in: animate-in 400ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-in-delayed: animate-in 400ms cubic-bezier(0.16, 1, 0.3, 1) 80ms both;
+  --animate-in-slow: animate-in 600ms cubic-bezier(0.16, 1, 0.3, 1) 120ms both;
+  --animate-float: float 6s ease-in-out infinite;
+  --animate-popover: popover-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-pulse-subtle: pulse-subtle 4s ease-in-out infinite;
+  --animate-caret: caret-blink 530ms steps(2, start) infinite;
+}
+
+@keyframes animate-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+@keyframes popover-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes pulse-subtle {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.7; }
+}
+
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes mode-switch {
+  0% { opacity: 0; transform: scale(0.88); filter: blur(3px); }
+  40% { opacity: 1; transform: scale(1.08); filter: blur(0); }
+  55% { transform: scale(0.97); }
+  70% { transform: scale(1.03); }
+  100% { transform: scale(1); }
+}
+
+@keyframes mode-glow {
+  0% { box-shadow: 0 0 0 0 var(--mode-tint-glow); }
+  40% { box-shadow: 0 0 12px 4px var(--mode-tint-glow); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+@layer base {
+  *, *::before, *::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--color-surface-0);
+    color: var(--color-text-primary);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  ::selection {
+    background-color: var(--color-accent);
+    color: white;
+  }
+
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--color-border-default); border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--color-border-strong); }
+
+  textarea:focus { outline: none; }
+}
+
+/* Markdown message container — last child of each block element has no bottom margin */
+.markdown-message > *:last-child {
+  margin-bottom: 0;
+}

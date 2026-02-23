@@ -1,50 +1,119 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { useState, useCallback, useRef } from "react";
+import type { Session } from "./lib/types";
+import { deleteSession, eventsSince } from "./lib/commands";
+import { PromptWindow } from "./components/prompt/PromptWindow";
+import { WorkspaceSelector } from "./components/workspace/WorkspaceSelector";
+import { Sidebar } from "./components/sidebar/Sidebar";
+import { useModes } from "./hooks/useModes";
+import { useConfig } from "./hooks/useConfig";
+
+type View =
+  | { kind: "workspace-selector" }
+  | { kind: "prompt-window"; session: Session };
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [view, setView] = useState<View>({ kind: "workspace-selector" });
+  const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0);
+  const { modes } = useModes();
+  const config = useConfig(
+    view.kind === "prompt-window" ? view.session.project_path : null,
+  );
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+  // Track which session we might need to clean up
+  const currentSessionRef = useRef<Session | null>(null);
+  if (view.kind === "prompt-window") {
+    currentSessionRef.current = view.session;
   }
 
+  const activeSessionId =
+    view.kind === "prompt-window" ? view.session.id : null;
+
+  const handleSelectSession = useCallback(async (session: Session) => {
+    const prev = currentSessionRef.current;
+    setView({ kind: "prompt-window", session });
+
+    // Clean up the previous session if it was empty
+    if (prev && prev.id !== session.id) {
+      try {
+        const events = await eventsSince(prev.id, "2000-01-01T00:00:00");
+        const hasPrompt = events.some((e) => e.kind === "PromptSubmitted");
+        if (!hasPrompt) {
+          await deleteSession(prev.id);
+          setSidebarRefreshKey((k) => k + 1);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  const handleNewSession = useCallback(async (session: Session) => {
+    const prev = currentSessionRef.current;
+    setView({ kind: "prompt-window", session });
+
+    // Clean up the previous session if it was empty
+    if (prev && prev.id !== session.id) {
+      try {
+        const events = await eventsSince(prev.id, "2000-01-01T00:00:00");
+        const hasPrompt = events.some((e) => e.kind === "PromptSubmitted");
+        if (!hasPrompt) {
+          await deleteSession(prev.id);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    setSidebarRefreshKey((k) => k + 1);
+  }, []);
+
+  const handleSessionCreated = useCallback((session: Session) => {
+    setSidebarRefreshKey((k) => k + 1);
+    setView({ kind: "prompt-window", session });
+  }, []);
+
+  // When closing a session, check if it's empty and clean up
+  const handleClose = useCallback(async () => {
+    const session = currentSessionRef.current;
+    setView({ kind: "workspace-selector" });
+    currentSessionRef.current = null;
+
+    if (session) {
+      try {
+        const events = await eventsSince(session.id, "2000-01-01T00:00:00");
+        const hasPrompt = events.some((e) => e.kind === "PromptSubmitted");
+        if (!hasPrompt) {
+          await deleteSession(session.id);
+        }
+      } catch {
+        // ignore cleanup errors
+      }
+      setSidebarRefreshKey((k) => k + 1);
+    }
+  }, []);
+
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <div className="flex h-screen w-screen overflow-hidden bg-surface-0">
+      <Sidebar
+        activeSessionId={activeSessionId}
+        onSelectSession={handleSelectSession}
+        onNewSession={handleNewSession}
+        refreshKey={sidebarRefreshKey}
+      />
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      <main className="relative flex flex-1 flex-col overflow-hidden">
+        {view.kind === "prompt-window" ? (
+          <PromptWindow
+            key={view.session.id}
+            session={view.session}
+            modes={modes}
+            config={config}
+            onClose={handleClose}
+          />
+        ) : (
+          <WorkspaceSelector onSessionCreated={handleSessionCreated} />
+        )}
+      </main>
+    </div>
   );
 }
 
