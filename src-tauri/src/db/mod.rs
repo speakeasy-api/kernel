@@ -1,4 +1,4 @@
-pub(crate) mod migrations;
+pub mod commands;
 pub mod models;
 pub mod queries;
 pub mod retention;
@@ -6,103 +6,112 @@ pub mod retention;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
 
 const KERNEL_DIR: &str = ".kernel";
 const DB_FILE: &str = "kernel.db";
 
-pub struct Database {
-    conn: Connection,
-    #[allow(dead_code)]
-    path: PathBuf,
+pub async fn create_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    let options: SqliteConnectOptions = db_url.parse::<SqliteConnectOptions>()?
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .create_if_missing(true);
+
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options)
+        .await?;
+
+    sqlx::migrate!().run(&pool).await?;
+
+    Ok(pool)
 }
 
-impl Database {
-    pub fn open(project_root: &Path) -> Result<Self, rusqlite::Error> {
-        let kernel_dir = project_root.join(KERNEL_DIR);
-        fs::create_dir_all(&kernel_dir).map_err(|e| {
-            rusqlite::Error::InvalidPath(
-                kernel_dir.join(format!(" (failed to create directory: {e})")),
-            )
-        })?;
+pub async fn open_project_pool(project_root: &Path) -> Result<SqlitePool, sqlx::Error> {
+    let kernel_dir = project_root.join(KERNEL_DIR);
+    fs::create_dir_all(&kernel_dir).map_err(|e| {
+        sqlx::Error::Configuration(
+            format!("failed to create {}: {e}", kernel_dir.display()).into(),
+        )
+    })?;
 
-        let db_path = kernel_dir.join(DB_FILE);
-        let conn = Connection::open(&db_path)?;
+    let db_path = kernel_dir.join(DB_FILE);
+    let db_url = format!("sqlite:{}", db_path.display());
+    create_pool(&db_url).await
+}
 
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+#[cfg(test)]
+pub async fn test_pool() -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("failed to create test pool");
 
-        migrations::run_migrations(&conn)?;
+    sqlx::migrate!().run(&pool).await.expect("failed to run migrations");
 
-        let db = Self {
-            conn,
-            path: db_path,
-        };
-
-        Ok(db)
-    }
-
-    pub fn connection(&self) -> &Connection {
-        &self.conn
-    }
+    pool
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_open_creates_kernel_dir_and_db() {
+    #[tokio::test]
+    async fn test_open_creates_kernel_dir_and_db() {
         let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open(tmp.path()).unwrap();
+        let pool = open_project_pool(tmp.path()).await.unwrap();
 
         assert!(tmp.path().join(KERNEL_DIR).exists());
         assert!(tmp.path().join(KERNEL_DIR).join(DB_FILE).exists());
 
         // Verify WAL mode
-        let mode: String = db
-            .connection()
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        let row: (String,) = sqlx::query_as("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
             .unwrap();
-        assert_eq!(mode.to_lowercase(), "wal");
+        assert_eq!(row.0.to_lowercase(), "wal");
 
         // Verify foreign keys
-        let fk: i64 = db
-            .connection()
-            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        let row: (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
             .unwrap();
-        assert_eq!(fk, 1);
+        assert_eq!(row.0, 1);
+
+        pool.close().await;
     }
 
-    #[test]
-    fn test_migrations_are_idempotent() {
+    #[tokio::test]
+    async fn test_migrations_are_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let _db1 = Database::open(tmp.path()).unwrap();
+        let pool1 = open_project_pool(tmp.path()).await.unwrap();
+        pool1.close().await;
         // Opening again should not fail (migrations already applied)
-        let _db2 = Database::open(tmp.path()).unwrap();
+        let pool2 = open_project_pool(tmp.path()).await.unwrap();
+        pool2.close().await;
     }
 
-    #[test]
-    fn test_tables_exist() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = Database::open(tmp.path()).unwrap();
+    #[tokio::test]
+    async fn test_tables_exist() {
+        let pool = test_pool().await;
 
-        let tables: Vec<String> = {
-            let mut stmt = db
-                .connection()
-                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                .unwrap();
-            stmt.query_map([], |row| row.get(0))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
-        };
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let tables: Vec<String> = rows.into_iter().map(|r| r.0).collect();
 
         let expected = [
             "agents",
+            "conventions",
+            "corrections",
             "events",
-            "migrations",
             "modes",
+            "recommendation_versions",
             "recommendations",
             "sessions",
             "stats_rollups",
@@ -116,14 +125,16 @@ mod tests {
                 "missing table: {table}"
             );
         }
+
+        pool.close().await;
     }
 
-    #[test]
-    fn test_open_with_nonexistent_nested_path() {
+    #[tokio::test]
+    async fn test_open_with_nonexistent_nested_path() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("deep").join("nested").join("project");
-        let db = Database::open(&nested).unwrap();
+        let pool = open_project_pool(&nested).await.unwrap();
         assert!(nested.join(KERNEL_DIR).join(DB_FILE).exists());
-        drop(db);
+        pool.close().await;
     }
 }

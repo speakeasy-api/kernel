@@ -50,27 +50,6 @@ pub enum Priority {
     Critical,
 }
 
-impl Priority {
-    pub fn as_i32(&self) -> i32 {
-        match self {
-            Self::Low => 0,
-            Self::Medium => 1,
-            Self::High => 2,
-            Self::Critical => 3,
-        }
-    }
-
-    pub fn from_i32(v: i32) -> Result<Self, String> {
-        match v {
-            0 => Ok(Self::Low),
-            1 => Ok(Self::Medium),
-            2 => Ok(Self::High),
-            3 => Ok(Self::Critical),
-            _ => Err(format!("unknown priority value: {v}")),
-        }
-    }
-}
-
 impl fmt::Display for Priority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -98,14 +77,14 @@ impl FromStr for Priority {
 
 // -- Entity Structs --
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Session {
     pub id: String,
     pub project_path: String,
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Event {
     pub id: String,
     pub kind: String,
@@ -115,33 +94,37 @@ pub struct Event {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Flat task row matching the unified schema.
+/// Status and priority are stored as TEXT in the DB.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Task {
     pub id: String,
     pub session_id: String,
-    pub parent_id: Option<String>,
     pub title: String,
-    pub description: Option<String>,
-    pub status: TaskStatus,
-    pub priority: Priority,
+    pub description: String,
+    pub status: String,
+    pub priority: String,
+    pub assigned_agent: Option<String>,
+    pub parent_task: Option<String>,
     pub worktree_branch: Option<String>,
     pub base_ref: String,
     pub base_commit: String,
     pub merge_target_ref: String,
     pub outcome_kind: Option<String>,
     pub outcome_data: Option<String>,
+    pub engagement_override: Option<String>,
+    pub cost_usd: f64,
     pub created_at: String,
     pub updated_at: String,
-    pub completed_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TaskDep {
     pub task_id: String,
-    pub depends_on: String,
+    pub depends_on_task_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Agent {
     pub id: String,
     pub session_id: String,
@@ -157,7 +140,7 @@ pub struct Agent {
     pub finished_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Mode {
     pub name: String,
     pub description: String,
@@ -170,20 +153,7 @@ pub struct Mode {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Recommendation {
-    pub id: i64,
-    pub trigger_pattern: String,
-    pub recommendation: String,
-    pub action_type: String,
-    pub action_payload: String,
-    pub status: String,
-    pub applied_at: Option<String>,
-    pub reverted_at: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct StatsRollup {
     pub id: i64,
     pub period_start: String,
@@ -196,18 +166,10 @@ pub struct StatsRollup {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionReport {
-    pub events_deleted: usize,
-    pub agents_deleted: usize,
-    pub tasks_deleted: usize,
-    pub sessions_deleted: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UxAgentState {
-    pub scope: String,
-    pub last_event_id: Option<String>,
-    pub last_event_at: Option<String>,
-    pub updated_at: String,
+    pub events_deleted: u64,
+    pub agents_deleted: u64,
+    pub tasks_deleted: u64,
+    pub sessions_deleted: u64,
 }
 
 #[cfg(test)]
@@ -252,25 +214,6 @@ mod tests {
     }
 
     #[test]
-    fn priority_i32_roundtrip() {
-        let variants = [
-            (Priority::Low, 0),
-            (Priority::Medium, 1),
-            (Priority::High, 2),
-            (Priority::Critical, 3),
-        ];
-        for (p, i) in &variants {
-            assert_eq!(p.as_i32(), *i);
-            assert_eq!(&Priority::from_i32(*i).unwrap(), p);
-        }
-    }
-
-    #[test]
-    fn priority_from_i32_error() {
-        assert!(Priority::from_i32(99).is_err());
-    }
-
-    #[test]
     fn session_serde_roundtrip() {
         let session = Session {
             id: "s-1".into(),
@@ -284,29 +227,31 @@ mod tests {
     }
 
     #[test]
-    fn task_serde_with_enums() {
+    fn task_serde_with_strings() {
         let task = Task {
             id: "t-1".into(),
             session_id: "s-1".into(),
-            parent_id: None,
             title: "Test task".into(),
-            description: Some("desc".into()),
-            status: TaskStatus::InProgress,
-            priority: Priority::High,
+            description: "desc".into(),
+            status: "in_progress".into(),
+            priority: "high".into(),
+            assigned_agent: None,
+            parent_task: None,
             worktree_branch: Some("kernel/task-test".into()),
             base_ref: "main".into(),
             base_commit: "abc123".into(),
             merge_target_ref: "main".into(),
             outcome_kind: None,
             outcome_data: None,
+            engagement_override: None,
+            cost_usd: 0.0,
             created_at: "2026-01-01T00:00:00".into(),
             updated_at: "2026-01-01T00:00:00".into(),
-            completed_at: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: Task = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.status, TaskStatus::InProgress);
-        assert_eq!(parsed.priority, Priority::High);
+        assert_eq!(parsed.status, "in_progress");
+        assert_eq!(parsed.priority, "high");
     }
 
     #[test]
@@ -354,7 +299,7 @@ mod tests {
             description: "Planning mode".into(),
             system_prompt: "You are a planner.".into(),
             default_model: None,
-            allowed_tools: r#"["fs_read","git"]"#.into(),
+            allowed_tools: r#"["fs_read","grep"]"#.into(),
             origin: "builtin".into(),
             version: 1,
             created_at: "2026-01-01T00:00:00".into(),
@@ -364,25 +309,6 @@ mod tests {
         let parsed: Mode = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "plan");
         assert_eq!(parsed.default_model, None);
-    }
-
-    #[test]
-    fn recommendation_serde_roundtrip() {
-        let rec = Recommendation {
-            id: 1,
-            trigger_pattern: "plan_rejected x3".into(),
-            recommendation: "Switch planning model".into(),
-            action_type: "model_change".into(),
-            action_payload: r#"{"model":"claude-opus-4-20250514"}"#.into(),
-            status: "pending".into(),
-            applied_at: None,
-            reverted_at: None,
-            created_at: "2026-01-01T00:00:00".into(),
-        };
-        let json = serde_json::to_string(&rec).unwrap();
-        let parsed: Recommendation = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.id, 1);
-        assert_eq!(parsed.status, "pending");
     }
 
     #[test]
@@ -400,19 +326,5 @@ mod tests {
         let parsed: StatsRollup = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.value, 3.50);
         assert_eq!(parsed.scope_id, Some("s-1".into()));
-    }
-
-    #[test]
-    fn ux_agent_state_serde_roundtrip() {
-        let state = UxAgentState {
-            scope: "global".into(),
-            last_event_id: Some("e-42".into()),
-            last_event_at: Some("2026-01-01T00:00:00".into()),
-            updated_at: "2026-01-01T00:00:00".into(),
-        };
-        let json = serde_json::to_string(&state).unwrap();
-        let parsed: UxAgentState = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.scope, "global");
-        assert_eq!(parsed.last_event_id, Some("e-42".into()));
     }
 }
