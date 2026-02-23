@@ -203,12 +203,12 @@ fn extract_steering_conventions(steerings: &[&Correction]) -> Vec<ExtractedConve
 ///
 /// Returns a structured string describing unincorporated corrections and
 /// proposed conventions.
-pub fn build_learning_context(
-    store: &RecommendationStore<'_>,
+pub async fn build_learning_context(
+    store: &RecommendationStore,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let corrections = store.get_unincorporated_corrections()?;
+    let corrections = store.get_unincorporated_corrections().await?;
     let conventions = extract_conventions(&corrections);
-    let proposed = store.get_proposed_conventions()?;
+    let proposed = store.get_proposed_conventions().await?;
 
     Ok(format_learning_context(&corrections, &conventions, &proposed))
 }
@@ -305,13 +305,12 @@ fn format_learning_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::test_pool;
     use crate::ux_agent::store::RecommendationStore;
-    use rusqlite::Connection;
+    use sqlx::SqlitePool;
 
-    fn setup() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        RecommendationStore::ensure_tables(&conn).unwrap();
-        conn
+    async fn setup() -> SqlitePool {
+        test_pool().await
     }
 
     fn make_correction(
@@ -351,16 +350,16 @@ mod tests {
         assert!(CorrectionType::from_str("nonexistent").is_none());
     }
 
-    #[test]
-    fn insert_and_retrieve_correction() {
-        let conn = setup();
-        let store = RecommendationStore::new(&conn);
+    #[tokio::test]
+    async fn insert_and_retrieve_correction() {
+        let pool = setup().await;
+        let store = RecommendationStore::new(pool.clone());
         let c = make_correction(CorrectionType::ModeOverride, Some("General"), Some("Implement"));
 
-        let id = store.insert_correction(&c).unwrap();
+        let id = store.insert_correction(&c).await.unwrap();
         assert!(id > 0);
 
-        let all = store.get_unincorporated_corrections().unwrap();
+        let all = store.get_unincorporated_corrections().await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, id);
         assert_eq!(all[0].correction_type, CorrectionType::ModeOverride);
@@ -369,10 +368,10 @@ mod tests {
         assert!(!all[0].incorporated);
     }
 
-    #[test]
-    fn get_corrections_by_type_filters() {
-        let conn = setup();
-        let store = RecommendationStore::new(&conn);
+    #[tokio::test]
+    async fn get_corrections_by_type_filters() {
+        let pool = setup().await;
+        let store = RecommendationStore::new(pool.clone());
 
         store
             .insert_correction(&make_correction(
@@ -380,6 +379,7 @@ mod tests {
                 Some("A"),
                 Some("B"),
             ))
+            .await
             .unwrap();
         store
             .insert_correction(&make_correction(
@@ -387,20 +387,21 @@ mod tests {
                 None,
                 Some("too verbose"),
             ))
+            .await
             .unwrap();
 
-        let overrides = store.get_corrections_by_type("mode_override").unwrap();
+        let overrides = store.get_corrections_by_type("mode_override").await.unwrap();
         assert_eq!(overrides.len(), 1);
         assert_eq!(overrides[0].correction_type, CorrectionType::ModeOverride);
 
-        let rejections = store.get_corrections_by_type("plan_rejection").unwrap();
+        let rejections = store.get_corrections_by_type("plan_rejection").await.unwrap();
         assert_eq!(rejections.len(), 1);
     }
 
-    #[test]
-    fn mark_corrections_incorporated() {
-        let conn = setup();
-        let store = RecommendationStore::new(&conn);
+    #[tokio::test]
+    async fn mark_corrections_incorporated() {
+        let pool = setup().await;
+        let store = RecommendationStore::new(pool.clone());
 
         let id1 = store
             .insert_correction(&make_correction(
@@ -408,6 +409,7 @@ mod tests {
                 Some("A"),
                 Some("B"),
             ))
+            .await
             .unwrap();
         let id2 = store
             .insert_correction(&make_correction(
@@ -415,50 +417,53 @@ mod tests {
                 None,
                 Some("bad"),
             ))
+            .await
             .unwrap();
 
-        store.mark_corrections_incorporated(&[id1]).unwrap();
+        store.mark_corrections_incorporated(&[id1]).await.unwrap();
 
-        let unincorporated = store.get_unincorporated_corrections().unwrap();
+        let unincorporated = store.get_unincorporated_corrections().await.unwrap();
         assert_eq!(unincorporated.len(), 1);
         assert_eq!(unincorporated[0].id, id2);
     }
 
-    #[test]
-    fn mark_corrections_incorporated_empty_ids() {
-        let conn = setup();
-        let store = RecommendationStore::new(&conn);
+    #[tokio::test]
+    async fn mark_corrections_incorporated_empty_ids() {
+        let pool = setup().await;
+        let store = RecommendationStore::new(pool.clone());
         // Should not error on empty list.
-        store.mark_corrections_incorporated(&[]).unwrap();
+        store.mark_corrections_incorporated(&[]).await.unwrap();
     }
 
-    #[test]
-    fn convention_lifecycle() {
-        let conn = setup();
-        let store = RecommendationStore::new(&conn);
+    #[tokio::test]
+    async fn convention_lifecycle() {
+        let pool = setup().await;
+        let store = RecommendationStore::new(pool.clone());
 
         let id = store
             .insert_convention("always use migrations", &[1, 2, 3], Some("implement"))
+            .await
             .unwrap();
         assert!(id > 0);
 
-        let proposed = store.get_proposed_conventions().unwrap();
+        let proposed = store.get_proposed_conventions().await.unwrap();
         assert_eq!(proposed.len(), 1);
         assert_eq!(proposed[0].convention, "always use migrations");
         assert_eq!(proposed[0].source_corrections, vec![1, 2, 3]);
         assert_eq!(proposed[0].target_mode.as_deref(), Some("implement"));
         assert_eq!(proposed[0].status, "proposed");
 
-        store.update_convention_status(id, "applied").unwrap();
-        let proposed_after = store.get_proposed_conventions().unwrap();
+        store.update_convention_status(id, "applied").await.unwrap();
+        let proposed_after = store.get_proposed_conventions().await.unwrap();
         assert!(proposed_after.is_empty());
 
         // Insert another and dismiss it.
         let id2 = store
             .insert_convention("never alter tables directly", &[4], None)
+            .await
             .unwrap();
-        store.update_convention_status(id2, "dismissed").unwrap();
-        let proposed_final = store.get_proposed_conventions().unwrap();
+        store.update_convention_status(id2, "dismissed").await.unwrap();
+        let proposed_final = store.get_proposed_conventions().await.unwrap();
         assert!(proposed_final.is_empty());
     }
 
@@ -552,10 +557,10 @@ mod tests {
         assert!(conventions.is_empty());
     }
 
-    #[test]
-    fn build_learning_context_produces_output() {
-        let conn = setup();
-        let store = RecommendationStore::new(&conn);
+    #[tokio::test]
+    async fn build_learning_context_produces_output() {
+        let pool = setup().await;
+        let store = RecommendationStore::new(pool.clone());
 
         for _ in 0..3 {
             store
@@ -564,25 +569,27 @@ mod tests {
                     Some("General"),
                     Some("Implement"),
                 ))
+                .await
                 .unwrap();
         }
         store
             .insert_convention("always use migrations", &[1, 2], Some("implement"))
+            .await
             .unwrap();
 
-        let context = build_learning_context(&store).unwrap();
+        let context = build_learning_context(&store).await.unwrap();
         assert!(context.contains("Corrections since last incorporation"));
         assert!(context.contains("mode_override"));
         assert!(context.contains("Previously proposed conventions"));
         assert!(context.contains("always use migrations"));
     }
 
-    #[test]
-    fn build_learning_context_empty_when_nothing() {
-        let conn = setup();
-        let store = RecommendationStore::new(&conn);
+    #[tokio::test]
+    async fn build_learning_context_empty_when_nothing() {
+        let pool = setup().await;
+        let store = RecommendationStore::new(pool.clone());
 
-        let context = build_learning_context(&store).unwrap();
+        let context = build_learning_context(&store).await.unwrap();
         assert!(context.is_empty());
     }
 

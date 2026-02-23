@@ -1,7 +1,7 @@
 use std::error::Error;
 
-use rusqlite::Connection;
 use serde_json::json;
+use sqlx::SqlitePool;
 
 use super::store::RecommendationStore;
 use super::types::{ModeChanges, RecommendationAction, RecommendationStatus};
@@ -86,16 +86,17 @@ impl LifecycleManager {
     /// 3. Execute the action side-effect
     /// 4. Save version record with snapshot
     /// 5. Update recommendation status to Applied
-    pub fn apply(
-        conn: &Connection,
+    pub async fn apply(
+        pool: &SqlitePool,
         recommendation_id: u64,
         mode_ops: &dyn ModeOperations,
         config_ops: &dyn ConfigOperations,
     ) -> LifecycleResult<()> {
-        let store = RecommendationStore::new(conn);
+        let store = RecommendationStore::new(pool.clone());
 
         let rec = store
-            .get(recommendation_id)?
+            .get(recommendation_id)
+            .await?
             .ok_or_else(|| lifecycle_error(&format!("recommendation {recommendation_id} not found")))?;
 
         if rec.status != RecommendationStatus::Pending {
@@ -108,11 +109,11 @@ impl LifecycleManager {
         let snapshot = capture_snapshot(&rec.action, mode_ops, config_ops)?;
         execute_action(&rec.action, mode_ops, config_ops)?;
 
-        let versions = store.get_versions(recommendation_id)?;
+        let versions = store.get_versions(recommendation_id).await?;
         let next_version = versions.last().map_or(1, |v| v.version + 1);
 
-        store.insert_version(recommendation_id, next_version, &snapshot)?;
-        store.update_status(recommendation_id, RecommendationStatus::Applied)?;
+        store.insert_version(recommendation_id, next_version, &snapshot).await?;
+        store.update_status(recommendation_id, RecommendationStatus::Applied).await?;
 
         Ok(())
     }
@@ -121,11 +122,12 @@ impl LifecycleManager {
     ///
     /// 1. Validate recommendation is in Pending status
     /// 2. Update status to Dismissed
-    pub fn dismiss(conn: &Connection, recommendation_id: u64) -> LifecycleResult<()> {
-        let store = RecommendationStore::new(conn);
+    pub async fn dismiss(pool: &SqlitePool, recommendation_id: u64) -> LifecycleResult<()> {
+        let store = RecommendationStore::new(pool.clone());
 
         let rec = store
-            .get(recommendation_id)?
+            .get(recommendation_id)
+            .await?
             .ok_or_else(|| lifecycle_error(&format!("recommendation {recommendation_id} not found")))?;
 
         if rec.status != RecommendationStatus::Pending {
@@ -135,7 +137,7 @@ impl LifecycleManager {
             )));
         }
 
-        store.update_status(recommendation_id, RecommendationStatus::Dismissed)?;
+        store.update_status(recommendation_id, RecommendationStatus::Dismissed).await?;
 
         Ok(())
     }
@@ -147,16 +149,17 @@ impl LifecycleManager {
     /// 3. Apply the snapshot (restore previous state)
     /// 4. Mark version as reverted
     /// 5. Update recommendation status to Reverted
-    pub fn revert(
-        conn: &Connection,
+    pub async fn revert(
+        pool: &SqlitePool,
         recommendation_id: u64,
         mode_ops: &dyn ModeOperations,
         config_ops: &dyn ConfigOperations,
     ) -> LifecycleResult<()> {
-        let store = RecommendationStore::new(conn);
+        let store = RecommendationStore::new(pool.clone());
 
         let rec = store
-            .get(recommendation_id)?
+            .get(recommendation_id)
+            .await?
             .ok_or_else(|| lifecycle_error(&format!("recommendation {recommendation_id} not found")))?;
 
         if rec.status != RecommendationStatus::Applied {
@@ -166,14 +169,14 @@ impl LifecycleManager {
             )));
         }
 
-        let versions = store.get_versions(recommendation_id)?;
+        let versions = store.get_versions(recommendation_id).await?;
         let latest = versions
             .last()
             .ok_or_else(|| lifecycle_error("no version records found for applied recommendation"))?;
 
         restore_snapshot(&rec.action, &latest.snapshot, mode_ops, config_ops)?;
-        store.mark_version_reverted(latest.id)?;
-        store.update_status(recommendation_id, RecommendationStatus::Reverted)?;
+        store.mark_version_reverted(latest.id).await?;
+        store.update_status(recommendation_id, RecommendationStatus::Reverted).await?;
 
         Ok(())
     }
@@ -257,8 +260,6 @@ fn restore_snapshot(
 ) -> LifecycleResult<()> {
     match action {
         RecommendationAction::ModeCreate { name, .. } => {
-            // Snapshot was {"existed": false} — restore means remove the mode.
-            // We use restore_mode_snapshot which the real implementation will handle as deletion.
             mode_ops.restore_mode_snapshot(name, snapshot)?;
         }
         RecommendationAction::ModeEdit { mode_name, .. } => {
@@ -308,16 +309,11 @@ fn lifecycle_error(msg: &str) -> Box<dyn Error + Send + Sync> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::test_pool;
     use crate::ux_agent::types::{Recommendation, RecommendationAction, RecommendationStatus};
 
-    fn setup() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        RecommendationStore::ensure_tables(&conn).unwrap();
-        conn
-    }
-
-    fn insert_pending(conn: &Connection, action: RecommendationAction) -> u64 {
-        let store = RecommendationStore::new(conn);
+    async fn insert_pending(pool: &SqlitePool, action: RecommendationAction) -> u64 {
+        let store = RecommendationStore::new(pool.clone());
         store
             .insert(&Recommendation {
                 id: 0,
@@ -326,6 +322,7 @@ mod tests {
                 action,
                 status: RecommendationStatus::Pending,
             })
+            .await
             .unwrap()
     }
 
@@ -337,27 +334,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_transitions_pending_to_applied() {
-        let conn = setup();
-        let id = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn apply_transitions_pending_to_applied() {
+        let pool = test_pool().await;
+        let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-        let store = RecommendationStore::new(&conn);
-        let rec = store.get(id).unwrap().unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let rec = store.get(id).await.unwrap().unwrap();
         assert_eq!(rec.status, RecommendationStatus::Applied);
     }
 
-    #[test]
-    fn apply_creates_version_record() {
-        let conn = setup();
-        let id = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn apply_creates_version_record() {
+        let pool = test_pool().await;
+        let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-        let store = RecommendationStore::new(&conn);
-        let versions = store.get_versions(id).unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let versions = store.get_versions(id).await.unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version, 1);
         assert_eq!(versions[0].recommendation_id, id);
@@ -368,113 +365,112 @@ mod tests {
         assert_eq!(snap["model"], "cheap");
     }
 
-    #[test]
-    fn apply_rejects_non_pending() {
-        let conn = setup();
-        let id = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn apply_rejects_non_pending() {
+        let pool = test_pool().await;
+        let id = insert_pending(&pool, model_change_action()).await;
 
-        // Apply it first
-        LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-        // Applying again should fail
-        let err = LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap_err();
+        let err = LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
         assert!(err.to_string().contains("expected Pending"));
     }
 
-    #[test]
-    fn dismiss_transitions_pending_to_dismissed() {
-        let conn = setup();
-        let id = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn dismiss_transitions_pending_to_dismissed() {
+        let pool = test_pool().await;
+        let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::dismiss(&conn, id).unwrap();
+        LifecycleManager::dismiss(&pool, id).await.unwrap();
 
-        let store = RecommendationStore::new(&conn);
-        let rec = store.get(id).unwrap().unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let rec = store.get(id).await.unwrap().unwrap();
         assert_eq!(rec.status, RecommendationStatus::Dismissed);
     }
 
-    #[test]
-    fn dismiss_rejects_non_pending() {
-        let conn = setup();
-        let id = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn dismiss_rejects_non_pending() {
+        let pool = test_pool().await;
+        let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-        let err = LifecycleManager::dismiss(&conn, id).unwrap_err();
+        let err = LifecycleManager::dismiss(&pool, id).await.unwrap_err();
         assert!(err.to_string().contains("expected Pending"));
     }
 
-    #[test]
-    fn revert_transitions_applied_to_reverted() {
-        let conn = setup();
-        let id = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn revert_transitions_applied_to_reverted() {
+        let pool = test_pool().await;
+        let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
-        LifecycleManager::revert(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-        let store = RecommendationStore::new(&conn);
-        let rec = store.get(id).unwrap().unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let rec = store.get(id).await.unwrap().unwrap();
         assert_eq!(rec.status, RecommendationStatus::Reverted);
 
-        let versions = store.get_versions(id).unwrap();
+        let versions = store.get_versions(id).await.unwrap();
         assert_eq!(versions.len(), 1);
         assert!(versions[0].reverted_at.is_some());
     }
 
-    #[test]
-    fn revert_rejects_non_applied() {
-        let conn = setup();
-        let id = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn revert_rejects_non_applied() {
+        let pool = test_pool().await;
+        let id = insert_pending(&pool, model_change_action()).await;
 
-        let err = LifecycleManager::revert(&conn, id, &StubModeOps, &StubConfigOps).unwrap_err();
+        let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
         assert!(err.to_string().contains("expected Applied"));
     }
 
-    #[test]
-    fn revert_rejects_dismissed() {
-        let conn = setup();
-        let id = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn revert_rejects_dismissed() {
+        let pool = test_pool().await;
+        let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::dismiss(&conn, id).unwrap();
+        LifecycleManager::dismiss(&pool, id).await.unwrap();
 
-        let err = LifecycleManager::revert(&conn, id, &StubModeOps, &StubConfigOps).unwrap_err();
+        let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
         assert!(err.to_string().contains("expected Applied"));
     }
 
-    #[test]
-    fn apply_not_found() {
-        let conn = setup();
-        let err = LifecycleManager::apply(&conn, 999, &StubModeOps, &StubConfigOps).unwrap_err();
+    #[tokio::test]
+    async fn apply_not_found() {
+        let pool = test_pool().await;
+        let err = LifecycleManager::apply(&pool, 999, &StubModeOps, &StubConfigOps).await.unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
-    #[test]
-    fn get_dismissed_patterns_returns_trigger_patterns() {
-        let conn = setup();
-        let id1 = insert_pending(&conn, model_change_action());
+    #[tokio::test]
+    async fn get_dismissed_patterns_returns_trigger_patterns() {
+        let pool = test_pool().await;
+        let id1 = insert_pending(&pool, model_change_action()).await;
         let id2 = insert_pending(
-            &conn,
+            &pool,
             RecommendationAction::ConfigChange {
                 key: "timeout".to_string(),
                 old_value: "30".to_string(),
                 new_value: "60".to_string(),
             },
-        );
+        )
+        .await;
         // One applied, one dismissed
-        LifecycleManager::apply(&conn, id1, &StubModeOps, &StubConfigOps).unwrap();
-        LifecycleManager::dismiss(&conn, id2).unwrap();
+        LifecycleManager::apply(&pool, id1, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::dismiss(&pool, id2).await.unwrap();
 
-        let store = RecommendationStore::new(&conn);
-        let patterns = store.get_dismissed_patterns().unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let patterns = store.get_dismissed_patterns().await.unwrap();
         assert_eq!(patterns.len(), 1);
         assert_eq!(patterns[0], "test-pattern");
     }
 
-    #[test]
-    fn apply_mode_create_snapshot() {
-        let conn = setup();
+    #[tokio::test]
+    async fn apply_mode_create_snapshot() {
+        let pool = test_pool().await;
         let id = insert_pending(
-            &conn,
+            &pool,
             RecommendationAction::ModeCreate {
                 name: "db-mode".to_string(),
                 description: "Database mode".to_string(),
@@ -482,53 +478,56 @@ mod tests {
                 default_model: None,
                 allowed_tools: vec!["sql".to_string()],
             },
-        );
+        )
+        .await;
 
-        LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-        let store = RecommendationStore::new(&conn);
-        let versions = store.get_versions(id).unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let versions = store.get_versions(id).await.unwrap();
         let snap: serde_json::Value = serde_json::from_str(&versions[0].snapshot).unwrap();
         assert_eq!(snap["existed"], false);
     }
 
-    #[test]
-    fn apply_config_change_snapshot() {
-        let conn = setup();
+    #[tokio::test]
+    async fn apply_config_change_snapshot() {
+        let pool = test_pool().await;
         let id = insert_pending(
-            &conn,
+            &pool,
             RecommendationAction::ConfigChange {
                 key: "timeout".to_string(),
                 old_value: "30".to_string(),
                 new_value: "60".to_string(),
             },
-        );
+        )
+        .await;
 
-        LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-        let store = RecommendationStore::new(&conn);
-        let versions = store.get_versions(id).unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let versions = store.get_versions(id).await.unwrap();
         let snap: serde_json::Value = serde_json::from_str(&versions[0].snapshot).unwrap();
         assert_eq!(snap["key"], "timeout");
         assert_eq!(snap["value"], "30");
     }
 
-    #[test]
-    fn apply_prompt_edit_snapshot() {
-        let conn = setup();
+    #[tokio::test]
+    async fn apply_prompt_edit_snapshot() {
+        let pool = test_pool().await;
         let id = insert_pending(
-            &conn,
+            &pool,
             RecommendationAction::PromptEdit {
                 mode_name: "coding".to_string(),
                 old_fragment: "be concise".to_string(),
                 new_fragment: "be verbose".to_string(),
             },
-        );
+        )
+        .await;
 
-        LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-        let store = RecommendationStore::new(&conn);
-        let versions = store.get_versions(id).unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let versions = store.get_versions(id).await.unwrap();
         let snap: serde_json::Value = serde_json::from_str(&versions[0].snapshot).unwrap();
         assert_eq!(snap["mode_name"], "coding");
         assert_eq!(snap["fragment"], "be concise");

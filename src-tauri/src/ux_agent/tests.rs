@@ -1,4 +1,6 @@
-use rusqlite::Connection;
+use sqlx::SqlitePool;
+
+use crate::db::test_pool;
 
 use super::decisions::{
     build_config_change_action, build_mode_create_action, build_mode_edit_action,
@@ -16,10 +18,8 @@ use super::types::{
     ModeChanges, Recommendation, RecommendationAction, RecommendationStatus, UxAgentState,
 };
 
-fn test_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    RecommendationStore::ensure_tables(&conn).unwrap();
-    conn
+async fn test_db() -> SqlitePool {
+    test_pool().await
 }
 
 // ---------------------------------------------------------------------------
@@ -158,10 +158,10 @@ fn recommendation_equality() {
 // 2. Store tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn store_insert_and_get_each_action_type() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn store_insert_and_get_each_action_type() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     let actions: Vec<RecommendationAction> = vec![
         RecommendationAction::ModelChange {
@@ -205,17 +205,17 @@ fn store_insert_and_get_each_action_type() {
             action: action.clone(),
             status: RecommendationStatus::Pending,
         };
-        let id = store.insert(&rec).unwrap();
-        let loaded = store.get(id).unwrap().unwrap();
+        let id = store.insert(&rec).await.unwrap();
+        let loaded = store.get(id).await.unwrap().unwrap();
         assert_eq!(loaded.action, action);
         assert_eq!(loaded.status, RecommendationStatus::Pending);
     }
 }
 
-#[test]
-fn store_list_pending_filters_correctly() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn store_list_pending_filters_correctly() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     let make = |status: RecommendationStatus| Recommendation {
         id: 0,
@@ -229,41 +229,42 @@ fn store_list_pending_filters_correctly() {
         status,
     };
 
-    let id1 = store.insert(&make(RecommendationStatus::Pending)).unwrap();
-    let id2 = store.insert(&make(RecommendationStatus::Pending)).unwrap();
-    let id3 = store.insert(&make(RecommendationStatus::Pending)).unwrap();
+    let id1 = store.insert(&make(RecommendationStatus::Pending)).await.unwrap();
+    let id2 = store.insert(&make(RecommendationStatus::Pending)).await.unwrap();
+    let id3 = store.insert(&make(RecommendationStatus::Pending)).await.unwrap();
 
     store
         .update_status(id3, RecommendationStatus::Applied)
+        .await
         .unwrap();
 
-    let pending = store.list_pending().unwrap();
+    let pending = store.list_pending().await.unwrap();
     assert_eq!(pending.len(), 2);
     let ids: Vec<u64> = pending.iter().map(|r| r.id).collect();
     assert!(ids.contains(&id1));
     assert!(ids.contains(&id2));
 }
 
-#[test]
-fn store_cursor_default() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
-    let state = store.get_cursor().unwrap();
+#[tokio::test]
+async fn store_cursor_default() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
+    let state = store.get_cursor().await.unwrap();
     assert_eq!(state, UxAgentState::default());
 }
 
-#[test]
-fn store_cursor_roundtrip() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn store_cursor_roundtrip() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     let state = UxAgentState {
         last_event_id: Some("evt-123".into()),
         last_event_at: Some("2026-02-22T10:00:00Z".into()),
         last_run_at: Some("2026-02-22T10:05:00Z".into()),
     };
-    store.set_cursor(&state).unwrap();
-    let loaded = store.get_cursor().unwrap();
+    store.set_cursor(&state).await.unwrap();
+    let loaded = store.get_cursor().await.unwrap();
     assert_eq!(loaded, state);
 
     // Update cursor again
@@ -272,15 +273,15 @@ fn store_cursor_roundtrip() {
         last_event_at: Some("2026-02-22T11:00:00Z".into()),
         last_run_at: Some("2026-02-22T11:05:00Z".into()),
     };
-    store.set_cursor(&state2).unwrap();
-    let loaded2 = store.get_cursor().unwrap();
+    store.set_cursor(&state2).await.unwrap();
+    let loaded2 = store.get_cursor().await.unwrap();
     assert_eq!(loaded2, state2);
 }
 
-#[test]
-fn store_version_tracking() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn store_version_tracking() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     let rec = Recommendation {
         id: 0,
@@ -293,25 +294,25 @@ fn store_version_tracking() {
         },
         status: RecommendationStatus::Pending,
     };
-    let rec_id = store.insert(&rec).unwrap();
+    let rec_id = store.insert(&rec).await.unwrap();
 
-    store.insert_version(rec_id, 1, r#"{"key":"k","value":"a"}"#).unwrap();
+    store.insert_version(rec_id, 1, r#"{"key":"k","value":"a"}"#).await.unwrap();
 
-    let versions = store.get_versions(rec_id).unwrap();
+    let versions = store.get_versions(rec_id).await.unwrap();
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].version, 1);
     assert_eq!(versions[0].recommendation_id, rec_id);
     assert!(versions[0].reverted_at.is_none());
 
-    store.mark_version_reverted(versions[0].id).unwrap();
-    let versions2 = store.get_versions(rec_id).unwrap();
+    store.mark_version_reverted(versions[0].id).await.unwrap();
+    let versions2 = store.get_versions(rec_id).await.unwrap();
     assert!(versions2[0].reverted_at.is_some());
 }
 
-#[test]
-fn store_dismissed_patterns() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn store_dismissed_patterns() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     let rec = Recommendation {
         id: 0,
@@ -324,12 +325,13 @@ fn store_dismissed_patterns() {
         },
         status: RecommendationStatus::Pending,
     };
-    let id = store.insert(&rec).unwrap();
+    let id = store.insert(&rec).await.unwrap();
     store
         .update_status(id, RecommendationStatus::Dismissed)
+        .await
         .unwrap();
 
-    let patterns = store.get_dismissed_patterns().unwrap();
+    let patterns = store.get_dismissed_patterns().await.unwrap();
     assert_eq!(patterns, vec!["cost_spike"]);
 }
 
@@ -565,8 +567,8 @@ fn action_builder_prompt_edit() {
 // 5. Lifecycle tests
 // ---------------------------------------------------------------------------
 
-fn insert_pending(conn: &Connection, action: RecommendationAction) -> u64 {
-    let store = RecommendationStore::new(conn);
+async fn insert_pending(pool: &SqlitePool, action: RecommendationAction) -> u64 {
+    let store = RecommendationStore::new(pool.clone());
     store
         .insert(&Recommendation {
             id: 0,
@@ -575,6 +577,7 @@ fn insert_pending(conn: &Connection, action: RecommendationAction) -> u64 {
             action,
             status: RecommendationStatus::Pending,
         })
+        .await
         .unwrap()
 }
 
@@ -586,79 +589,79 @@ fn model_change_action() -> RecommendationAction {
     }
 }
 
-#[test]
-fn apply_pending_recommendation() {
-    let conn = test_db();
-    let id = insert_pending(&conn, model_change_action());
+#[tokio::test]
+async fn apply_pending_recommendation() {
+    let pool = test_db().await;
+    let id = insert_pending(&pool, model_change_action()).await;
 
-    LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-    let store = RecommendationStore::new(&conn);
-    let rec = store.get(id).unwrap().unwrap();
+    let store = RecommendationStore::new(pool.clone());
+    let rec = store.get(id).await.unwrap().unwrap();
     assert_eq!(rec.status, RecommendationStatus::Applied);
 
-    let versions = store.get_versions(id).unwrap();
+    let versions = store.get_versions(id).await.unwrap();
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].version, 1);
 }
 
-#[test]
-fn apply_non_pending_fails() {
-    let conn = test_db();
-    let id = insert_pending(&conn, model_change_action());
+#[tokio::test]
+async fn apply_non_pending_fails() {
+    let pool = test_db().await;
+    let id = insert_pending(&pool, model_change_action()).await;
 
-    LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-    let err = LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap_err();
+    let err = LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
     assert!(err.to_string().contains("expected Pending"));
 }
 
-#[test]
-fn dismiss_recommendation() {
-    let conn = test_db();
-    let id = insert_pending(&conn, model_change_action());
+#[tokio::test]
+async fn dismiss_recommendation() {
+    let pool = test_db().await;
+    let id = insert_pending(&pool, model_change_action()).await;
 
-    LifecycleManager::dismiss(&conn, id).unwrap();
+    LifecycleManager::dismiss(&pool, id).await.unwrap();
 
-    let store = RecommendationStore::new(&conn);
-    let rec = store.get(id).unwrap().unwrap();
+    let store = RecommendationStore::new(pool.clone());
+    let rec = store.get(id).await.unwrap().unwrap();
     assert_eq!(rec.status, RecommendationStatus::Dismissed);
 }
 
-#[test]
-fn revert_applied_recommendation() {
-    let conn = test_db();
-    let id = insert_pending(&conn, model_change_action());
+#[tokio::test]
+async fn revert_applied_recommendation() {
+    let pool = test_db().await;
+    let id = insert_pending(&pool, model_change_action()).await;
 
-    LifecycleManager::apply(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
-    LifecycleManager::revert(&conn, id, &StubModeOps, &StubConfigOps).unwrap();
+    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+    LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
 
-    let store = RecommendationStore::new(&conn);
-    let rec = store.get(id).unwrap().unwrap();
+    let store = RecommendationStore::new(pool.clone());
+    let rec = store.get(id).await.unwrap().unwrap();
     assert_eq!(rec.status, RecommendationStatus::Reverted);
 
-    let versions = store.get_versions(id).unwrap();
+    let versions = store.get_versions(id).await.unwrap();
     assert!(versions[0].reverted_at.is_some());
 }
 
-#[test]
-fn revert_non_applied_fails() {
-    let conn = test_db();
-    let id = insert_pending(&conn, model_change_action());
+#[tokio::test]
+async fn revert_non_applied_fails() {
+    let pool = test_db().await;
+    let id = insert_pending(&pool, model_change_action()).await;
 
-    let err = LifecycleManager::revert(&conn, id, &StubModeOps, &StubConfigOps).unwrap_err();
+    let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
     assert!(err.to_string().contains("expected Applied"));
 }
 
-#[test]
-fn dismissed_patterns_returned() {
-    let conn = test_db();
-    let id = insert_pending(&conn, model_change_action());
+#[tokio::test]
+async fn dismissed_patterns_returned() {
+    let pool = test_db().await;
+    let id = insert_pending(&pool, model_change_action()).await;
 
-    LifecycleManager::dismiss(&conn, id).unwrap();
+    LifecycleManager::dismiss(&pool, id).await.unwrap();
 
-    let store = RecommendationStore::new(&conn);
-    let patterns = store.get_dismissed_patterns().unwrap();
+    let store = RecommendationStore::new(pool.clone());
+    let patterns = store.get_dismissed_patterns().await.unwrap();
     assert_eq!(patterns, vec!["test-pattern"]);
 }
 
@@ -683,43 +686,49 @@ fn make_correction(
     }
 }
 
-#[test]
-fn insert_and_retrieve_corrections() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn insert_and_retrieve_corrections() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     store
         .insert_correction(&make_correction(CorrectionType::ModeOverride, Some("A"), Some("B")))
+        .await
         .unwrap();
     store
         .insert_correction(&make_correction(CorrectionType::PlanRejection, None, Some("verbose")))
+        .await
         .unwrap();
     store
         .insert_correction(&make_correction(CorrectionType::AgentSteering, None, Some("use tests")))
+        .await
         .unwrap();
 
-    let all = store.get_unincorporated_corrections().unwrap();
+    let all = store.get_unincorporated_corrections().await.unwrap();
     assert_eq!(all.len(), 3);
 }
 
-#[test]
-fn mark_corrections_incorporated() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn mark_corrections_incorporated() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     let id1 = store
         .insert_correction(&make_correction(CorrectionType::ModeOverride, Some("A"), Some("B")))
+        .await
         .unwrap();
     let id2 = store
         .insert_correction(&make_correction(CorrectionType::DiffRejection, None, Some("bad")))
+        .await
         .unwrap();
     let id3 = store
         .insert_correction(&make_correction(CorrectionType::AgentSteering, None, Some("tests")))
+        .await
         .unwrap();
 
-    store.mark_corrections_incorporated(&[id1, id2]).unwrap();
+    store.mark_corrections_incorporated(&[id1, id2]).await.unwrap();
 
-    let remaining = store.get_unincorporated_corrections().unwrap();
+    let remaining = store.get_unincorporated_corrections().await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, id3);
 }
@@ -764,10 +773,10 @@ fn extract_conventions_insufficient_data() {
     assert!(conventions.is_empty());
 }
 
-#[test]
-fn build_learning_context_formatting() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn build_learning_context_formatting() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     for _ in 0..3 {
         store
@@ -776,42 +785,44 @@ fn build_learning_context_formatting() {
                 Some("General"),
                 Some("Implement"),
             ))
+            .await
             .unwrap();
     }
 
-    let context = build_learning_context(&store).unwrap();
+    let context = build_learning_context(&store).await.unwrap();
     assert!(!context.is_empty());
     assert!(context.contains("Corrections since last incorporation"));
     assert!(context.contains("mode_override"));
 }
 
-#[test]
-fn build_learning_context_empty_when_no_data() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
-    let context = build_learning_context(&store).unwrap();
+#[tokio::test]
+async fn build_learning_context_empty_when_no_data() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
+    let context = build_learning_context(&store).await.unwrap();
     assert!(context.is_empty());
 }
 
-#[test]
-fn convention_lifecycle() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn convention_lifecycle() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     let id = store
         .insert_convention("always use migrations", &[1, 2, 3], Some("implement"))
+        .await
         .unwrap();
     assert!(id > 0);
 
-    let proposed = store.get_proposed_conventions().unwrap();
+    let proposed = store.get_proposed_conventions().await.unwrap();
     assert_eq!(proposed.len(), 1);
     assert_eq!(proposed[0].convention, "always use migrations");
     assert_eq!(proposed[0].source_corrections, vec![1, 2, 3]);
     assert_eq!(proposed[0].target_mode.as_deref(), Some("implement"));
     assert_eq!(proposed[0].status, "proposed");
 
-    store.update_convention_status(id, "applied").unwrap();
-    let proposed_after = store.get_proposed_conventions().unwrap();
+    store.update_convention_status(id, "applied").await.unwrap();
+    let proposed_after = store.get_proposed_conventions().await.unwrap();
     assert!(proposed_after.is_empty());
 }
 
@@ -819,9 +830,9 @@ fn convention_lifecycle() {
 // 7. Runtime integration tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn runtime_run_with_stub_model() {
-    let conn = test_db();
+#[tokio::test]
+async fn runtime_run_with_stub_model() {
+    let pool = test_db().await;
     let rt = UxAgentRuntime::new("cheap-model".into(), Box::new(StubModelInvoker));
     let triggers = vec![TriggerReason::RejectionsAccumulated { count: 3 }];
     let summary = EventSummary {
@@ -830,12 +841,12 @@ fn runtime_run_with_stub_model() {
         ..Default::default()
     };
 
-    let recs = rt.run(&conn, &triggers, &summary, "{}", "[]").unwrap();
+    let recs = rt.run(&pool, &triggers, &summary, "{}", "[]").await.unwrap();
     assert!(recs.is_empty());
 
     // Cursor should be updated even with no recommendations
-    let store = RecommendationStore::new(&conn);
-    let cursor = store.get_cursor().unwrap();
+    let store = RecommendationStore::new(pool.clone());
+    let cursor = store.get_cursor().await.unwrap();
     assert!(cursor.last_run_at.is_some());
 }
 
@@ -853,9 +864,9 @@ impl super::runtime::ModelInvoker for MockModelInvoker {
     }
 }
 
-#[test]
-fn runtime_persists_recommendations() {
-    let conn = test_db();
+#[tokio::test]
+async fn runtime_persists_recommendations() {
+    let pool = test_db().await;
     let response = serde_json::json!({
         "recommendations": [{
             "trigger_pattern": "3+ rejections on schema edits",
@@ -879,12 +890,12 @@ fn runtime_persists_recommendations() {
         ..Default::default()
     };
 
-    let recs = rt.run(&conn, &triggers, &summary, "{}", "[]").unwrap();
+    let recs = rt.run(&pool, &triggers, &summary, "{}", "[]").await.unwrap();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].status, RecommendationStatus::Pending);
 
-    let store = RecommendationStore::new(&conn);
-    let pending = store.list_pending().unwrap();
+    let store = RecommendationStore::new(pool.clone());
+    let pending = store.list_pending().await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, recs[0].id);
 }
@@ -918,9 +929,9 @@ fn prompt_assembly_contains_trigger_info() {
 // 8. End-to-end pipeline: triggers -> runtime -> lifecycle
 // ---------------------------------------------------------------------------
 
-#[test]
-fn full_pipeline_trigger_to_apply_to_revert() {
-    let conn = test_db();
+#[tokio::test]
+async fn full_pipeline_trigger_to_apply_to_revert() {
+    let pool = test_db().await;
 
     // 1. Evaluate triggers
     let summary = EventSummary {
@@ -948,25 +959,25 @@ fn full_pipeline_trigger_to_apply_to_revert() {
         response: serde_json::to_string(&response).unwrap(),
     };
     let rt = UxAgentRuntime::new("ux-model".into(), Box::new(invoker));
-    let recs = rt.run(&conn, &triggers, &summary, "{}", "[]").unwrap();
+    let recs = rt.run(&pool, &triggers, &summary, "{}", "[]").await.unwrap();
     assert_eq!(recs.len(), 1);
     let rec_id = recs[0].id;
 
     // 3. Apply the recommendation
-    LifecycleManager::apply(&conn, rec_id, &StubModeOps, &StubConfigOps).unwrap();
-    let store = RecommendationStore::new(&conn);
-    let rec = store.get(rec_id).unwrap().unwrap();
+    LifecycleManager::apply(&pool, rec_id, &StubModeOps, &StubConfigOps).await.unwrap();
+    let store = RecommendationStore::new(pool.clone());
+    let rec = store.get(rec_id).await.unwrap().unwrap();
     assert_eq!(rec.status, RecommendationStatus::Applied);
 
     // 4. Revert the recommendation
-    LifecycleManager::revert(&conn, rec_id, &StubModeOps, &StubConfigOps).unwrap();
-    let rec = store.get(rec_id).unwrap().unwrap();
+    LifecycleManager::revert(&pool, rec_id, &StubModeOps, &StubConfigOps).await.unwrap();
+    let rec = store.get(rec_id).await.unwrap().unwrap();
     assert_eq!(rec.status, RecommendationStatus::Reverted);
 }
 
-#[test]
-fn full_pipeline_trigger_to_dismiss_affects_future_candidates() {
-    let conn = test_db();
+#[tokio::test]
+async fn full_pipeline_trigger_to_dismiss_affects_future_candidates() {
+    let pool = test_db().await;
 
     // 1. Create and dismiss a recommendation
     let response = serde_json::json!({
@@ -995,14 +1006,14 @@ fn full_pipeline_trigger_to_dismiss_affects_future_candidates() {
         ..Default::default()
     };
     let triggers = evaluate_triggers(&summary);
-    let recs = rt.run(&conn, &triggers, &summary, "{}", "[]").unwrap();
+    let recs = rt.run(&pool, &triggers, &summary, "{}", "[]").await.unwrap();
     let rec_id = recs[0].id;
 
-    LifecycleManager::dismiss(&conn, rec_id).unwrap();
+    LifecycleManager::dismiss(&pool, rec_id).await.unwrap();
 
     // 2. Dismissed patterns now include the trigger pattern
-    let store = RecommendationStore::new(&conn);
-    let dismissed = store.get_dismissed_patterns().unwrap();
+    let store = RecommendationStore::new(pool.clone());
+    let dismissed = store.get_dismissed_patterns().await.unwrap();
     assert!(dismissed.contains(&"rejections_accumulated:5".to_string()));
 
     // 3. Future decision generation should filter it out
@@ -1020,10 +1031,10 @@ fn full_pipeline_trigger_to_dismiss_affects_future_candidates() {
     );
 }
 
-#[test]
-fn learning_corrections_feed_into_context() {
-    let conn = test_db();
-    let store = RecommendationStore::new(&conn);
+#[tokio::test]
+async fn learning_corrections_feed_into_context() {
+    let pool = test_db().await;
+    let store = RecommendationStore::new(pool.clone());
 
     // Insert corrections that form a pattern
     for _ in 0..3 {
@@ -1033,6 +1044,7 @@ fn learning_corrections_feed_into_context() {
                 Some("General"),
                 Some("Implement"),
             ))
+            .await
             .unwrap();
     }
     store
@@ -1041,22 +1053,23 @@ fn learning_corrections_feed_into_context() {
             None,
             Some("too verbose"),
         ))
+        .await
         .unwrap();
 
     // Build learning context
-    let context = build_learning_context(&store).unwrap();
+    let context = build_learning_context(&store).await.unwrap();
     assert!(context.contains("mode_override"));
     assert!(context.contains("Corrections since last incorporation"));
 
     // Extract conventions
-    let corrections = store.get_unincorporated_corrections().unwrap();
+    let corrections = store.get_unincorporated_corrections().await.unwrap();
     let conventions = extract_conventions(&corrections);
     assert!(!conventions.is_empty());
     assert!(conventions.iter().any(|c| c.convention.contains("Implement")));
 
     // Mark corrections as incorporated
     let ids: Vec<u64> = corrections.iter().map(|c| c.id).collect();
-    store.mark_corrections_incorporated(&ids).unwrap();
-    let remaining = store.get_unincorporated_corrections().unwrap();
+    store.mark_corrections_incorporated(&ids).await.unwrap();
+    let remaining = store.get_unincorporated_corrections().await.unwrap();
     assert!(remaining.is_empty());
 }

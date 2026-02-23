@@ -1,5 +1,5 @@
-use rusqlite::Connection;
 use serde::Deserialize;
+use sqlx::SqlitePool;
 
 use super::prompt::{self, UX_AGENT_SYSTEM_PROMPT};
 use super::store::RecommendationStore;
@@ -66,21 +66,21 @@ impl UxAgentRuntime {
     /// 6. Persist recommendations with status=Pending
     /// 7. Update cursor state
     /// 8. Return the new recommendations
-    pub fn run(
+    pub async fn run(
         &self,
-        conn: &Connection,
+        pool: &SqlitePool,
         triggers: &[TriggerReason],
         summary: &EventSummary,
         config_snapshot: &str,
         modes_snapshot: &str,
     ) -> Result<Vec<Recommendation>, RuntimeError> {
-        let store = RecommendationStore::new(conn);
+        let store = RecommendationStore::new(pool.clone());
 
         // 1. Load cursor state
-        let _cursor = store.get_cursor()?;
+        let _cursor = store.get_cursor().await?;
 
         // 2-3. Assemble context and build prompt
-        let dismissed = store.get_dismissed_patterns()?;
+        let dismissed = store.get_dismissed_patterns().await?;
         let user_message = prompt::build_user_message(
             triggers,
             summary,
@@ -105,7 +105,7 @@ impl UxAgentRuntime {
                 action: raw.action,
                 status: RecommendationStatus::Pending,
             };
-            let id = store.insert(&rec)?;
+            let id = store.insert(&rec).await?;
             recommendations.push(Recommendation { id, ..rec });
         }
 
@@ -120,7 +120,7 @@ impl UxAgentRuntime {
             last_event_at: Some(now.clone()),
             last_run_at: Some(now),
         };
-        store.set_cursor(&new_cursor)?;
+        store.set_cursor(&new_cursor).await?;
 
         // 8. Return
         Ok(recommendations)
@@ -130,6 +130,7 @@ impl UxAgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::test_pool;
     use crate::ux_agent::store::RecommendationStore;
     use crate::ux_agent::triggers::TriggerReason;
     use crate::ux_agent::types::RecommendationStatus;
@@ -160,12 +161,6 @@ mod tests {
         }
     }
 
-    fn setup() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        RecommendationStore::ensure_tables(&conn).unwrap();
-        conn
-    }
-
     fn default_summary() -> EventSummary {
         EventSummary {
             rejection_count: 3,
@@ -180,19 +175,19 @@ mod tests {
         assert_eq!(rt.model(), "cheap-model");
     }
 
-    #[test]
-    fn run_with_stub_returns_empty_recommendations() {
-        let conn = setup();
+    #[tokio::test]
+    async fn run_with_stub_returns_empty_recommendations() {
+        let pool = test_pool().await;
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(StubModelInvoker));
         let triggers = vec![TriggerReason::RejectionsAccumulated { count: 3 }];
 
-        let recs = rt.run(&conn, &triggers, &default_summary(), "{}", "[]").unwrap();
+        let recs = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await.unwrap();
         assert!(recs.is_empty());
     }
 
-    #[test]
-    fn run_persists_recommendations_and_updates_cursor() {
-        let conn = setup();
+    #[tokio::test]
+    async fn run_persists_recommendations_and_updates_cursor() {
+        let pool = test_pool().await;
         let response = serde_json::json!({
             "recommendations": [
                 {
@@ -213,7 +208,7 @@ mod tests {
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(invoker));
         let triggers = vec![TriggerReason::RejectionsAccumulated { count: 3 }];
 
-        let recs = rt.run(&conn, &triggers, &default_summary(), "{}", "[]").unwrap();
+        let recs = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await.unwrap();
 
         assert_eq!(recs.len(), 1);
         assert_ne!(recs[0].id, 0);
@@ -221,43 +216,43 @@ mod tests {
         assert_eq!(recs[0].trigger_pattern, "3+ rejections on schema edits");
 
         // Verify persisted
-        let store = RecommendationStore::new(&conn);
-        let pending = store.list_pending().unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let pending = store.list_pending().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, recs[0].id);
 
         // Verify cursor updated
-        let cursor = store.get_cursor().unwrap();
+        let cursor = store.get_cursor().await.unwrap();
         assert!(cursor.last_run_at.is_some());
     }
 
-    #[test]
-    fn run_returns_error_on_model_failure() {
-        let conn = setup();
+    #[tokio::test]
+    async fn run_returns_error_on_model_failure() {
+        let pool = test_pool().await;
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(FailingInvoker));
         let triggers = vec![TriggerReason::NewSession];
 
-        let result = rt.run(&conn, &triggers, &default_summary(), "{}", "[]");
+        let result = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("model unavailable"));
     }
 
-    #[test]
-    fn run_returns_error_on_invalid_json() {
+    #[tokio::test]
+    async fn run_returns_error_on_invalid_json() {
         let invoker = EchoInvoker {
             response: "not valid json".to_string(),
         };
-        let conn = setup();
+        let pool = test_pool().await;
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(invoker));
         let triggers = vec![TriggerReason::NewSession];
 
-        let result = rt.run(&conn, &triggers, &default_summary(), "{}", "[]");
+        let result = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn run_with_multiple_recommendations() {
-        let conn = setup();
+    #[tokio::test]
+    async fn run_with_multiple_recommendations() {
+        let pool = test_pool().await;
         let response = serde_json::json!({
             "recommendations": [
                 {
@@ -290,11 +285,11 @@ mod tests {
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(invoker));
         let triggers = vec![TriggerReason::RejectionsAccumulated { count: 5 }];
 
-        let recs = rt.run(&conn, &triggers, &default_summary(), "{}", "[]").unwrap();
+        let recs = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await.unwrap();
         assert_eq!(recs.len(), 2);
 
-        let store = RecommendationStore::new(&conn);
-        let all = store.list_all().unwrap();
+        let store = RecommendationStore::new(pool.clone());
+        let all = store.list_all().await.unwrap();
         assert_eq!(all.len(), 2);
     }
 }
