@@ -1,0 +1,27 @@
+# Kernel project config
+# Global config: ~/.config/kernel/config.toml
+# Project config (this file) overrides global.
+
+[models]
+default = "anthropic/claude-sonnet-4.6"
+prompt_router = "arcee-ai/trinity-large-preview:free"
+compactor = "anthropic/claude-haiku-4.5"
+
+# Per-role model overrides
+# [models.roles]
+# orchestrator = "claude-sonnet-4-6"
+# research = "claude-sonnet-4-6"
+# implementation = "claude-sonnet-4-6"
+# review = "claude-sonnet-4-6"
+
+# Provider config (auto-detected from env if omitted)
+[models.providers.openrouter]
+api_key_env = "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"
+#
+# [models.providers.anthropic]
+# api_key_env = "ANTHROPIC_API_KEY"
+
+[compaction]
+light_every_turn = true
+deep_trigger_pct = 80.0
+deep_target_pct = 50.0
