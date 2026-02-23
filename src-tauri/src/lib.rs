@@ -1,36 +1,72 @@
 pub mod agent;
+pub mod anthropic;
 mod compaction;
-mod config;
-mod db;
+pub mod config;
+pub mod db;
 mod events;
 mod git;
-mod modes;
-mod prompt_router;
+pub mod modes;
+pub mod prompt_router;
 mod tasks;
+pub mod tools;
 mod ux_agent;
 
-use std::sync::Mutex;
+use std::sync::Arc;
 
-pub struct DbState(pub Mutex<rusqlite::Connection>);
+use tauri::Manager;
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+use crate::prompt_router::model_registry::ModelRegistry;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let db_path = ".kernel/kernel.db";
-    std::fs::create_dir_all(".kernel").expect("failed to create .kernel dir");
-    let conn = rusqlite::Connection::open(db_path).expect("failed to open database");
-    tasks::db::init_schema(&conn).expect("failed to init task schema");
+    // Structured logging via tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "kernel_lib=info".into()),
+        )
+        .with_target(true)
+        .init();
 
     tauri::Builder::default()
-        .manage(DbState(Mutex::new(conn)))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let pool = tauri::async_runtime::block_on(async {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                db::open_project_pool(&cwd).await
+            })
+            .expect("failed to create database pool");
+            app.manage(pool);
+
+            // Model registry: cached OpenRouter model lists
+            let registry = ModelRegistry::new();
+            app.manage(Arc::clone(&registry));
+
+            // Per-session conversation store
+            app.manage(Arc::new(
+                crate::prompt_router::commands::ConversationStore::new(),
+            ));
+
+            // Spawn background task: initial refresh + 24h interval
+            tauri::async_runtime::spawn(async move {
+                registry.refresh().await;
+
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+                // The first tick completes immediately — skip it since we just refreshed
+                interval.tick().await;
+
+                loop {
+                    interval.tick().await;
+                    registry.refresh().await;
+                }
+            });
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            greet,
+            // Task commands
             tasks::commands::create_task,
             tasks::commands::persist_task_plan,
             tasks::commands::list_tasks,
@@ -40,7 +76,22 @@ pub fn run() {
             tasks::commands::next_unblocked,
             tasks::commands::set_task_engagement,
             tasks::commands::get_task_cost,
-            tasks::commands::get_session_cost
+            tasks::commands::get_session_cost,
+            // DB commands (sessions, events, modes)
+            db::commands::create_session,
+            db::commands::get_session,
+            db::commands::list_sessions,
+            db::commands::delete_session,
+            db::commands::list_db_modes,
+            db::commands::get_db_mode,
+            db::commands::insert_event,
+            db::commands::events_since,
+            // Config commands
+            config::commands::load_project_config,
+            config::commands::get_builtin_modes,
+            // Prompt router commands
+            prompt_router::commands::submit_prompt,
+            prompt_router::commands::get_conversation_context,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
