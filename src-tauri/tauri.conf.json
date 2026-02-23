@@ -12,9 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "kernel",
-        "width": 800,
-        "height": 600
+        "title": "Kernel",
+        "width": 720,
+        "height": 560,
+        "minWidth": 480,
+        "minHeight": 400,
+        "center": true
       }
     ],
     "security": {
@@ -31,5 +34,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
-  }
+  },
+  "plugins": {}
 }
