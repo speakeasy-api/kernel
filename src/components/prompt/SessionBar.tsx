@@ -1,4 +1,6 @@
 import type { Session } from "../../lib/types";
+import { shortenPathWithHome } from "../../lib/paths";
+import { useHomeDir } from "../../hooks/useHomeDir";
 
 interface SessionBarProps {
   session: Session;
@@ -9,17 +11,12 @@ function folderName(path: string): string {
   return path.split("/").pop() || path;
 }
 
-function shortenPath(path: string): string {
-  const home = "/Users/";
-  if (path.startsWith(home)) {
-    const rest = path.slice(home.length);
-    const slash = rest.indexOf("/");
-    return "~" + (slash >= 0 ? rest.slice(slash) : "/" + rest);
-  }
-  return path;
-}
-
 export function SessionBar({ session, onClose }: SessionBarProps) {
+  const home = useHomeDir();
+  const displayPath = home
+    ? shortenPathWithHome(session.project_path, home)
+    : session.project_path;
+
   return (
     <div
       className="flex h-10 shrink-0 items-center justify-between px-3"
@@ -33,7 +30,7 @@ export function SessionBar({ session, onClose }: SessionBarProps) {
           {folderName(session.project_path)}
         </span>
         <span className="shrink-0 text-[11px] text-text-ghost font-mono">
-          {shortenPath(session.project_path)}
+          {displayPath}
         </span>
       </div>
 

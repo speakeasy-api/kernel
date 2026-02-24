@@ -47,23 +47,46 @@ pub fn categories_for_mode(mode: &str) -> &'static [&'static str] {
     }
 }
 
-/// Cached registry of models fetched from OpenRouter, keyed by category.
+/// Cached registry of models fetched from OpenRouter.
+///
+/// Two-level structure:
+/// - **catalog**: full model metadata keyed by model ID (populated from unfiltered fetch)
+/// - **categories**: category name → top N model IDs (populated from per-category fetches)
 pub struct ModelRegistry {
     client: reqwest::Client,
-    cache: RwLock<HashMap<String, Vec<ModelInfo>>>,
+    /// Full model catalog keyed by model ID (e.g. "anthropic/claude-sonnet-4-6")
+    catalog: RwLock<HashMap<String, ModelInfo>>,
+    /// Category index: category name → model IDs (top N per category)
+    categories: RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl ModelRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             client: reqwest::Client::new(),
-            cache: RwLock::new(HashMap::new()),
+            catalog: RwLock::new(HashMap::new()),
+            categories: RwLock::new(HashMap::new()),
         })
     }
 
-    /// Fetch models for every known category from OpenRouter and update cache.
+    /// Fetch all models and per-category indices from OpenRouter and update caches.
     /// Logs failures but keeps stale data — callers never see a hard error.
     pub async fn refresh(&self) {
+        // Step 1: Fetch full catalog (unfiltered)
+        match self.fetch_all_models().await {
+            Ok(models) => {
+                let mut catalog = self.catalog.write().await;
+                catalog.clear();
+                for m in models {
+                    catalog.insert(m.id.clone(), m);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to refresh model catalog");
+            }
+        }
+
+        // Step 2: Fetch per-category indices
         let all_categories: &[&str] = &[
             "programming",
             "technology",
@@ -72,19 +95,50 @@ impl ModelRegistry {
         ];
 
         for &cat in all_categories {
-            match self.fetch_category(cat).await {
-                Ok(models) => {
-                    let mut cache = self.cache.write().await;
-                    cache.insert(cat.to_string(), models);
+            match self.fetch_category_ids(cat).await {
+                Ok(ids) => {
+                    let mut categories = self.categories.write().await;
+                    categories.insert(cat.to_string(), ids);
                 }
                 Err(e) => {
-                    tracing::warn!(category = cat, error = %e, "failed to refresh model registry");
+                    tracing::warn!(category = cat, error = %e, "failed to refresh category index");
                 }
             }
         }
     }
 
-    async fn fetch_category(&self, category: &str) -> Result<Vec<ModelInfo>, String> {
+    /// Fetch all models from the unfiltered endpoint.
+    async fn fetch_all_models(&self) -> Result<Vec<ModelInfo>, String> {
+        let url = "https://openrouter.ai/api/v1/models";
+
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+
+        let body: OpenRouterModelsResponse =
+            resp.json().await.map_err(|e| e.to_string())?;
+
+        Ok(body
+            .data
+            .into_iter()
+            .map(|m| ModelInfo {
+                id: m.id,
+                name: m.name,
+                description: m.description,
+                context_length: m.context_length,
+            })
+            .collect())
+    }
+
+    /// Fetch top N model IDs for a category.
+    async fn fetch_category_ids(&self, category: &str) -> Result<Vec<String>, String> {
         let url = format!(
             "https://openrouter.ai/api/v1/models?category={category}"
         );
@@ -103,29 +157,34 @@ impl ModelRegistry {
         let body: OpenRouterModelsResponse =
             resp.json().await.map_err(|e| e.to_string())?;
 
-        let mut models: Vec<ModelInfo> = body
+        let mut models: Vec<(String, u64)> = body
             .data
             .into_iter()
-            .map(|m| ModelInfo {
-                id: m.id,
-                name: m.name,
-                description: m.description,
-                context_length: m.context_length,
-            })
+            .map(|m| (m.id, m.context_length))
             .collect();
 
         // Sort by context_length descending, take top N
-        models.sort_by(|a, b| b.context_length.cmp(&a.context_length));
+        models.sort_by(|a, b| b.1.cmp(&a.1));
         models.truncate(MAX_MODELS_PER_CATEGORY);
 
-        Ok(models)
+        Ok(models.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// Look up context_length for a model ID. Returns None if model not in catalog.
+    pub fn context_length_for_model(&self, model_id: &str) -> Option<u64> {
+        let guard = self.catalog.try_read().ok()?;
+        guard.get(model_id).map(|m| m.context_length)
     }
 
     /// Return deduplicated models relevant to a mode. Uses `try_read()` so
     /// callers in `spawn_blocking` never block on a concurrent refresh.
     /// Returns an empty vec on lock contention or cold cache.
     pub fn models_for_mode(&self, mode: &str) -> Vec<ModelInfo> {
-        let guard = match self.cache.try_read() {
+        let cat_guard = match self.categories.try_read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let catalog_guard = match self.catalog.try_read() {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
@@ -135,10 +194,12 @@ impl ModelRegistry {
         let mut out = Vec::new();
 
         for cat in cats {
-            if let Some(models) = guard.get(*cat) {
-                for m in models {
-                    if seen.insert(m.id.clone()) {
-                        out.push(m.clone());
+            if let Some(ids) = cat_guard.get(*cat) {
+                for id in ids {
+                    if seen.insert(id.clone()) {
+                        if let Some(info) = catalog_guard.get(id) {
+                            out.push(info.clone());
+                        }
                     }
                 }
             }
@@ -148,14 +209,14 @@ impl ModelRegistry {
 
     /// Check if any cached category contains the given model ID.
     pub fn is_model_known(&self, model_id: &str) -> bool {
-        let guard = match self.cache.try_read() {
+        let guard = match self.categories.try_read() {
             Ok(g) => g,
             Err(_) => return false,
         };
 
         guard
             .values()
-            .any(|models| models.iter().any(|m| m.id == model_id))
+            .any(|ids| ids.iter().any(|id| id == model_id))
     }
 }
 
@@ -203,24 +264,58 @@ mod tests {
         assert!(!registry.is_model_known("anything"));
     }
 
+    #[test]
+    fn context_length_for_model_none_on_cold_cache() {
+        let registry = ModelRegistry::new();
+        assert!(registry.context_length_for_model("anything").is_none());
+    }
+
+    #[tokio::test]
+    async fn context_length_for_model_returns_value() {
+        let registry = ModelRegistry::new();
+        {
+            let mut catalog = registry.catalog.write().await;
+            catalog.insert(
+                "anthropic/claude-sonnet-4-6".into(),
+                ModelInfo {
+                    id: "anthropic/claude-sonnet-4-6".into(),
+                    name: "Claude Sonnet".into(),
+                    description: "".into(),
+                    context_length: 200_000,
+                },
+            );
+        }
+        assert_eq!(
+            registry.context_length_for_model("anthropic/claude-sonnet-4-6"),
+            Some(200_000)
+        );
+        assert!(registry.context_length_for_model("nonexistent/model").is_none());
+    }
+
     #[tokio::test]
     async fn models_for_mode_deduplicates() {
         let registry = ModelRegistry::new();
         {
-            let mut cache = registry.cache.write().await;
-            let model = ModelInfo {
-                id: "openai/gpt-4".into(),
-                name: "GPT-4".into(),
-                description: "".into(),
-                context_length: 128_000,
-            };
-            cache.insert(
-                "programming".into(),
-                vec![model.clone()],
+            let mut catalog = registry.catalog.write().await;
+            catalog.insert(
+                "openai/gpt-4".into(),
+                ModelInfo {
+                    id: "openai/gpt-4".into(),
+                    name: "GPT-4".into(),
+                    description: "".into(),
+                    context_length: 128_000,
+                },
             );
-            cache.insert(
+        }
+        {
+            let mut categories = registry.categories.write().await;
+            categories.insert(
+                "programming".into(),
+                vec!["openai/gpt-4".into()],
+            );
+            categories.insert(
                 "technology".into(),
-                vec![model],
+                vec!["openai/gpt-4".into()],
             );
         }
 
@@ -234,15 +329,10 @@ mod tests {
     async fn is_model_known_finds_cached_model() {
         let registry = ModelRegistry::new();
         {
-            let mut cache = registry.cache.write().await;
-            cache.insert(
+            let mut categories = registry.categories.write().await;
+            categories.insert(
                 "programming".into(),
-                vec![ModelInfo {
-                    id: "anthropic/claude-sonnet-4-6".into(),
-                    name: "Claude Sonnet".into(),
-                    description: "".into(),
-                    context_length: 200_000,
-                }],
+                vec!["anthropic/claude-sonnet-4-6".into()],
             );
         }
 

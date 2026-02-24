@@ -1,4 +1,6 @@
 import { cn } from "../../lib/cn";
+import { shortenPathWithHome } from "../../lib/paths";
+import { useHomeDir } from "../../hooks/useHomeDir";
 
 interface ProjectCardProps {
   name: string;
@@ -8,16 +10,6 @@ interface ProjectCardProps {
   index: number;
 }
 
-function shortenPath(path: string): string {
-  const home = "/Users/";
-  if (path.startsWith(home)) {
-    const rest = path.slice(home.length);
-    const slash = rest.indexOf("/");
-    return "~" + (slash >= 0 ? rest.slice(slash) : "/" + rest);
-  }
-  return path;
-}
-
 export function ProjectCard({
   name,
   path,
@@ -25,6 +17,8 @@ export function ProjectCard({
   onClick,
   index,
 }: ProjectCardProps) {
+  const home = useHomeDir();
+
   return (
     <button
       onClick={onClick}
@@ -43,7 +37,7 @@ export function ProjectCard({
           {name}
         </p>
         <p className="mt-0.5 truncate text-[11px] leading-tight text-text-ghost font-mono">
-          {shortenPath(path)}
+          {home ? shortenPathWithHome(path, home) : path}
         </p>
       </div>
       <span className="shrink-0 text-[10px] font-mono text-text-ghost tabular-nums">

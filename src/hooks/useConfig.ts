@@ -7,8 +7,8 @@ export function useConfig(projectPath: string | null) {
 
   useEffect(() => {
     if (!projectPath) return;
-    loadProjectConfig(projectPath).then(setConfig).catch(() => {
-      // Fall back to null on error (e.g. no kernel.toml)
+    loadProjectConfig(projectPath).then(setConfig).catch((err) => {
+      console.warn("Failed to load kernel.toml:", err);
       setConfig(null);
     });
   }, [projectPath]);

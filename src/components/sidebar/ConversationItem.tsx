@@ -8,7 +8,9 @@ interface ConversationItemProps {
 }
 
 function timeAgo(dateStr: string): string {
-  const date = new Date(dateStr.endsWith("Z") ? dateStr : dateStr + "Z");
+  // SQLite datetime('now') always returns UTC; ensure we always parse as UTC
+  const normalized = dateStr.replace(" ", "T").replace(/Z?$/, "Z");
+  const date = new Date(normalized);
   const now = Date.now();
   const diff = Math.floor((now - date.getTime()) / 1000);
 

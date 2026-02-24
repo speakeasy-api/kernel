@@ -2,6 +2,8 @@ import { useState } from "react";
 import { cn } from "../../lib/cn";
 import type { WorkspaceGroup } from "../../hooks/useSessionSummaries";
 import type { Session } from "../../lib/types";
+import { shortenPathWithHome } from "../../lib/paths";
+import { useHomeDir } from "../../hooks/useHomeDir";
 import { ConversationItem } from "./ConversationItem";
 
 interface WorkspaceGroupProps {
@@ -12,16 +14,6 @@ interface WorkspaceGroupProps {
   onNewConversation: (projectPath: string) => void;
 }
 
-function shortenPath(path: string): string {
-  const home = "/Users/";
-  if (path.startsWith(home)) {
-    const rest = path.slice(home.length);
-    const slash = rest.indexOf("/");
-    return "~" + (slash >= 0 ? rest.slice(slash) : "/" + rest);
-  }
-  return path;
-}
-
 export function WorkspaceGroupSection({
   group,
   activeSessionId,
@@ -30,6 +22,7 @@ export function WorkspaceGroupSection({
   onNewConversation,
 }: WorkspaceGroupProps) {
   const [open, setOpen] = useState(defaultOpen);
+  const home = useHomeDir();
 
   return (
     <div className="select-none">
@@ -75,7 +68,7 @@ export function WorkspaceGroupSection({
               {group.projectName}
             </p>
             <p className="truncate text-[10px] font-mono text-text-ghost leading-snug">
-              {shortenPath(group.projectPath)}
+              {home ? shortenPathWithHome(group.projectPath, home) : group.projectPath}
             </p>
           </div>
 

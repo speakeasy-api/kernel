@@ -73,10 +73,35 @@ export function getConversationContext(sessionId: string) {
   return invoke<ContextMessage[]>("get_conversation_context", { sessionId });
 }
 
+// -- Conversation History --
+
+export interface HistoryEntry {
+  type: "message" | "interrupted" | "compaction";
+  // message fields (when type === "message"):
+  role?: "user" | "assistant";
+  content?: ContextBlock[];
+  // compaction fields (when type === "compaction"):
+  before_messages?: number;
+  after_messages?: number;
+}
+
+export interface ConversationHistory {
+  entries: HistoryEntry[];
+  last_mode: { mode: string; model: string; confidence: number } | null;
+}
+
+export function getConversationHistory(sessionId: string) {
+  return invoke<ConversationHistory>("get_conversation_history", { sessionId });
+}
+
 export function submitPrompt(
   sessionId: string,
   prompt: string,
   modeOverride: string | null,
 ) {
   return invoke<void>("submit_prompt", { sessionId, prompt, modeOverride });
+}
+
+export function cancelPrompt(sessionId: string) {
+  return invoke<void>("cancel_prompt", { sessionId });
 }

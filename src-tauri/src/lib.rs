@@ -33,8 +33,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let pool = tauri::async_runtime::block_on(async {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                db::open_project_pool(&cwd).await
+                db::open_pool().await
             })
             .expect("failed to create database pool");
             app.manage(pool);
@@ -43,9 +42,9 @@ pub fn run() {
             let registry = ModelRegistry::new();
             app.manage(Arc::clone(&registry));
 
-            // Per-session conversation store
+            // Per-session cancellation flags
             app.manage(Arc::new(
-                crate::prompt_router::commands::ConversationStore::new(),
+                crate::prompt_router::commands::CancellationFlags::new(),
             ));
 
             // Spawn background task: initial refresh + 24h interval
@@ -91,7 +90,9 @@ pub fn run() {
             config::commands::get_builtin_modes,
             // Prompt router commands
             prompt_router::commands::submit_prompt,
+            prompt_router::commands::cancel_prompt,
             prompt_router::commands::get_conversation_context,
+            prompt_router::commands::get_conversation_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -5,9 +5,11 @@ interface PromptInputProps {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  busy?: boolean;
+  onCancel?: () => void;
 }
 
-export function PromptInput({ value, onChange, onSubmit }: PromptInputProps) {
+export function PromptInput({ value, onChange, onSubmit, busy, onCancel }: PromptInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [focused, setFocused] = useState(false);
 
@@ -32,6 +34,10 @@ export function PromptInput({ value, onChange, onSubmit }: PromptInputProps) {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
       onSubmit();
+    }
+    if (e.key === "Escape" && busy && onCancel) {
+      e.preventDefault();
+      onCancel();
     }
   }
 
@@ -74,24 +80,36 @@ export function PromptInput({ value, onChange, onSubmit }: PromptInputProps) {
         )}
       />
 
-      {/* Submit */}
-      <div
-        className={cn(
-          "absolute right-3 bottom-3 transition-all duration-200",
-          hasValue
-            ? "opacity-100 translate-y-0"
-            : "opacity-0 translate-y-1 pointer-events-none",
+      {/* Submit / Cancel */}
+      <div className="absolute right-3 bottom-3">
+        {busy ? (
+          <button
+            onClick={onCancel}
+            className="flex h-7 items-center justify-center gap-1 rounded-lg px-2 transition-all duration-150 hover:brightness-110 active:scale-95 cursor-pointer"
+            style={{ backgroundColor: `var(--mode-tint)`, color: "white" }}
+          >
+            <span className="text-[12px] font-mono leading-none">esc</span>
+          </button>
+        ) : (
+          <div
+            className={cn(
+              "transition-all duration-200",
+              hasValue
+                ? "opacity-100 translate-y-0"
+                : "opacity-0 translate-y-1 pointer-events-none",
+            )}
+          >
+            <button
+              onClick={onSubmit}
+              disabled={!hasValue}
+              className="flex h-7 items-center justify-center gap-0.5 rounded-lg px-1.5 transition-all duration-150 hover:brightness-110 active:scale-95 cursor-pointer"
+              style={{ backgroundColor: `var(--mode-tint)`, color: "white" }}
+            >
+              <span className="text-[13px] font-mono leading-none">&#x2318;</span>
+              <span className="text-[13px] font-mono leading-none relative -top-px">&#x21B5;</span>
+            </button>
+          </div>
         )}
-      >
-        <button
-          onClick={onSubmit}
-          disabled={!hasValue}
-          className="flex h-7 items-center justify-center gap-0.5 rounded-lg px-1.5 transition-all duration-150 hover:brightness-110 active:scale-95 cursor-pointer"
-          style={{ backgroundColor: `var(--mode-tint)`, color: "white" }}
-        >
-          <span className="text-[13px] font-mono leading-none">&#x2318;</span>
-          <span className="text-[13px] font-mono leading-none relative -top-px">&#x21B5;</span>
-        </button>
       </div>
     </div>
   );

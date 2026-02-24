@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use super::models::{Agent, Event, Mode, Session, StatsRollup, Task};
+use super::models::{Agent, ConversationRow, Event, Mode, Session, SnapshotRow, StatsRollup, Task};
 
 // ---- Sessions ----
 
@@ -36,7 +36,15 @@ pub async fn get_session(pool: &SqlitePool, id: &str) -> Result<Option<Session>,
 }
 
 pub async fn delete_session(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
-    // Delete all events for this session first (FK constraint)
+    // Delete dependent data first
+    sqlx::query("DELETE FROM conversation_messages WHERE session_id = ?1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM context_snapshots WHERE session_id = ?1")
+        .bind(id)
+        .execute(pool)
+        .await?;
     sqlx::query("DELETE FROM events WHERE session_id = ?1")
         .bind(id)
         .execute(pool)
@@ -528,6 +536,109 @@ pub async fn update_ux_state(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ---- Conversation Messages ----
+
+/// Append a message. Ordinal = MAX(ordinal)+1 for the session. Returns the ordinal.
+pub async fn append_conversation_message(
+    pool: &SqlitePool,
+    session_id: &str,
+    role: &str,
+    content_json: &str,
+) -> Result<i64, sqlx::Error> {
+    let id = Uuid::new_v4().to_string();
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO conversation_messages (id, session_id, ordinal, role, content)
+         VALUES (?1, ?2, COALESCE((SELECT MAX(ordinal) + 1 FROM conversation_messages WHERE session_id = ?2), 0), ?3, ?4)
+         RETURNING ordinal",
+    )
+    .bind(&id)
+    .bind(session_id)
+    .bind(role)
+    .bind(content_json)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Load all messages for a session (full history).
+pub async fn get_conversation_messages(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Vec<ConversationRow>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRow>(
+        "SELECT ordinal, role, content FROM conversation_messages
+         WHERE session_id = ?1 ORDER BY ordinal ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Load messages after a given ordinal (for building agent context from snapshot).
+pub async fn get_conversation_messages_since(
+    pool: &SqlitePool,
+    session_id: &str,
+    after_ordinal: i64,
+) -> Result<Vec<ConversationRow>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRow>(
+        "SELECT ordinal, role, content FROM conversation_messages
+         WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal ASC",
+    )
+    .bind(session_id)
+    .bind(after_ordinal)
+    .fetch_all(pool)
+    .await
+}
+
+/// Get the latest snapshot for a session.
+pub async fn get_latest_snapshot(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<SnapshotRow>, sqlx::Error> {
+    sqlx::query_as::<_, SnapshotRow>(
+        "SELECT up_to_ordinal, summary_messages FROM context_snapshots
+         WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Save a compaction snapshot.
+pub async fn save_context_snapshot(
+    pool: &SqlitePool,
+    session_id: &str,
+    up_to_ordinal: i64,
+    summary_json: &str,
+) -> Result<(), sqlx::Error> {
+    let id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO context_snapshots (id, session_id, up_to_ordinal, summary_messages)
+         VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(&id)
+    .bind(session_id)
+    .bind(up_to_ordinal)
+    .bind(summary_json)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get the max ordinal for a session (or None if no messages).
+pub async fn get_max_ordinal(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT MAX(ordinal) FROM conversation_messages WHERE session_id = ?1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.0))
 }
 
 #[cfg(test)]

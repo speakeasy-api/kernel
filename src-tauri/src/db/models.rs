@@ -164,6 +164,21 @@ pub struct StatsRollup {
     pub value: f64,
 }
 
+// -- Conversation message rows --
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ConversationRow {
+    pub ordinal: i64,
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SnapshotRow {
+    pub up_to_ordinal: i64,
+    pub summary_messages: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionReport {
     pub events_deleted: u64,

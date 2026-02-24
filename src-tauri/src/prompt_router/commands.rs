@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -27,34 +28,140 @@ use crate::prompt_router::model_registry::{ModelRegistry, FALLBACK_MODEL};
 use crate::prompt_router::types::*;
 use crate::prompt_router::user_override::ModeOverriddenEvent;
 
-// ---- Per-session conversation history ----
+use std::collections::HashMap;
 
-pub struct ConversationStore {
-    inner: Mutex<HashMap<String, Vec<Message>>>,
+// ---- Per-session cancellation flags ----
+
+pub struct CancellationFlags {
+    inner: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
-impl ConversationStore {
+impl CancellationFlags {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn get(&self, session_id: &str) -> Vec<Message> {
-        self.inner
-            .lock()
-            .await
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default()
+    /// Create a fresh (unset) flag for a session, returning a handle to it.
+    /// Returns an error if a prompt is already running for this session.
+    async fn create(&self, session_id: &str) -> Result<Arc<AtomicBool>, String> {
+        let mut map = self.inner.lock().await;
+        if map.contains_key(session_id) {
+            return Err(format!(
+                "a prompt is already running for session {session_id}"
+            ));
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        map.insert(session_id.to_string(), Arc::clone(&flag));
+        Ok(flag)
     }
 
-    async fn set(&self, session_id: &str, messages: Vec<Message>) {
-        self.inner
-            .lock()
-            .await
-            .insert(session_id.to_string(), messages);
+    /// Signal cancellation for a session.
+    async fn cancel(&self, session_id: &str) {
+        if let Some(flag) = self.inner.lock().await.get(session_id) {
+            flag.store(true, Ordering::SeqCst);
+        }
     }
+
+    /// Remove the flag once the loop has finished.
+    async fn remove(&self, session_id: &str) {
+        self.inner.lock().await.remove(session_id);
+    }
+}
+
+/// RAII guard that removes the cancellation flag when dropped.
+struct CancellationGuard {
+    session_id: String,
+    flags: Arc<CancellationFlags>,
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        let session_id = self.session_id.clone();
+        let flags = Arc::clone(&self.flags);
+        // Spawn a task to do the async cleanup since Drop is synchronous
+        tokio::spawn(async move {
+            flags.remove(&session_id).await;
+        });
+    }
+}
+
+// ---- DB-backed conversation helpers ----
+
+/// Load the agent's working context: latest snapshot + messages after it.
+/// Falls back to all messages if no snapshot exists.
+async fn load_agent_context(pool: &SqlitePool, session_id: &str) -> Result<Vec<Message>, String> {
+    let mut rows = if let Some(snapshot) =
+        crate::db::queries::get_latest_snapshot(pool, session_id)
+            .await
+            .map_err(|e| e.to_string())?
+    {
+        // Deserialize snapshot summary messages
+        let mut messages: Vec<Message> = serde_json::from_str(&snapshot.summary_messages)
+            .map_err(|e| format!("failed to deserialize snapshot: {e}"))?;
+
+        // Load messages after the snapshot
+        let tail = crate::db::queries::get_conversation_messages_since(
+            pool,
+            session_id,
+            snapshot.up_to_ordinal,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        for row in tail {
+            let content: Vec<ContentBlock> = serde_json::from_str(&row.content)
+                .map_err(|e| format!("failed to deserialize message content: {e}"))?;
+            let role = if row.role == "assistant" {
+                Role::Assistant
+            } else {
+                Role::User
+            };
+            messages.push(Message { role, content });
+        }
+
+        messages
+    } else {
+        // No snapshot — load all messages
+        let rows = crate::db::queries::get_conversation_messages(pool, session_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let content: Vec<ContentBlock> = serde_json::from_str(&row.content)
+                .map_err(|e| format!("failed to deserialize message content: {e}"))?;
+            let role = if row.role == "assistant" {
+                Role::Assistant
+            } else {
+                Role::User
+            };
+            messages.push(Message { role, content });
+        }
+        messages
+    };
+
+    // Apply light compaction to loaded messages (truncate large tool results)
+    light_compact(&mut rows);
+    Ok(rows)
+}
+
+/// Append a Message to the conversation log and return its ordinal.
+async fn append_message(
+    pool: &SqlitePool,
+    session_id: &str,
+    message: &Message,
+) -> Result<i64, String> {
+    let role_str = match message.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+    let content_json =
+        serde_json::to_string(&message.content).map_err(|e| format!("serialize failed: {e}"))?;
+    crate::db::queries::append_conversation_message(pool, session_id, role_str, &content_json)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---- Event sink that discards (events are persisted separately) ----
@@ -170,9 +277,145 @@ fn is_model_unsupported_error(error: &str) -> bool {
 #[tauri::command]
 pub async fn get_conversation_context(
     session_id: String,
-    conversations: State<'_, Arc<ConversationStore>>,
+    pool: State<'_, SqlitePool>,
 ) -> Result<Vec<Message>, String> {
-    Ok(conversations.get(&session_id).await)
+    load_agent_context(&*pool, &session_id).await
+}
+
+/// Return the full conversation history for the UI timeline.
+#[tauri::command]
+pub async fn get_conversation_history(
+    session_id: String,
+    pool: State<'_, SqlitePool>,
+) -> Result<ConversationHistory, String> {
+    build_conversation_history(&*pool, &session_id).await
+}
+
+#[derive(Clone, Serialize)]
+pub struct ConversationHistory {
+    pub entries: Vec<HistoryEntry>,
+    pub last_mode: Option<ModeResolvedInfo>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ModeResolvedInfo {
+    pub mode: String,
+    pub model: String,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum HistoryEntry {
+    #[serde(rename = "message")]
+    Message {
+        role: String,
+        content: Vec<ContentBlock>,
+    },
+    #[serde(rename = "interrupted")]
+    Interrupted,
+    #[serde(rename = "compaction")]
+    Compacted {
+        before_messages: usize,
+        after_messages: usize,
+    },
+}
+
+async fn build_conversation_history(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<ConversationHistory, String> {
+    // 1. Load all messages
+    let rows = crate::db::queries::get_conversation_messages(pool, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 2. Load snapshots for compaction markers
+    // We query all snapshots for this session to insert compaction markers
+    let snapshots: Vec<(i64, usize, usize)> = {
+        // For now, load compaction events from events table for the marker data
+        let events = crate::db::queries::events_since(pool, session_id, "2000-01-01T00:00:00")
+            .await
+            .map_err(|e| e.to_string())?;
+        events
+            .iter()
+            .filter(|e| e.kind == "ContextCompacted")
+            .filter_map(|e| {
+                let d: Value = serde_json::from_str(&e.data).ok()?;
+                let before = d.get("before_messages")?.as_u64()? as usize;
+                let after = d.get("after_messages")?.as_u64()? as usize;
+                Some((0i64, before, after))
+            })
+            .collect()
+    };
+
+    // 3. Load Interrupted events
+    let interrupted_events: Vec<()> = {
+        let events = crate::db::queries::events_since(pool, session_id, "2000-01-01T00:00:00")
+            .await
+            .map_err(|e| e.to_string())?;
+        events
+            .iter()
+            .filter(|e| e.kind == "Interrupted")
+            .map(|_| ())
+            .collect()
+    };
+
+    // 4. Load latest PromptClassified for last_mode
+    let last_mode = {
+        let events = crate::db::queries::events_since(pool, session_id, "2000-01-01T00:00:00")
+            .await
+            .map_err(|e| e.to_string())?;
+        events
+            .iter()
+            .rev()
+            .find(|e| e.kind == "PromptClassified")
+            .and_then(|e| {
+                let d: Value = serde_json::from_str(&e.data).ok()?;
+                Some(ModeResolvedInfo {
+                    mode: d.get("mode")?.as_str()?.to_string(),
+                    model: d.get("model")?.as_str()?.to_string(),
+                    confidence: d.get("confidence")?.as_f64()? as f32,
+                })
+            })
+    };
+
+    // 5. Build entries from messages
+    let mut entries: Vec<HistoryEntry> = rows
+        .into_iter()
+        .map(|row| {
+            let content: Vec<ContentBlock> =
+                serde_json::from_str(&row.content).unwrap_or_default();
+            HistoryEntry::Message {
+                role: row.role,
+                content,
+            }
+        })
+        .collect();
+
+    // Append compaction markers at the end (they're session-level markers)
+    for (_, before, after) in &snapshots {
+        entries.push(HistoryEntry::Compacted {
+            before_messages: *before,
+            after_messages: *after,
+        });
+    }
+
+    // Append interrupted markers
+    for _ in &interrupted_events {
+        entries.push(HistoryEntry::Interrupted);
+    }
+
+    Ok(ConversationHistory { entries, last_mode })
+}
+
+#[tauri::command]
+pub async fn cancel_prompt(
+    session_id: String,
+    flags: State<'_, Arc<CancellationFlags>>,
+) -> Result<(), String> {
+    flags.cancel(&session_id).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -183,7 +426,7 @@ pub async fn submit_prompt(
     app: tauri::AppHandle,
     pool: State<'_, SqlitePool>,
     registry: State<'_, Arc<ModelRegistry>>,
-    conversations: State<'_, Arc<ConversationStore>>,
+    cancel_flags: State<'_, Arc<CancellationFlags>>,
 ) -> Result<(), String> {
     // 0. Look up session to get project_path
     let session = crate::db::queries::get_session(&*pool, &session_id)
@@ -284,17 +527,28 @@ pub async fn submit_prompt(
         handoff.model.clone()
     };
 
-    // Load conversation history and append user message
-    let mut history = conversations.get(&session.id).await;
-    history.push(Message {
+    // Load conversation history from DB and append user message
+    let mut history = load_agent_context(&*pool, &session.id).await?;
+    let user_msg = Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: prompt.clone(),
         }],
-    });
+    };
+    append_message(&*pool, &session.id, &user_msg).await?;
+    history.push(user_msg);
 
-    // Save the user message immediately so Raw Context is never empty during streaming
-    conversations.set(&session.id, history.clone()).await;
+    let cancelled = cancel_flags.create(&session.id).await?;
+    let _guard = CancellationGuard {
+        session_id: session.id.clone(),
+        flags: Arc::clone(&cancel_flags),
+    };
+
+    // Resolve context window from registry (real model metadata) or fall back
+    let context_window = registry
+        .context_length_for_model(&model)
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
     let mut working = history.clone();
     let stream_result = run_agent_loop(
@@ -305,9 +559,11 @@ pub async fn submit_prompt(
         &session.project_path,
         &app,
         &mut working,
-        &conversations,
         &session.id,
         &*pool,
+        &cancelled,
+        &config,
+        context_window,
     )
     .await;
 
@@ -320,9 +576,10 @@ pub async fn submit_prompt(
                 &handoff.system_prompt,
                 &session.project_path,
                 &config,
+                context_window,
             )
             .await;
-            // Persist compaction event if context was actually compacted
+            // If compacted, save a context snapshot instead of modifying messages
             if compacted.len() < pre_compact_len {
                 let compact_data = serde_json::json!({
                     "before_messages": pre_compact_len,
@@ -330,8 +587,21 @@ pub async fn submit_prompt(
                 })
                 .to_string();
                 let _ = crate::db::queries::insert_event(&*pool, &session.id, None, "ContextCompacted", &compact_data).await;
+
+                // Save the compacted messages as a snapshot
+                if let Ok(Some(max_ord)) =
+                    crate::db::queries::get_max_ordinal(&*pool, &session.id).await
+                {
+                    let summary_json = serde_json::to_string(&compacted).unwrap_or_default();
+                    let _ = crate::db::queries::save_context_snapshot(
+                        &*pool,
+                        &session.id,
+                        max_ord,
+                        &summary_json,
+                    )
+                    .await;
+                }
             }
-            conversations.set(&session.id, compacted).await;
             (text, usage, model)
         }
         Err(err) if is_model_unsupported_error(&err) => {
@@ -352,7 +622,15 @@ pub async fn submit_prompt(
                 },
             );
 
+            // Reset the flag for the fallback attempt
+            cancelled.store(false, Ordering::SeqCst);
+
             let fallback_client = resolve_client(&session.project_path)?;
+            // Re-resolve context window for fallback model
+            let fallback_context_window = registry
+                .context_length_for_model(FALLBACK_MODEL)
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW);
             let mut fallback_working = history.clone();
             let (text, usage) = run_agent_loop(
                 &fallback_client,
@@ -362,9 +640,11 @@ pub async fn submit_prompt(
                 &session.project_path,
                 &app,
                 &mut fallback_working,
-                &conversations,
                 &session.id,
                 &*pool,
+                &cancelled,
+                &config,
+                fallback_context_window,
             )
             .await?;
 
@@ -374,6 +654,7 @@ pub async fn submit_prompt(
                 &handoff.system_prompt,
                 &session.project_path,
                 &config,
+                fallback_context_window,
             )
             .await;
             if compacted.len() < pre_compact_len {
@@ -383,12 +664,38 @@ pub async fn submit_prompt(
                 })
                 .to_string();
                 let _ = crate::db::queries::insert_event(&*pool, &session.id, None, "ContextCompacted", &compact_data).await;
+
+                if let Ok(Some(max_ord)) =
+                    crate::db::queries::get_max_ordinal(&*pool, &session.id).await
+                {
+                    let summary_json = serde_json::to_string(&compacted).unwrap_or_default();
+                    let _ = crate::db::queries::save_context_snapshot(
+                        &*pool,
+                        &session.id,
+                        max_ord,
+                        &summary_json,
+                    )
+                    .await;
+                }
             }
-            conversations.set(&session.id, compacted).await;
             (text, usage, FALLBACK_MODEL.to_string())
         }
         Err(err) => return Err(err),
     };
+
+    // Persist an Interrupted event if the user cancelled
+    if cancelled.load(Ordering::SeqCst) {
+        let after_ordinal = crate::db::queries::get_max_ordinal(&*pool, &session.id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let interrupt_data = serde_json::json!({
+            "after_ordinal": after_ordinal,
+        })
+        .to_string();
+        let _ = crate::db::queries::insert_event(&*pool, &session.id, None, "Interrupted", &interrupt_data).await;
+    }
 
     let sid = session.id.clone();
 
@@ -453,8 +760,16 @@ pub async fn submit_prompt(
 /// Maximum agentic turns to prevent runaway loops.
 const MAX_AGENT_TURNS: usize = 200;
 
+/// Payload emitted each turn so the frontend can show real API token usage.
+#[derive(Clone, Serialize)]
+struct ContextUsage {
+    session_id: String,
+    input_tokens: u64,
+    context_window: usize,
+}
+
 /// Run the agentic loop: stream LLM, execute tool calls, feed results back, repeat.
-/// Appends assistant/tool messages to `messages` in place.
+/// Appends assistant/tool messages to `messages` in place and persists to DB.
 /// Returns `(full_text, accumulated_usage)` on success.
 async fn run_agent_loop(
     client: &LlmClient2,
@@ -464,9 +779,11 @@ async fn run_agent_loop(
     project_path: &str,
     app: &tauri::AppHandle,
     messages: &mut Vec<Message>,
-    conversations: &ConversationStore,
     session_id: &str,
     pool: &SqlitePool,
+    cancelled: &AtomicBool,
+    config: &KernelConfig,
+    context_window: usize,
 ) -> Result<(String, Usage), String> {
     let tool_defs = tool_definitions(allowed_tools);
     let project = Path::new(project_path);
@@ -475,6 +792,18 @@ async fn run_agent_loop(
     let mut accumulated_usage = Usage::default();
 
     for turn in 0..MAX_AGENT_TURNS {
+        // Check cancellation before starting a new turn
+        if cancelled.load(Ordering::SeqCst) {
+            let _ = app.emit(
+                "llm-done",
+                LlmDone {
+                    stop_reason: "cancelled".into(),
+                    full_text: full_text.clone(),
+                },
+            );
+            return Ok((full_text, accumulated_usage));
+        }
+
         let req = StreamRequest {
             system: system_prompt,
             messages: &*messages,
@@ -488,8 +817,32 @@ async fn run_agent_loop(
         let mut turn_text = String::new();
         let mut tool_calls: BTreeMap<u64, InFlightToolCall> = BTreeMap::new();
         let mut stop_reason = String::new();
+        let mut turn_input_tokens: u64 = 0;
 
         while let Some(chunk) = rx.recv().await {
+            // Check cancellation while consuming the stream
+            if cancelled.load(Ordering::SeqCst) {
+                // Save whatever text we've accumulated so far
+                if !turn_text.is_empty() {
+                    let partial_msg = Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: turn_text.clone(),
+                        }],
+                    };
+                    let _ = append_message(pool, session_id, &partial_msg).await;
+                    messages.push(partial_msg);
+                }
+                let _ = app.emit(
+                    "llm-done",
+                    LlmDone {
+                        stop_reason: "cancelled".into(),
+                        full_text: full_text.clone(),
+                    },
+                );
+                return Ok((full_text, accumulated_usage));
+            }
+
             match chunk {
                 StreamChunk::Delta { text } => {
                     turn_text.push_str(&text);
@@ -527,15 +880,10 @@ async fn run_agent_loop(
                     return Ok((full_text, accumulated_usage));
                 }
                 StreamChunk::MessageUsage { usage } => {
+                    turn_input_tokens = usage.input_tokens;
                     accumulated_usage.merge(&usage);
                 }
             }
-        }
-
-        // Persist assistant text to DB for history replay (before move)
-        if !turn_text.is_empty() {
-            let data = serde_json::json!({"text": turn_text}).to_string();
-            let _ = crate::db::queries::insert_event(pool, session_id, None, "AssistantText", &data).await;
         }
 
         // Build assistant message content
@@ -556,10 +904,14 @@ async fn run_agent_loop(
             finalized.push((tc.id, tc.name, input));
         }
 
-        messages.push(Message {
+        let assistant_msg = Message {
             role: Role::Assistant,
             content: assistant_content,
-        });
+        };
+
+        // Persist assistant message to DB
+        let _ = append_message(pool, session_id, &assistant_msg).await;
+        messages.push(assistant_msg);
 
         tracing::info!(
             turn,
@@ -573,7 +925,19 @@ async fn run_agent_loop(
             let mut tool_results: Vec<ContentBlock> = Vec::new();
 
             for (id, name, input) in &finalized {
-                // Persist tool call to DB
+                // Check cancellation before executing each tool
+                if cancelled.load(Ordering::SeqCst) {
+                    let _ = app.emit(
+                        "llm-done",
+                        LlmDone {
+                            stop_reason: "cancelled".into(),
+                            full_text: full_text.clone(),
+                        },
+                    );
+                    return Ok((full_text, accumulated_usage));
+                }
+
+                // Persist tool call event (for audit)
                 let tc_data = serde_json::json!({"id": id, "name": name, "input": input}).to_string();
                 let _ = crate::db::queries::insert_event(pool, session_id, None, "ToolCall", &tc_data).await;
 
@@ -599,7 +963,7 @@ async fn run_agent_loop(
                     }
                 };
 
-                // Persist tool result to DB
+                // Persist tool result event (for audit)
                 let tr_data = serde_json::json!({"id": id, "content": content, "is_error": is_error}).to_string();
                 let _ = crate::db::queries::insert_event(pool, session_id, None, "ToolResult", &tr_data).await;
 
@@ -619,19 +983,59 @@ async fn run_agent_loop(
                 });
             }
 
-            messages.push(Message {
+            let tool_results_msg = Message {
                 role: Role::User,
                 content: tool_results,
-            });
+            };
+
+            // Persist tool results message to DB
+            let _ = append_message(pool, session_id, &tool_results_msg).await;
+            messages.push(tool_results_msg);
 
             // Light compaction: truncate large tool outputs from previous turns
+            // (operates on working copy only — DB stores full content)
             light_compact(messages);
 
-            // Save incrementally so Raw Context view stays up-to-date during streaming
-            conversations.set(session_id, messages.clone()).await;
+            // Emit real API token usage so the frontend can show accurate context ring
+            let _ = app.emit(
+                "context-usage",
+                ContextUsage {
+                    session_id: session_id.to_string(),
+                    input_tokens: turn_input_tokens,
+                    context_window,
+                },
+            );
+
+            // Mid-loop deep compaction when real input_tokens exceed the trigger
+            let trigger = (context_window as f64 * config.compaction.deep_trigger_pct as f64 / 100.0) as u64;
+            if turn_input_tokens >= trigger {
+                tracing::info!(
+                    turn_input_tokens,
+                    trigger,
+                    context_window,
+                    "mid-loop compaction triggered"
+                );
+                let owned = std::mem::take(messages);
+                *messages = maybe_compact_for_storage(
+                    owned,
+                    system_prompt,
+                    project_path,
+                    config,
+                    context_window,
+                )
+                .await;
+            }
             // Continue loop for next turn
         } else {
             // end_turn or other — done
+            let _ = app.emit(
+                "context-usage",
+                ContextUsage {
+                    session_id: session_id.to_string(),
+                    input_tokens: turn_input_tokens,
+                    context_window,
+                },
+            );
             let _ = app.emit(
                 "llm-done",
                 LlmDone {
@@ -674,7 +1078,7 @@ fn light_compact(messages: &mut [Message]) {
     }
 }
 
-// ---- Deep compaction (on save to ConversationStore) ----
+// ---- Deep compaction (on save to DB as snapshot) ----
 
 struct CompactionClientAdapter {
     inner: LlmClient2,
@@ -775,8 +1179,8 @@ fn from_compaction_messages(messages: &[compaction::Message]) -> Vec<Message> {
     result
 }
 
-/// Context window size for budget calculations (Claude's context window).
-const CONTEXT_WINDOW: usize = 200_000;
+/// Conservative fallback when the model is not in the registry catalog.
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 const RESERVED_SYSTEM: usize = 2_000;
 const RESERVED_RESPONSE: usize = 4_096;
 
@@ -788,6 +1192,7 @@ async fn maybe_compact_for_storage(
     system_prompt: &str,
     project_path: &str,
     config: &KernelConfig,
+    context_window: usize,
 ) -> Vec<Message> {
     // Estimate current token count
     let compact_msgs = to_compaction_messages(&messages);
@@ -796,7 +1201,7 @@ async fn maybe_compact_for_storage(
 
     // Only trigger deep compaction when over budget
     let trigger =
-        (CONTEXT_WINDOW as f32 * config.compaction.deep_trigger_pct / 100.0) as usize;
+        (context_window as f32 * config.compaction.deep_trigger_pct / 100.0) as usize;
 
     if token_estimate < trigger {
         return messages;
@@ -805,6 +1210,7 @@ async fn maybe_compact_for_storage(
     tracing::info!(
         token_estimate,
         trigger,
+        context_window,
         "context exceeds trigger, running deep compaction"
     );
 
@@ -819,7 +1225,7 @@ async fn maybe_compact_for_storage(
     };
 
     let pipeline = match compaction::CompactionPipeline::from_config(
-        CONTEXT_WINDOW,
+        context_window,
         RESERVED_SYSTEM,
         RESERVED_RESPONSE,
         config.compaction.light_every_turn,

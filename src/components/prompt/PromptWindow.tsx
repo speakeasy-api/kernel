@@ -23,34 +23,8 @@ function resolveModel(mode: Mode, config: KernelConfig | null): string {
   return mode.default_model ?? config?.models.default ?? "claude-sonnet-4-6";
 }
 
-/** Known Claude model context windows in tokens. */
-const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
-  "claude-opus-4-5":     200_000,
-  "claude-opus-4":       200_000,
-  "claude-sonnet-4-5":   200_000,
-  "claude-sonnet-4-6":   200_000,
-  "claude-sonnet-4":     200_000,
-  "claude-haiku-4":      200_000,
-  "claude-opus-3-5":     200_000,
-  "claude-sonnet-3-5":   200_000,
-  "claude-haiku-3-5":    200_000,
-  "claude-opus-3":       200_000,
-  "claude-sonnet-3":     200_000,
-  "claude-haiku-3":      200_000,
-};
-
-const DEFAULT_CONTEXT_WINDOW = 200_000;
-
-function getContextWindow(model: string): number {
-  // Try exact match first, then prefix match
-  if (MODEL_CONTEXT_WINDOWS[model]) return MODEL_CONTEXT_WINDOWS[model];
-  for (const key of Object.keys(MODEL_CONTEXT_WINDOWS)) {
-    if (model.startsWith(key) || key.startsWith(model)) {
-      return MODEL_CONTEXT_WINDOWS[key];
-    }
-  }
-  return DEFAULT_CONTEXT_WINDOW;
-}
+/** Conservative fallback before the backend reports real context window. */
+const DEFAULT_CONTEXT_WINDOW = 128_000;
 
 type HistoryView = "full" | "agent";
 
@@ -103,7 +77,7 @@ export function PromptWindow({
     }),
   );
   const [prompt, setPrompt] = useState("");
-  const { items, phase, resolvedMode, error, submit } = useLlmStream(session.id);
+  const { items, phase, resolvedMode, error, contextUsage, submit, cancel } = useLlmStream(session.id);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // History view toggle
@@ -112,6 +86,19 @@ export function PromptWindow({
   const [agentContextLoading, setAgentContextLoading] = useState(false);
 
   const busy = phase !== "idle";
+
+  // Global Escape key listener (works even when textarea isn't focused)
+  useEffect(() => {
+    if (!busy) return;
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancel();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [busy, cancel]);
 
   // When the router resolves a mode, update the selector
   useEffect(() => {
@@ -157,8 +144,9 @@ export function PromptWindow({
 
   const displayItems = historyView === "agent" && agentContext ? agentContext : items;
 
-  // Estimate total tokens consumed: all chat items + current prompt draft
+  // Use real API token count when available, fall back to chars/4 estimate
   const usedTokens = useMemo(() => {
+    if (contextUsage) return contextUsage.inputTokens;
     const historyChars = items.reduce<number>((acc, item) => {
       if (item.kind === "text") return acc + item.content.length;
       if (item.kind === "tool_result") return acc + item.content.length;
@@ -166,11 +154,11 @@ export function PromptWindow({
       return acc;
     }, 0);
     return Math.ceil((historyChars + prompt.length) / 4);
-  }, [items, prompt]);
+  }, [contextUsage, items, prompt]);
 
   const contextWindow = useMemo(
-    () => getContextWindow(resolveModel(selectedMode, config)),
-    [selectedMode, config],
+    () => contextUsage?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    [contextUsage],
   );
 
   async function handleSubmit() {
@@ -236,6 +224,9 @@ export function PromptWindow({
                       />
                     );
                   }
+                  if (item.kind === "interrupted") {
+                    return <InterruptedMarker key={i} />;
+                  }
                   if (item.kind === "tool_call") {
                     return <ToolCallBlock key={i} name={item.name} input={item.input} />;
                   }
@@ -289,6 +280,8 @@ export function PromptWindow({
             value={prompt}
             onChange={setPrompt}
             onSubmit={handleSubmit}
+            busy={busy}
+            onCancel={cancel}
           />
 
           {/* Controls row */}
@@ -380,6 +373,18 @@ function ViewToggle({
       >
         Agent View
       </button>
+    </div>
+  );
+}
+
+function InterruptedMarker() {
+  return (
+    <div className="flex items-center gap-3 py-2">
+      <div className="flex-1 border-t border-dashed border-text-ghost/20" />
+      <span className="text-[10px] font-mono text-text-ghost/60 shrink-0">
+        interrupted by user
+      </span>
+      <div className="flex-1 border-t border-dashed border-text-ghost/20" />
     </div>
   );
 }

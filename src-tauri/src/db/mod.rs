@@ -19,6 +19,7 @@ pub async fn create_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .create_if_missing(true);
 
     let pool = SqlitePoolOptions::new()
+        .max_connections(5)
         .connect_with(options)
         .await?;
 
@@ -27,14 +28,34 @@ pub async fn create_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
-pub async fn open_project_pool(project_root: &Path) -> Result<SqlitePool, sqlx::Error> {
-    let kernel_dir = project_root.join(KERNEL_DIR);
+pub fn kernel_data_dir() -> PathBuf {
+    dirs::home_dir()
+        .expect("could not determine home directory")
+        .join(KERNEL_DIR)
+}
+
+pub async fn open_pool() -> Result<SqlitePool, sqlx::Error> {
+    let kernel_dir = kernel_data_dir();
     fs::create_dir_all(&kernel_dir).map_err(|e| {
         sqlx::Error::Configuration(
             format!("failed to create {}: {e}", kernel_dir.display()).into(),
         )
     })?;
 
+    let db_path = kernel_dir.join(DB_FILE);
+    let db_url = format!("sqlite:{}", db_path.display());
+    create_pool(&db_url).await
+}
+
+/// Open a pool at an arbitrary directory (used by tests).
+#[cfg(test)]
+async fn open_pool_at(root: &Path) -> Result<SqlitePool, sqlx::Error> {
+    let kernel_dir = root.join(KERNEL_DIR);
+    fs::create_dir_all(&kernel_dir).map_err(|e| {
+        sqlx::Error::Configuration(
+            format!("failed to create {}: {e}", kernel_dir.display()).into(),
+        )
+    })?;
     let db_path = kernel_dir.join(DB_FILE);
     let db_url = format!("sqlite:{}", db_path.display());
     create_pool(&db_url).await
@@ -60,7 +81,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_creates_kernel_dir_and_db() {
         let tmp = tempfile::tempdir().unwrap();
-        let pool = open_project_pool(tmp.path()).await.unwrap();
+        let pool = open_pool_at(tmp.path()).await.unwrap();
 
         assert!(tmp.path().join(KERNEL_DIR).exists());
         assert!(tmp.path().join(KERNEL_DIR).join(DB_FILE).exists());
@@ -85,10 +106,10 @@ mod tests {
     #[tokio::test]
     async fn test_migrations_are_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let pool1 = open_project_pool(tmp.path()).await.unwrap();
+        let pool1 = open_pool_at(tmp.path()).await.unwrap();
         pool1.close().await;
         // Opening again should not fail (migrations already applied)
-        let pool2 = open_project_pool(tmp.path()).await.unwrap();
+        let pool2 = open_pool_at(tmp.path()).await.unwrap();
         pool2.close().await;
     }
 
@@ -107,6 +128,8 @@ mod tests {
 
         let expected = [
             "agents",
+            "context_snapshots",
+            "conversation_messages",
             "conventions",
             "corrections",
             "events",
@@ -133,7 +156,7 @@ mod tests {
     async fn test_open_with_nonexistent_nested_path() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("deep").join("nested").join("project");
-        let pool = open_project_pool(&nested).await.unwrap();
+        let pool = open_pool_at(&nested).await.unwrap();
         assert!(nested.join(KERNEL_DIR).join(DB_FILE).exists());
         pool.close().await;
     }

@@ -114,7 +114,7 @@ impl LlmClient2 {
         Err("No LLM API key found. Set OPENROUTER_API_KEY or ANTHROPIC_API_KEY.".to_string())
     }
 
-    fn headers(&self) -> HeaderMap {
+    fn headers(&self) -> Result<HeaderMap, String> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -122,7 +122,8 @@ impl LlmClient2 {
             AuthStyle::ApiKey => {
                 headers.insert(
                     "x-api-key",
-                    HeaderValue::from_str(&self.api_key).expect("invalid API key"),
+                    HeaderValue::from_str(&self.api_key)
+                        .map_err(|_| "API key contains invalid header characters".to_string())?,
                 );
                 headers.insert(
                     "anthropic-version",
@@ -133,12 +134,12 @@ impl LlmClient2 {
                 headers.insert(
                     AUTHORIZATION,
                     HeaderValue::from_str(&format!("Bearer {}", self.api_key))
-                        .expect("invalid API key"),
+                        .map_err(|_| "API key contains invalid header characters".to_string())?,
                 );
             }
         }
 
-        headers
+        Ok(headers)
     }
 
     /// Normalize a model ID for the current provider.
@@ -177,7 +178,7 @@ impl LlmClient2 {
         let resp = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&body)
             .send()
             .await
@@ -233,7 +234,7 @@ impl LlmClient2 {
         let resp = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&body)
             .send()
             .await
@@ -305,7 +306,7 @@ impl LlmClient2 {
         let resp = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&body)
             .send()
             .await
