@@ -325,85 +325,86 @@ async fn build_conversation_history(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<ConversationHistory, String> {
-    // 1. Load all messages
+    // 1. Load all messages (ordered by ordinal)
     let rows = crate::db::queries::get_conversation_messages(pool, session_id)
         .await
         .map_err(|e| e.to_string())?;
 
-    // 2. Load snapshots for compaction markers
-    // We query all snapshots for this session to insert compaction markers
-    let snapshots: Vec<(i64, usize, usize)> = {
-        // For now, load compaction events from events table for the marker data
-        let events = crate::db::queries::events_since(pool, session_id, "2000-01-01T00:00:00")
-            .await
-            .map_err(|e| e.to_string())?;
-        events
-            .iter()
-            .filter(|e| e.kind == "ContextCompacted")
-            .filter_map(|e| {
-                let d: Value = serde_json::from_str(&e.data).ok()?;
-                let before = d.get("before_messages")?.as_u64()? as usize;
-                let after = d.get("after_messages")?.as_u64()? as usize;
-                Some((0i64, before, after))
-            })
-            .collect()
-    };
+    // 2. Load all events once
+    let events = crate::db::queries::events_since(pool, session_id, "2000-01-01T00:00:00")
+        .await
+        .map_err(|e| e.to_string())?;
 
-    // 3. Load Interrupted events
-    let interrupted_events: Vec<()> = {
-        let events = crate::db::queries::events_since(pool, session_id, "2000-01-01T00:00:00")
-            .await
-            .map_err(|e| e.to_string())?;
-        events
-            .iter()
-            .filter(|e| e.kind == "Interrupted")
-            .map(|_| ())
-            .collect()
-    };
+    // 3. Extract interrupted ordinals (sorted) so we can interleave them
+    let mut interrupt_ordinals: Vec<i64> = events
+        .iter()
+        .filter(|e| e.kind == "Interrupted")
+        .filter_map(|e| {
+            let d: Value = serde_json::from_str(&e.data).ok()?;
+            d.get("after_ordinal")?.as_i64()
+        })
+        .collect();
+    interrupt_ordinals.sort();
 
-    // 4. Load latest PromptClassified for last_mode
-    let last_mode = {
-        let events = crate::db::queries::events_since(pool, session_id, "2000-01-01T00:00:00")
-            .await
-            .map_err(|e| e.to_string())?;
-        events
-            .iter()
-            .rev()
-            .find(|e| e.kind == "PromptClassified")
-            .and_then(|e| {
-                let d: Value = serde_json::from_str(&e.data).ok()?;
-                Some(ModeResolvedInfo {
-                    mode: d.get("mode")?.as_str()?.to_string(),
-                    model: d.get("model")?.as_str()?.to_string(),
-                    confidence: d.get("confidence")?.as_f64()? as f32,
-                })
-            })
-    };
-
-    // 5. Build entries from messages
-    let mut entries: Vec<HistoryEntry> = rows
-        .into_iter()
-        .map(|row| {
-            let content: Vec<ContentBlock> =
-                serde_json::from_str(&row.content).unwrap_or_default();
-            HistoryEntry::Message {
-                role: row.role,
-                content,
-            }
+    // 4. Extract compaction markers
+    let compaction_markers: Vec<(usize, usize)> = events
+        .iter()
+        .filter(|e| e.kind == "ContextCompacted")
+        .filter_map(|e| {
+            let d: Value = serde_json::from_str(&e.data).ok()?;
+            let before = d.get("before_messages")?.as_u64()? as usize;
+            let after = d.get("after_messages")?.as_u64()? as usize;
+            Some((before, after))
         })
         .collect();
 
-    // Append compaction markers at the end (they're session-level markers)
-    for (_, before, after) in &snapshots {
+    // 5. Load latest PromptClassified for last_mode
+    let last_mode = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "PromptClassified")
+        .and_then(|e| {
+            let d: Value = serde_json::from_str(&e.data).ok()?;
+            Some(ModeResolvedInfo {
+                mode: d.get("mode")?.as_str()?.to_string(),
+                model: d.get("model")?.as_str()?.to_string(),
+                confidence: d.get("confidence")?.as_f64()? as f32,
+            })
+        });
+
+    // 6. Build entries, interleaving interrupted markers at correct positions
+    let mut entries: Vec<HistoryEntry> = Vec::new();
+    let mut interrupt_idx = 0;
+
+    for row in &rows {
+        // Insert any interrupted markers that belong before this message
+        while interrupt_idx < interrupt_ordinals.len()
+            && interrupt_ordinals[interrupt_idx] < row.ordinal
+        {
+            entries.push(HistoryEntry::Interrupted);
+            interrupt_idx += 1;
+        }
+
+        let content: Vec<ContentBlock> =
+            serde_json::from_str(&row.content).unwrap_or_default();
+        entries.push(HistoryEntry::Message {
+            role: row.role.clone(),
+            content,
+        });
+    }
+
+    // Append any remaining interrupted markers (after all messages)
+    while interrupt_idx < interrupt_ordinals.len() {
+        entries.push(HistoryEntry::Interrupted);
+        interrupt_idx += 1;
+    }
+
+    // Append compaction markers at the end (session-level markers)
+    for (before, after) in &compaction_markers {
         entries.push(HistoryEntry::Compacted {
             before_messages: *before,
             after_messages: *after,
         });
-    }
-
-    // Append interrupted markers
-    for _ in &interrupted_events {
-        entries.push(HistoryEntry::Interrupted);
     }
 
     Ok(ConversationHistory { entries, last_mode })
@@ -871,6 +872,13 @@ async fn run_agent_loop(
                     if stop_reason.is_empty() {
                         stop_reason = sr;
                     }
+                }
+                StreamChunk::DoneWithUsage { stop_reason: sr, usage } => {
+                    if stop_reason.is_empty() {
+                        stop_reason = sr;
+                    }
+                    turn_input_tokens = usage.input_tokens;
+                    accumulated_usage.merge(&usage);
                 }
                 StreamChunk::Error { message } => {
                     if is_model_unsupported_error(&message) {

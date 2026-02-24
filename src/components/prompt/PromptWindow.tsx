@@ -19,13 +19,6 @@ interface PromptWindowProps {
   onClose: () => void;
 }
 
-function resolveModel(mode: Mode, config: KernelConfig | null): string {
-  return mode.default_model ?? config?.models.default ?? "claude-sonnet-4-6";
-}
-
-/** Conservative fallback before the backend reports real context window. */
-const DEFAULT_CONTEXT_WINDOW = 128_000;
-
 type HistoryView = "full" | "agent";
 
 /** Convert raw ContextMessages (what the LLM sees) into ChatItems for display. */
@@ -37,21 +30,24 @@ function contextToChatItems(messages: ContextMessage[]): ChatItem[] {
         items.push({
           kind: "text",
           role: msg.role as "user" | "assistant",
-          content: block.text,
+          content: block.text ?? "",
         });
       } else if (block.type === "tool_use") {
         items.push({
           kind: "tool_call",
-          id: block.id,
-          name: block.name,
-          input: block.input,
+          id: block.id ?? "",
+          name: block.name ?? "",
+          input: block.input ?? {},
         });
       } else if (block.type === "tool_result") {
+        const content = Array.isArray(block.content)
+          ? block.content.map((c) => c.text ?? "").join("")
+          : (block.content ?? "");
         items.push({
           kind: "tool_result",
-          id: block.tool_use_id,
-          content: block.content,
-          isError: block.is_error,
+          id: block.tool_use_id ?? "",
+          content,
+          isError: block.is_error ?? false,
         });
       }
     }
@@ -59,12 +55,15 @@ function contextToChatItems(messages: ContextMessage[]): ChatItem[] {
   return items;
 }
 
-export function PromptWindow({
-  session,
-  modes,
-  config,
-  onClose,
-}: PromptWindowProps) {
+function resolveModel(mode: Mode, config: KernelConfig | null): string {
+  if (mode.default_model) return mode.default_model;
+  return config?.models?.default ?? "unknown";
+}
+
+const DEFAULT_CONTEXT_WINDOW = 200_000;
+const SCROLL_THRESHOLD = 50; // px from bottom to be considered "following"
+
+export function PromptWindow({ session, modes, config, onClose }: PromptWindowProps) {
   const [selectedMode, setSelectedMode] = useState<Mode>(
     () => ({
       name: "auto",
@@ -79,6 +78,12 @@ export function PromptWindow({
   const [prompt, setPrompt] = useState("");
   const { items, phase, resolvedMode, error, contextUsage, submit, cancel } = useLlmStream(session.id);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  // Track whether the user is near the bottom
+  const [isFollowing, setIsFollowing] = useState(true);
+  // Track whether content was previously scrollable (for edge-case detection)
+  const wasScrollableRef = useRef(false);
 
   // History view toggle
   const [historyView, setHistoryView] = useState<HistoryView>("full");
@@ -108,10 +113,42 @@ export function PromptWindow({
     }
   }, [resolvedMode, modes]);
 
-  // Auto-scroll to bottom on new items
+  // Update isFollowing based on scroll position
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setIsFollowing(distanceFromBottom <= SCROLL_THRESHOLD);
+  }, []);
+
+  // Smart auto-scroll: follow if already following, or if content just became scrollable
   useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+
+    const isScrollable = el.scrollHeight > el.clientHeight;
+
+    if (isFollowing) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    } else if (!wasScrollableRef.current && isScrollable) {
+      // Content just crossed the scrollable threshold for the first time — follow it
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      setIsFollowing(true);
+    }
+
+    wasScrollableRef.current = isScrollable;
+  }, [items, agentContext, historyView, isFollowing]);
+
+  // When switching history views, reset following state and scroll to bottom
+  useEffect(() => {
+    setIsFollowing(true);
+    wasScrollableRef.current = false;
+  }, [historyView]);
+
+  const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [items, agentContext, historyView]);
+    setIsFollowing(true);
+  }, []);
 
   // Fetch agent context when switching to agent view
   const fetchAgentContext = useCallback(async () => {
@@ -147,14 +184,16 @@ export function PromptWindow({
   // Use real API token count when available, fall back to chars/4 estimate
   const usedTokens = useMemo(() => {
     if (contextUsage) return contextUsage.inputTokens;
-    const historyChars = items.reduce<number>((acc, item) => {
-      if (item.kind === "text") return acc + item.content.length;
-      if (item.kind === "tool_result") return acc + item.content.length;
-      if (item.kind === "tool_call") return acc + JSON.stringify(item.input).length;
-      return acc;
-    }, 0);
-    return Math.ceil((historyChars + prompt.length) / 4);
-  }, [contextUsage, items, prompt]);
+    const text = items
+      .map((item) => {
+        if (item.kind === "text") return item.content;
+        if (item.kind === "tool_call") return JSON.stringify(item.input);
+        if (item.kind === "tool_result") return item.content;
+        return "";
+      })
+      .join(" ");
+    return Math.round(text.length / 4);
+  }, [contextUsage, items]);
 
   const contextWindow = useMemo(
     () => contextUsage?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
@@ -164,7 +203,7 @@ export function PromptWindow({
   async function handleSubmit() {
     const trimmed = prompt.trim();
     if (!trimmed || busy) return;
-    // Switch back to full view when submitting so user sees live streaming
+    // Switch to full view when submitting so user sees live streaming
     if (historyView === "agent") setHistoryView("full");
     const modeOverride = selectedMode.name === "auto" ? null : selectedMode.name;
     setPrompt("");
@@ -183,223 +222,218 @@ export function PromptWindow({
     >
       <SessionBar session={session} onClose={onClose} />
 
-      <div className="relative flex flex-1 flex-col px-8 pb-6 overflow-hidden">
-        {/* Mode-tinted ambient glow */}
+      {/* View toggle — full width, content centered */}
+      {items.some((i) => i.kind === "tool_call" || i.kind === "tool_result") && (
+        <div className="relative z-10 flex justify-center pt-3 pb-1 shrink-0">
+          <ViewToggle view={historyView} onChange={setHistoryView} />
+        </div>
+      )}
+
+      {/* Messages — scroll container spans full width, inner content is centered */}
+      {hasMessages || showPendingBubble ? (
         <div
-          className="pointer-events-none absolute left-1/2 top-[42%] -translate-x-1/2 -translate-y-1/2 h-[260px] w-[480px] rounded-full blur-[120px] transition-all duration-700"
-          style={{ background: `radial-gradient(ellipse, var(--mode-tint-glow) 0%, transparent 70%)` }}
-        />
-
-        {/* History view toggle */}
-        {items.length > 0 && (
-          <div className="relative z-10 flex justify-center pt-3 pb-1">
-            <ViewToggle view={historyView} onChange={setHistoryView} />
-          </div>
-        )}
-
-        {/* Messages area */}
-        {hasMessages || showPendingBubble ? (
-          <div className="relative flex-1 overflow-y-auto py-6">
-            {agentContextLoading && historyView === "agent" ? (
-              <div className="flex items-center justify-center h-full">
-                <span className="text-[11px] text-text-ghost animate-pulse">Loading agent context...</span>
-              </div>
-            ) : (
-              <div className="mx-auto max-w-[640px] space-y-4">
-                {historyView === "agent" && (
-                  <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.03] border border-white/[0.06] mb-2">
-                    <span className="text-[10px] text-text-ghost">
-                      Showing what the agent sees after compaction. Some messages may be summarized or removed.
-                    </span>
-                  </div>
-                )}
-
-                {displayItems.map((item, i) => {
-                  if (item.kind === "compaction") {
-                    return (
-                      <CompactionMarker
-                        key={i}
-                        beforeMessages={item.beforeMessages}
-                        afterMessages={item.afterMessages}
-                      />
-                    );
-                  }
-                  if (item.kind === "interrupted") {
-                    return <InterruptedMarker key={i} />;
-                  }
-                  if (item.kind === "tool_call") {
-                    return <ToolCallBlock key={i} name={item.name} input={item.input} />;
-                  }
-                  if (item.kind === "tool_result") {
-                    return <ToolResultBlock key={i} content={item.content} isError={item.isError} />;
-                  }
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          className="flex-1 overflow-y-auto"
+        >
+          {agentContextLoading && historyView === "agent" ? (
+            <div className="flex items-center justify-center h-full">
+              <span className="text-[11px] text-text-ghost animate-pulse">Loading agent context...</span>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-4 mx-auto w-full max-w-[540px] px-4 py-6">
+              {displayItems.map((item, i) => {
+                if (item.kind === "compaction") {
                   return (
-                    <div
+                    <CompactionDivider
                       key={i}
-                      className={cn(
-                        "rounded-xl px-4 py-3 text-[14px] leading-relaxed",
-                        item.role === "user"
-                          ? "bg-surface-2 text-text-primary ml-12"
-                          : "text-text-secondary mr-4",
-                      )}
-                    >
-                      <div className="markdown-message wrap-break-word">
-                        <MarkdownMessage content={item.content} role={item.role} />
-                        {item.role === "assistant" &&
-                          phase === "streaming" &&
-                          historyView === "full" &&
-                          i === displayItems.length - 1 && (
-                            <span
-                              className="inline-block w-1.5 h-4 rounded-sm ml-0.5 -mb-0.5 animate-caret"
-                              style={{ backgroundColor: "var(--mode-tint)" }}
-                            />
-                          )}
+                      beforeMessages={item.beforeMessages}
+                      afterMessages={item.afterMessages}
+                    />
+                  );
+                }
+
+                if (item.kind === "text" && item.role === "user") {
+                  return (
+                    <div key={i} className="flex justify-end">
+                      <div
+                        className={cn(
+                          "rounded-xl px-4 py-3 text-[14px] leading-relaxed max-w-[85%]",
+                          "bg-surface-1 text-text-primary ml-4",
+                        )}
+                      >
+                        <MarkdownMessage content={item.content} role="user" />
                       </div>
                     </div>
                   );
-                })}
+                }
 
-                {/* Shows a blinking cursor before any text arrives */}
-                {showPendingBubble && historyView === "full" && (
-                  <div className="rounded-xl px-4 py-3 text-[14px] leading-relaxed text-text-secondary mr-4">
-                    <span className="inline-block w-1.5 h-4 rounded-sm animate-caret" style={{ backgroundColor: "var(--mode-tint)" }} />
-                  </div>
-                )}
+                if (item.kind === "text" && item.role === "assistant") {
+                  return (
+                    <div key={i} className="flex justify-start">
+                      <div className="rounded-xl px-4 py-3 text-[14px] leading-relaxed text-text-secondary mr-4">
+                        <MarkdownMessage content={item.content} role="assistant" />
+                      </div>
+                    </div>
+                  );
+                }
 
-                <div ref={messagesEndRef} />
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="flex flex-1 items-center justify-center" />
-        )}
+                if (item.kind === "tool_call") {
+                  return (
+                    <ToolCallBlock
+                      key={i}
+                      name={item.name}
+                      input={item.input}
+                    />
+                  );
+                }
 
-        {/* Input area */}
-        <div className="relative w-full max-w-[540px] mx-auto animate-in">
-          <PromptInput
-            value={prompt}
-            onChange={setPrompt}
-            onSubmit={handleSubmit}
-            busy={busy}
-            onCancel={cancel}
-          />
+                if (item.kind === "tool_result") {
+                  return (
+                    <ToolResultBlock
+                      key={i}
+                      content={item.content}
+                      isError={item.isError}
+                    />
+                  );
+                }
 
-          {/* Controls row */}
-          <div className="mt-3 flex items-center justify-between px-1 animate-in-delayed">
-            <div className="flex items-center gap-1">
-              <ModeSelector
-                modes={modes}
-                selected={selectedMode}
-                onSelect={setSelectedMode}
-              />
-              <span className="text-text-ghost mx-1">&middot;</span>
-              <ModelBadge model={resolveModel(selectedMode, config)} />
-            </div>
+                return null;
+              })}
 
-            <div className="flex items-center gap-2">
-              {busy && (
-                <span className="text-[11px] font-mono tracking-tight animate-pulse" style={{ color: "var(--mode-tint-dim)" }}>
-                  {phase === "classifying"
-                    ? "routing..."
-                    : phase === "generating"
-                      ? "thinking..."
-                      : "streaming..."}
-                </span>
+              {/* Shows a blinking cursor before any text arrives */}
+              {showPendingBubble && historyView === "full" && (
+                <div className="rounded-xl px-4 py-3 text-[14px] leading-relaxed text-text-secondary mr-4">
+                  <span className="inline-block w-1.5 h-4 rounded-sm animate-caret" style={{ backgroundColor: "var(--mode-tint)" }} />
+                </div>
               )}
-              <ContextRing used={usedTokens} total={contextWindow} items={items} sessionId={session.id} />
-            </div>
-          </div>
-        </div>
 
-        {/* Status */}
-        <div className="mt-3 flex justify-center">
-          {error ? (
-            <div className="max-w-[480px] rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-1.5">
-              <p className="text-[11px] text-red-400 tracking-wide text-center">{error}</p>
+              <div ref={messagesEndRef} />
             </div>
-          ) : (
-            <p className="text-[11px] text-text-ghost tracking-wide">
-              {phase === "classifying" ? (
-                "selecting mode..."
-              ) : phase === "generating" ? (
-                resolvedMode
-                  ? `${resolvedMode.mode} mode`
-                  : "waiting for model..."
-              ) : phase === "streaming" ? (
-                resolvedMode
-                  ? `${resolvedMode.mode}`
-                  : "streaming"
-              ) : (
-                "ready"
-              )}
-            </p>
           )}
         </div>
+      ) : (
+        <div className="flex-1" />
+      )}
+
+      {/* Input area — centered, fixed width */}
+      <div className="shrink-0 w-full max-w-[540px] mx-auto px-4 pb-4 animate-in">
+        {/* Scroll-to-bottom button */}
+        <div className="relative">
+          {!isFollowing && (
+            <div className="absolute -top-10 left-0 right-0 flex justify-center pointer-events-none">
+              <button
+                onClick={scrollToBottom}
+                className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-border-subtle bg-surface-1 px-3 py-1 text-[11px] text-text-secondary shadow-sm hover:bg-surface-2 hover:text-text-primary transition-colors"
+              >
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" className="shrink-0">
+                  <path d="M5 1v8M1.5 5.5 5 9l3.5-3.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                new messages
+              </button>
+            </div>
+          )}
+        </div>
+
+        <PromptInput
+          value={prompt}
+          onChange={setPrompt}
+          onSubmit={handleSubmit}
+          busy={busy}
+          onCancel={cancel}
+        />
+
+        {/* Controls row */}
+        <div className="mt-3 flex items-center justify-between px-1 animate-in-delayed">
+          <div className="flex items-center gap-1">
+            <ModeSelector
+              modes={modes}
+              selected={selectedMode}
+              onSelect={setSelectedMode}
+            />
+            <span className="text-text-ghost mx-1">&middot;</span>
+            <ModelBadge model={resolveModel(selectedMode, config)} />
+          </div>
+
+          <div className="flex items-center gap-2">
+            {busy && (
+              <span className="text-[11px] font-mono tracking-tight animate-pulse" style={{ color: "var(--mode-tint-dim)" }}>
+                {phase === "classifying"
+                  ? "routing..."
+                  : phase === "generating"
+                    ? "thinking..."
+                    : "streaming..."}
+              </span>
+            )}
+            {selectedMode.name !== "auto" && (
+              <ContextRing used={usedTokens} total={contextWindow} items={items} sessionId={session.id} />
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Status */}
+      <div className="shrink-0 pb-3 flex justify-center">
+        {error ? (
+          <div className="max-w-[480px] rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-1.5">
+            <p className="text-[11px] text-red-400 tracking-wide text-center">{error}</p>
+          </div>
+        ) : (
+          <p className="text-[11px] text-text-ghost tracking-wide">
+            {phase === "classifying" ? (
+              "selecting mode..."
+            ) : phase === "generating" ? (
+              "thinking..."
+            ) : phase === "streaming" ? (
+              "streaming"
+            ) : (
+              "ready"
+            )}
+          </p>
+        )}
       </div>
     </div>
   );
 }
 
-// ---- Sub-components ----
+// ─── Sub-components ────────────────────────────────────────────────────────────
 
-function ViewToggle({
-  view,
-  onChange,
-}: {
+interface ViewToggleProps {
   view: HistoryView;
   onChange: (v: HistoryView) => void;
-}) {
+}
+
+function ViewToggle({ view, onChange }: ViewToggleProps) {
   return (
-    <div className="inline-flex rounded-lg border border-white/[0.06] bg-surface-1 p-0.5">
-      <button
-        onClick={() => onChange("full")}
-        className={cn(
-          "px-2.5 py-1 rounded-md text-[10px] font-medium tracking-wide transition-colors",
-          view === "full"
-            ? "bg-white/[0.08] text-text-primary"
-            : "text-text-ghost hover:text-text-secondary",
-        )}
-      >
-        Full History
-      </button>
-      <button
-        onClick={() => onChange("agent")}
-        className={cn(
-          "px-2.5 py-1 rounded-md text-[10px] font-medium tracking-wide transition-colors",
-          view === "agent"
-            ? "bg-white/[0.08] text-text-primary"
-            : "text-text-ghost hover:text-text-secondary",
-        )}
-      >
-        Agent View
-      </button>
+    <div className="flex items-center gap-0.5 rounded-full border border-border-subtle bg-surface-1 p-0.5 text-[11px]">
+      {(["full", "agent"] as HistoryView[]).map((v) => (
+        <button
+          key={v}
+          onClick={() => onChange(v)}
+          className={cn(
+            "rounded-full px-3 py-0.5 transition-colors",
+            view === v
+              ? "bg-surface-2 text-text-primary"
+              : "text-text-ghost hover:text-text-secondary",
+          )}
+        >
+          {v === "full" ? "conversation" : "agent context"}
+        </button>
+      ))}
     </div>
   );
 }
 
-function InterruptedMarker() {
-  return (
-    <div className="flex items-center gap-3 py-2">
-      <div className="flex-1 border-t border-dashed border-text-ghost/20" />
-      <span className="text-[10px] font-mono text-text-ghost/60 shrink-0">
-        interrupted by user
-      </span>
-      <div className="flex-1 border-t border-dashed border-text-ghost/20" />
-    </div>
-  );
-}
-
-function CompactionMarker({
-  beforeMessages,
-  afterMessages,
-}: {
+interface CompactionDividerProps {
   beforeMessages: number;
   afterMessages: number;
-}) {
+}
+
+function CompactionDivider({ beforeMessages, afterMessages }: CompactionDividerProps) {
   return (
-    <div className="flex items-center gap-3 py-2">
+    <div className="flex items-center gap-2 py-1">
       <div className="flex-1 border-t border-dashed border-amber-500/20" />
-      <span className="text-[10px] font-mono text-amber-500/60 shrink-0">
+      <span className="text-[10px] text-amber-500/60 shrink-0">
         context compacted {beforeMessages} &rarr; {afterMessages} messages
       </span>
       <div className="flex-1 border-t border-dashed border-amber-500/20" />

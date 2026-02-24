@@ -19,6 +19,7 @@ pub enum StreamChunk {
     ContentBlockStop { index: u64 },
     MessageUsage { usage: Usage },
     Done { stop_reason: String },
+    DoneWithUsage { stop_reason: String, usage: Usage },
     Error { message: String },
 }
 
@@ -439,29 +440,23 @@ fn parse_sse_event(json: &Value) -> Option<StreamChunk> {
             Some(StreamChunk::ContentBlockStop { index })
         }
         "message_delta" => {
-            // Emit stop_reason
-            let mut chunk = None;
-            if let Some(reason) = json["delta"]["stop_reason"].as_str() {
-                chunk = Some(StreamChunk::Done {
-                    stop_reason: reason.to_string(),
-                });
+            let stop = json["delta"]["stop_reason"]
+                .as_str()
+                .map(|r| r.to_string());
+            let usage = json
+                .get("usage")
+                .and_then(|v| serde_json::from_value::<Usage>(v.clone()).ok());
+
+            // Return both as a combined variant so no data is lost
+            match (stop, usage) {
+                (Some(stop_reason), Some(usage)) => Some(StreamChunk::DoneWithUsage {
+                    stop_reason,
+                    usage,
+                }),
+                (Some(stop_reason), None) => Some(StreamChunk::Done { stop_reason }),
+                (None, Some(usage)) => Some(StreamChunk::MessageUsage { usage }),
+                (None, None) => None,
             }
-            // Also emit usage if present in message_delta
-            if let Some(usage_val) = json.get("usage") {
-                if let Ok(usage) = serde_json::from_value::<Usage>(usage_val.clone()) {
-                    // If we also have a stop_reason, the caller gets usage via a separate chunk.
-                    // We prefer to send usage first, then done — but since we can only return one,
-                    // we'll return done here and let message_start handle input usage.
-                    // Actually, message_delta usage contains output_tokens.
-                    // We return Done; the caller accumulates usage from MessageUsage chunks.
-                    // Let's return the usage chunk instead if there's no stop reason, or
-                    // combine: we'll just return Done and the caller gets usage from message_start.
-                    if chunk.is_none() {
-                        return Some(StreamChunk::MessageUsage { usage });
-                    }
-                }
-            }
-            chunk
         }
         "message_stop" => Some(StreamChunk::Done {
             stop_reason: "end_turn".to_string(),
@@ -603,9 +598,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_message_delta_done() {
+    fn parse_message_delta_done_with_usage() {
         let json: Value = serde_json::from_str(
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#,
+        )
+        .unwrap();
+        match parse_sse_event(&json) {
+            Some(StreamChunk::DoneWithUsage { stop_reason, usage }) => {
+                assert_eq!(stop_reason, "end_turn");
+                assert_eq!(usage.output_tokens, 42);
+            }
+            other => panic!("Expected DoneWithUsage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_message_delta_done_without_usage() {
+        let json: Value = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
         )
         .unwrap();
         match parse_sse_event(&json) {
