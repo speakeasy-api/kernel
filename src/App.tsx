@@ -1,4 +1,5 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 import type { Session } from "./lib/types";
 import { deleteSession, eventsSince } from "./lib/commands";
 import { PromptWindow } from "./components/prompt/PromptWindow";
@@ -24,6 +25,18 @@ function App() {
   if (view.kind === "prompt-window") {
     currentSessionRef.current = view.session;
   }
+
+  // Refresh sidebar when a prompt completes (session goes from empty → non-empty)
+  useEffect(() => {
+    let cancelled = false;
+    const unsub = listen("llm-done", () => {
+      if (!cancelled) setSidebarRefreshKey((k) => k + 1);
+    });
+    return () => {
+      cancelled = true;
+      unsub.then((u) => u());
+    };
+  }, []);
 
   const activeSessionId =
     view.kind === "prompt-window" ? view.session.id : null;

@@ -38,29 +38,42 @@ async function fetchSummaries(sessions: Session[]): Promise<SessionSummary[]> {
 }
 
 function groupByProject(summaries: SessionSummary[]): WorkspaceGroup[] {
-  const map = new Map<string, SessionSummary[]>();
+  // Collect all unique project paths (so workspaces always appear)
+  const pathSet = new Set<string>();
+  const nonEmpty = new Map<string, SessionSummary[]>();
+
   for (const s of summaries) {
-    // Skip empty conversations (no prompt ever submitted)
-    if (!s.title) continue;
     const path = s.session.project_path;
-    if (!map.has(path)) map.set(path, []);
-    map.get(path)!.push(s);
+    pathSet.add(path);
+    // Only include conversations that have at least one prompt
+    if (s.title) {
+      if (!nonEmpty.has(path)) nonEmpty.set(path, []);
+      nonEmpty.get(path)!.push(s);
+    }
   }
 
   const groups: WorkspaceGroup[] = [];
-  for (const [path, sessions] of map) {
+  for (const path of pathSet) {
     groups.push({
       projectPath: path,
       projectName: projectName(path),
-      // sessions are already DESC from the backend; keep that order
-      sessions,
+      sessions: nonEmpty.get(path) ?? [],
     });
   }
 
-  // Sort groups by most-recent session created_at
+  // Sort groups by most-recent session created_at (from any session, including empty)
+  const latestByPath = new Map<string, string>();
+  for (const s of summaries) {
+    const path = s.session.project_path;
+    const current = latestByPath.get(path) ?? "";
+    if (s.session.created_at > current) {
+      latestByPath.set(path, s.session.created_at);
+    }
+  }
+
   groups.sort((a, b) => {
-    const aLatest = a.sessions[0]?.session.created_at ?? "";
-    const bLatest = b.sessions[0]?.session.created_at ?? "";
+    const aLatest = latestByPath.get(a.projectPath) ?? "";
+    const bLatest = latestByPath.get(b.projectPath) ?? "";
     return bLatest.localeCompare(aLatest);
   });
 
