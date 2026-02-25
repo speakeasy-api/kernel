@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, info, instrument, warn};
 
 /// Well-known stable model used when the router picks an unknown ID.
 pub const FALLBACK_MODEL: &str = "anthropic/claude-sonnet-4-6";
@@ -71,10 +72,13 @@ impl ModelRegistry {
 
     /// Fetch all models and per-category indices from OpenRouter and update caches.
     /// Logs failures but keeps stale data — callers never see a hard error.
+    #[instrument(skip(self))]
     pub async fn refresh(&self) {
+        info!("refreshing model catalog");
         // Step 1: Fetch full catalog (unfiltered)
         match self.fetch_all_models().await {
             Ok(models) => {
+                debug!(model_count = models.len(), "fetched model catalog");
                 let mut catalog = self.catalog.write().await;
                 catalog.clear();
                 for m in models {
@@ -82,7 +86,7 @@ impl ModelRegistry {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to refresh model catalog");
+                warn!(error = %e, "failed to refresh model catalog");
             }
         }
 
@@ -97,14 +101,16 @@ impl ModelRegistry {
         for &cat in all_categories {
             match self.fetch_category_ids(cat).await {
                 Ok(ids) => {
+                    debug!(category = cat, model_count = ids.len(), "fetched category index");
                     let mut categories = self.categories.write().await;
                     categories.insert(cat.to_string(), ids);
                 }
                 Err(e) => {
-                    tracing::warn!(category = cat, error = %e, "failed to refresh category index");
+                    warn!(category = cat, error = %e, "failed to refresh category index");
                 }
             }
         }
+        info!("model catalog refresh complete");
     }
 
     /// Fetch all models from the unfiltered endpoint.
@@ -179,6 +185,7 @@ impl ModelRegistry {
     /// Return deduplicated models relevant to a mode. Uses `try_read()` so
     /// callers in `spawn_blocking` never block on a concurrent refresh.
     /// Returns an empty vec on lock contention or cold cache.
+    #[instrument(skip(self))]
     pub fn models_for_mode(&self, mode: &str) -> Vec<ModelInfo> {
         let cat_guard = match self.categories.try_read() {
             Ok(g) => g,
@@ -204,6 +211,7 @@ impl ModelRegistry {
                 }
             }
         }
+        debug!(mode, model_count = out.len(), "resolved models for mode");
         out
     }
 

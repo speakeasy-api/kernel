@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use super::diff::FileDiff;
 
@@ -58,6 +59,12 @@ pub fn classify_changes(diffs: &[FileDiff]) -> ClassifiedChanges {
         }
     }
 
+    debug!(
+        total = diffs.len(),
+        code = code_changes.len(),
+        dependency = dependency_changes.len(),
+        "classified changes"
+    );
     ClassifiedChanges {
         code_changes,
         dependency_changes,

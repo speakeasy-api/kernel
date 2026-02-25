@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use chrono::NaiveDateTime;
 use sqlx::SqlitePool;
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::db::queries as db_queries;
@@ -83,8 +84,11 @@ pub async fn events_since(
     session_id: &str,
     since: &str,
 ) -> Result<Vec<Event>, QueryError> {
+    debug!(session_id = %session_id, since = %since, "querying events since");
     let db_events = db_queries::events_since(pool, session_id, since).await?;
-    db_events.iter().map(to_typed).collect()
+    let events: Vec<Event> = db_events.iter().map(to_typed).collect::<Result<_, _>>()?;
+    debug!(count = events.len(), "query returned events");
+    Ok(events)
 }
 
 /// All events matching a variant name (the `kind` column) after the given timestamp.
@@ -93,8 +97,11 @@ pub async fn events_by_variant(
     variant: &str,
     since: &str,
 ) -> Result<Vec<Event>, QueryError> {
+    debug!(variant = %variant, since = %since, "querying events by variant");
     let db_events = db_queries::events_by_kind(pool, variant, since).await?;
-    db_events.iter().map(to_typed).collect()
+    let events: Vec<Event> = db_events.iter().map(to_typed).collect::<Result<_, _>>()?;
+    debug!(count = events.len(), "query returned events");
+    Ok(events)
 }
 
 /// Count of events per variant name within a session after the given timestamp.
@@ -103,6 +110,7 @@ pub async fn aggregate_by_variant(
     session_id: &str,
     since: &str,
 ) -> Result<HashMap<String, u64>, QueryError> {
+    debug!(session_id = %session_id, since = %since, "aggregating events by variant");
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT kind, COUNT(*) FROM events
          WHERE session_id = ?1 AND created_at > ?2
@@ -117,6 +125,7 @@ pub async fn aggregate_by_variant(
     for (kind, count) in rows {
         map.insert(kind, count as u64);
     }
+    debug!(variant_count = map.len(), "aggregation returned variants");
     Ok(map)
 }
 
@@ -130,6 +139,7 @@ pub async fn rejection_rate(
     session_id: &str,
     window_seconds: i64,
 ) -> Result<f32, QueryError> {
+    debug!(session_id = %session_id, window_seconds = window_seconds, "computing rejection rate");
     let window_param = format!("-{window_seconds} seconds");
 
     let total: (i64,) = sqlx::query_as(
@@ -159,11 +169,14 @@ pub async fn rejection_rate(
     .fetch_one(pool)
     .await?;
 
-    Ok(rejected.0 as f32 / total.0 as f32)
+    let rate = rejected.0 as f32 / total.0 as f32;
+    debug!(rate = rate, total_reviews = total.0, rejected = rejected.0, "rejection rate computed");
+    Ok(rate)
 }
 
 /// Total cost (USD) from all CostIncurred events in a session.
 pub async fn cost_total(pool: &SqlitePool, session_id: &str) -> Result<f64, QueryError> {
+    debug!(session_id = %session_id, "querying total cost");
     let row: (f64,) = sqlx::query_as(
         "SELECT CAST(COALESCE(SUM(json_extract(data, '$.cost_usd')), 0.0) AS REAL)
          FROM events
@@ -172,12 +185,14 @@ pub async fn cost_total(pool: &SqlitePool, session_id: &str) -> Result<f64, Quer
     .bind(session_id)
     .fetch_one(pool)
     .await?;
+    debug!(total_cost = row.0, "total cost computed");
     Ok(row.0)
 }
 
 /// Total cost (USD) for a specific task, joining through the agents table
 /// to find agents assigned to the task.
 pub async fn cost_total_task(pool: &SqlitePool, task_id: &str) -> Result<f64, QueryError> {
+    debug!(task_id = %task_id, "querying total cost for task");
     let row: (f64,) = sqlx::query_as(
         "SELECT CAST(COALESCE(SUM(json_extract(e.data, '$.cost_usd')), 0.0) AS REAL)
          FROM events e
@@ -187,6 +202,7 @@ pub async fn cost_total_task(pool: &SqlitePool, task_id: &str) -> Result<f64, Qu
     .bind(task_id)
     .fetch_one(pool)
     .await?;
+    debug!(task_id = %task_id, total_cost = row.0, "task cost computed");
     Ok(row.0)
 }
 
@@ -196,6 +212,7 @@ pub async fn loop_detections(
     session_id: &str,
     since: &str,
 ) -> Result<Vec<Event>, QueryError> {
+    debug!(session_id = %session_id, since = %since, "querying loop detections");
     let db_events: Vec<crate::db::models::Event> = sqlx::query_as(
         "SELECT id, kind, session_id, agent_id, data, created_at
          FROM events
@@ -207,7 +224,9 @@ pub async fn loop_detections(
     .fetch_all(pool)
     .await?;
 
-    db_events.iter().map(to_typed).collect()
+    let events: Vec<Event> = db_events.iter().map(to_typed).collect::<Result<_, _>>()?;
+    debug!(count = events.len(), "loop detections returned");
+    Ok(events)
 }
 
 /// Aggregate raw events into the `stats_rollups` table for the given window period.
@@ -221,6 +240,7 @@ pub async fn rollup_metrics(
     session_id: &str,
     window_seconds: i64,
 ) -> Result<(), QueryError> {
+    debug!(session_id = %session_id, window_seconds = window_seconds, "rolling up metrics");
     let window_param = format!("-{window_seconds} seconds");
 
     let row: (String, String) = sqlx::query_as(
@@ -305,6 +325,7 @@ pub async fn rollup_metrics(
     )
     .await?;
 
+    debug!(session_id = %session_id, "rollup metrics complete");
     Ok(())
 }
 

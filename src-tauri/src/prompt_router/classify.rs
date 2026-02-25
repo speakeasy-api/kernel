@@ -1,3 +1,5 @@
+use tracing::{debug, info, instrument, warn};
+
 use crate::prompt_router::model_registry::ModelInfo;
 use crate::prompt_router::{ModeInfo, RouterInput, RouterOutput};
 
@@ -86,17 +88,32 @@ Respond with ONLY a JSON object:\n\
     )
 }
 
+#[instrument(skip(input, llm_client, available_models), fields(router_model, prompt_len = input.prompt.len()))]
 pub fn classify(
     input: &RouterInput,
     llm_client: &dyn LlmClient,
     router_model: &str,
     available_models: &[ModelInfo],
 ) -> Result<RouterOutput, ClassificationError> {
+    info!(
+        prompt_len = input.prompt.len(),
+        modes = input.available_modes.len(),
+        models = available_models.len(),
+        "classifying prompt"
+    );
     let prompt = build_classification_prompt(input, available_models);
     let response = llm_client.complete(&prompt, router_model)?;
-    parse_classification_response(&response, &input.available_modes)
+    let result = parse_classification_response(&response, &input.available_modes)?;
+    debug!(
+        mode = %result.mode,
+        model = %result.model,
+        confidence = result.confidence,
+        "classification result"
+    );
+    Ok(result)
 }
 
+#[instrument(skip(response, available_modes))]
 pub fn parse_classification_response(
     response: &str,
     available_modes: &[ModeInfo],
@@ -154,7 +171,7 @@ pub fn parse_classification_response(
     }
 
     if !(0.0..=1.0).contains(&output.confidence) {
-        tracing::warn!(
+        warn!(
             confidence = output.confidence,
             "classifier confidence out of range, clamping"
         );

@@ -1,17 +1,22 @@
+use tracing::debug;
+
 use super::types::{combine_tool_sets, Mode, ModeOrigin, FULL_TOOLS, READ_ONLY_TOOLS, WEB_TOOLS};
 
 pub fn builtin_modes() -> Vec<Mode> {
-    vec![
+    let modes = vec![
         plan_mode(),
         implement_mode(),
         review_mode(),
         debug_mode(),
         research_mode(),
         general_mode(),
-    ]
+    ];
+    debug!(count = modes.len(), "registered builtin modes");
+    modes
 }
 
 fn plan_mode() -> Mode {
+    debug!(name = "plan", "registering builtin mode");
     Mode {
         name: "plan".into(),
         description: "Structured decomposition, trade-off analysis, step-by-step reasoning".into(),
@@ -32,6 +37,7 @@ You must never modify files, run shell commands, or take any action that changes
 }
 
 fn implement_mode() -> Mode {
+    debug!(name = "implement", "registering builtin mode");
     Mode {
         name: "implement".into(),
         description: "Code generation, tool-use heavy, minimal explanation".into(),
@@ -52,6 +58,7 @@ Keep commentary minimal. A one-line summary of what you did is fine; a paragraph
 }
 
 fn review_mode() -> Mode {
+    debug!(name = "review", "registering builtin mode");
     Mode {
         name: "review".into(),
         description: "Diff-aware, security and correctness focus, concise feedback".into(),
@@ -72,6 +79,7 @@ Be concise and actionable. Say what is wrong, why it matters, and what to do abo
 }
 
 fn debug_mode() -> Mode {
+    debug!(name = "debug", "registering builtin mode");
     Mode {
         name: "debug".into(),
         description: "Hypothesis-driven, log analysis, bisect strategy".into(),
@@ -92,6 +100,7 @@ When you find the fix, explain the root cause clearly: what was wrong, why it ha
 }
 
 fn research_mode() -> Mode {
+    debug!(name = "research", "registering builtin mode");
     Mode {
         name: "research".into(),
         description: "Deep reading, summarization, web search".into(),
@@ -112,6 +121,7 @@ Read project files thoroughly to understand existing context before searching ex
 }
 
 fn general_mode() -> Mode {
+    debug!(name = "general", "registering builtin mode");
     Mode {
         name: "general".into(),
         description: "Balanced, conversational".into(),

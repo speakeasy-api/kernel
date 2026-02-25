@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tracing::{debug, error, info};
 
 const KERNEL_DIR: &str = ".kernel";
 const WORKTREES_DIR: &str = "worktrees";
@@ -86,6 +87,13 @@ pub fn create_worktree(
     base_ref: &str,
     merge_target_ref: &str,
 ) -> Result<Worktree, WorktreeError> {
+    info!(
+        branch = %branch_name,
+        base_ref = %base_ref,
+        merge_target = %merge_target_ref,
+        task_id = ?task_id,
+        "creating worktree"
+    );
     let full_branch = format!("{BRANCH_PREFIX}{branch_name}");
     let worktree_path = worktrees_dir(project_root).join(branch_name);
 
@@ -126,23 +134,32 @@ pub fn create_worktree(
     let meta_file = meta.join(format!("{branch_name}.json"));
     std::fs::write(meta_file, serde_json::to_string_pretty(&worktree)?)?;
 
+    info!(path = %worktree.path.display(), branch = %worktree.branch, "worktree created");
     Ok(worktree)
 }
 
 /// Removes a git worktree and deletes its branch.
 pub fn remove_worktree(project_root: &Path, branch_name: &str) -> Result<(), WorktreeError> {
+    info!(branch = %branch_name, "removing worktree");
     let full_branch = format!("{BRANCH_PREFIX}{branch_name}");
     let worktree_path = worktrees_dir(project_root).join(branch_name);
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
-    git(project_root, &["worktree", "remove", &worktree_path_str])?;
-    git(project_root, &["branch", "-d", &full_branch])?;
+    git(project_root, &["worktree", "remove", &worktree_path_str]).map_err(|e| {
+        error!(branch = %branch_name, error = %e, "failed to remove worktree");
+        e
+    })?;
+    git(project_root, &["branch", "-d", &full_branch]).map_err(|e| {
+        error!(branch = %full_branch, error = %e, "failed to delete branch");
+        e
+    })?;
 
     let meta_file = meta_dir(project_root).join(format!("{branch_name}.json"));
     if meta_file.exists() {
         std::fs::remove_file(meta_file)?;
     }
 
+    info!(branch = %branch_name, "worktree removed");
     Ok(())
 }
 
@@ -150,6 +167,7 @@ pub fn remove_worktree(project_root: &Path, branch_name: &str) -> Result<(), Wor
 /// Parses `git worktree list --porcelain` and enriches results with
 /// persisted metadata when available.
 pub fn list_worktrees(project_root: &Path) -> Result<Vec<Worktree>, WorktreeError> {
+    debug!("listing worktrees");
     let output = git(project_root, &["worktree", "list", "--porcelain"])?;
     // Canonicalize to handle symlinks (e.g. macOS /tmp -> /private/tmp)
     let kernel_wt_dir = worktrees_dir(project_root)
@@ -188,6 +206,7 @@ pub fn list_worktrees(project_root: &Path) -> Result<Vec<Worktree>, WorktreeErro
         }
     }
 
+    debug!(count = worktrees.len(), "worktrees listed");
     Ok(worktrees)
 }
 

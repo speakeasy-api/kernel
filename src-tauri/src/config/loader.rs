@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use tracing::{debug, error, info, instrument, warn};
+
 use crate::config::KernelConfig;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,7 +22,9 @@ pub enum ConfigError {
 
 /// Load config from global (~/.config/kernel/config.toml) and project (kernel.toml) files,
 /// merging project over global over defaults at the field level.
+#[instrument(skip_all, fields(project_root = %project_root.display()))]
 pub fn load_config(project_root: &Path) -> Result<KernelConfig, ConfigError> {
+    info!(path = %project_root.display(), "loading config");
     let defaults =
         toml::Value::try_from(&KernelConfig::default()).expect("default config must serialize");
 
@@ -28,31 +32,42 @@ pub fn load_config(project_root: &Path) -> Result<KernelConfig, ConfigError> {
 
     let merged = match global_path {
         Some(ref p) if p.exists() => {
+            debug!(path = %p.display(), "loading global config");
             let global = load_toml_value(p)?;
             deep_merge(defaults, global)
         }
-        _ => defaults,
+        _ => {
+            debug!("no global config found, using defaults");
+            defaults
+        }
     };
 
     let project_path = project_root.join("kernel.toml");
     let merged = if project_path.exists() {
+        debug!(path = %project_path.display(), "loading project config");
         let project = load_toml_value(&project_path)?;
         deep_merge(merged, project)
     } else {
+        debug!("no project config found");
         merged
     };
 
-    let config: KernelConfig = merged.try_into().map_err(|e| ConfigError::Parse {
-        path: "merged config".to_string(),
-        source: e,
+    let config: KernelConfig = merged.try_into().map_err(|e| {
+        error!(error = %e, "failed to parse merged config");
+        ConfigError::Parse {
+            path: "merged config".to_string(),
+            source: e,
+        }
     })?;
 
     validate_config(&config)?;
 
+    debug!("config loaded successfully");
     Ok(config)
 }
 
 /// Validate config values for logical consistency.
+#[instrument(skip_all)]
 pub fn validate_config(config: &KernelConfig) -> Result<(), ConfigError> {
     let mut errors = Vec::new();
 
@@ -86,22 +101,30 @@ pub fn validate_config(config: &KernelConfig) -> Result<(), ConfigError> {
     }
 
     if errors.is_empty() {
+        debug!("config validation passed");
         Ok(())
     } else {
+        warn!(errors = %errors.join("; "), "config validation failed");
         Err(ConfigError::Validation(errors.join("; ")))
     }
 }
 
 fn load_toml_value(path: &Path) -> Result<toml::Value, ConfigError> {
-    let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
-        path: path.display().to_string(),
-        source: e,
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        error!(path = %path.display(), error = %e, "failed to read config file");
+        ConfigError::Read {
+            path: path.display().to_string(),
+            source: e,
+        }
     })?;
     contents
         .parse::<toml::Value>()
-        .map_err(|e| ConfigError::Parse {
-            path: path.display().to_string(),
-            source: e,
+        .map_err(|e| {
+            error!(path = %path.display(), error = %e, "failed to parse config file");
+            ConfigError::Parse {
+                path: path.display().to_string(),
+                source: e,
+            }
         })
 }
 

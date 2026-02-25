@@ -1,4 +1,5 @@
 use std::path::Path;
+use tracing::{debug, error, info};
 
 use super::worktree::{list_worktrees, WorktreeError};
 
@@ -25,6 +26,7 @@ pub fn cleanup_merged_worktree(
     project_root: &Path,
     branch_name: &str,
 ) -> Result<(), WorktreeError> {
+    info!(branch = %branch_name, "cleaning up merged worktree");
     let full_branch = format!("kernel/{branch_name}");
     let worktree_path = project_root
         .join(".kernel")
@@ -37,24 +39,33 @@ pub fn cleanup_merged_worktree(
 
     // 1. Remove git worktree (non-fatal if already gone)
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    debug!(path = %worktree_path_str, "removing git worktree");
     let _ = git(project_root, &["worktree", "remove", &worktree_path_str]);
 
     // 2. Prune stale worktree bookkeeping so branch -d doesn't see a lock
+    debug!("pruning stale worktree bookkeeping");
     let _ = git(project_root, &["worktree", "prune"]);
 
     // 3. Delete branch — this is the real gate: fails if branch has unmerged commits
-    git(project_root, &["branch", "-d", &full_branch])?;
+    debug!(branch = %full_branch, "deleting branch");
+    git(project_root, &["branch", "-d", &full_branch]).map_err(|e| {
+        error!(branch = %full_branch, error = %e, "failed to delete branch (unmerged commits?)");
+        e
+    })?;
 
     // 4. Remove worktree directory if it still exists (belt-and-suspenders)
     if worktree_path.exists() {
+        debug!(path = %worktree_path.display(), "removing leftover worktree directory");
         std::fs::remove_dir_all(&worktree_path)?;
     }
 
     // 5. Remove metadata file
     if meta_file.exists() {
+        debug!(path = %meta_file.display(), "removing metadata file");
         std::fs::remove_file(&meta_file)?;
     }
 
+    info!(branch = %branch_name, "cleanup complete");
     Ok(())
 }
 
@@ -68,6 +79,7 @@ pub fn garbage_collect_worktrees(
     project_root: &Path,
     active_task_ids: &[String],
 ) -> Result<Vec<String>, WorktreeError> {
+    info!(active_tasks = active_task_ids.len(), "starting worktree garbage collection");
     let worktrees = list_worktrees(project_root)?;
     let mut removed = Vec::new();
 
@@ -79,6 +91,7 @@ pub fn garbage_collect_worktrees(
 
         if !is_active {
             let slug = wt.branch.strip_prefix("kernel/").unwrap_or(&wt.branch);
+            debug!(branch = %wt.branch, task_id = ?wt.task_id, "collecting inactive worktree");
 
             // Best-effort: log the branch as removed even if cleanup partially fails,
             // since the worktree is abandoned and should not block other cleanup.
@@ -88,6 +101,7 @@ pub fn garbage_collect_worktrees(
         }
     }
 
+    info!(removed_count = removed.len(), "garbage collection complete");
     Ok(removed)
 }
 

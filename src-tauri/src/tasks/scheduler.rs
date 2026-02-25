@@ -3,6 +3,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use super::types::{Priority, Task, TaskOutcome, TaskStatus};
@@ -22,6 +23,7 @@ impl Scheduler {
 
     /// Given the current state of tasks, return which tasks should be dispatched next.
     /// This is a pure function that reads from DB and returns task IDs to start.
+    #[instrument(skip(self, pool))]
     pub async fn select_next(
         &self,
         pool: &SqlitePool,
@@ -30,6 +32,7 @@ impl Scheduler {
         let candidates = super::db::next_unblocked(pool, session_id).await?;
         let available_slots = self.max_concurrent.saturating_sub(self.active_tasks.len());
         if available_slots == 0 {
+            debug!(%session_id, active = self.active_tasks.len(), max = self.max_concurrent, "no available slots for scheduling");
             return Ok(Vec::new());
         }
 
@@ -38,6 +41,7 @@ impl Scheduler {
 
         for task in candidates {
             if self.active_tasks.contains(&task.id) {
+                debug!(task_id = %task.id, "skipping already-active task");
                 continue;
             }
             heap.push(PrioritizedTask {
@@ -54,33 +58,40 @@ impl Scheduler {
                 break;
             };
             if let Some(task) = tasks_by_id.get(&prioritized.task_id) {
+                info!(task_id = %task.id, priority = ?task.priority, "scheduling task");
                 selected.push(task.clone());
             }
         }
 
+        debug!(%session_id, selected_count = selected.len(), "select_next complete");
         Ok(selected)
     }
 
     /// Run one scheduling cycle: pick tasks, transition them to InProgress, return them.
+    #[instrument(skip(self, pool))]
     pub async fn dispatch_cycle(
         &mut self,
         pool: &SqlitePool,
         session_id: Uuid,
     ) -> Result<Vec<Task>, SchedulerError> {
+        info!(%session_id, "starting dispatch cycle");
         let tasks_to_start = self.select_next(pool, session_id).await?;
 
         for task in &tasks_to_start {
+            info!(task_id = %task.id, priority = ?task.priority, "dispatching task to InProgress");
             super::lifecycle::apply_transition(pool, task.id, TaskStatus::InProgress, None)
                 .await
                 .map_err(map_lifecycle_err)?;
             self.mark_active(task.id);
         }
 
+        info!(%session_id, dispatched_count = tasks_to_start.len(), "dispatch cycle complete");
         Ok(tasks_to_start)
     }
 
     /// Called when a task finishes (success, failure, or block).
     /// Removes from active set and triggers cascade unblock for successful completion.
+    #[instrument(skip(self, pool, outcome))]
     pub async fn on_task_complete(
         &mut self,
         pool: &SqlitePool,
@@ -88,6 +99,7 @@ impl Scheduler {
         status: TaskStatus,
         outcome: Option<&TaskOutcome>,
     ) -> Result<Vec<Uuid>, SchedulerError> {
+        info!(%task_id, ?status, "task complete");
         self.mark_inactive(task_id);
 
         super::lifecycle::apply_transition(pool, task_id, status, outcome)
@@ -95,9 +107,11 @@ impl Scheduler {
             .map_err(map_lifecycle_err)?;
 
         if status == TaskStatus::Done {
-            super::lifecycle::cascade_unblock(pool, task_id)
+            let unblocked = super::lifecycle::cascade_unblock(pool, task_id)
                 .await
-                .map_err(map_lifecycle_err)
+                .map_err(map_lifecycle_err)?;
+            debug!(%task_id, unblocked_count = unblocked.len(), "cascade unblock after completion");
+            Ok(unblocked)
         } else {
             Ok(Vec::new())
         }
@@ -105,11 +119,13 @@ impl Scheduler {
 
     /// Mark a task as actively being worked on.
     pub fn mark_active(&mut self, task_id: Uuid) {
+        debug!(%task_id, "marking task active");
         self.active_tasks.insert(task_id);
     }
 
     /// Mark a task as no longer active (completed, failed, blocked).
     pub fn mark_inactive(&mut self, task_id: Uuid) {
+        debug!(%task_id, "marking task inactive");
         self.active_tasks.remove(&task_id);
     }
 
@@ -126,7 +142,9 @@ impl Scheduler {
 
 /// Validate a task dependency graph is acyclic using Kahn's algorithm.
 /// `edges` are `(task_id, depends_on_task_id)`.
+#[instrument(skip(tasks, edges), fields(task_count = tasks.len(), edge_count = edges.len()))]
 pub fn validate_dag(tasks: &[Task], edges: &[(Uuid, Uuid)]) -> Result<Vec<Uuid>, SchedulerError> {
+    debug!("validating task DAG");
     let mut in_degree: HashMap<Uuid, usize> = tasks.iter().map(|task| (task.id, 0)).collect();
     let mut adjacency: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
 
@@ -168,14 +186,16 @@ pub fn validate_dag(tasks: &[Task], edges: &[(Uuid, Uuid)]) -> Result<Vec<Uuid>,
     }
 
     if ordered.len() != tasks.len() {
-        let cycle_nodes = tasks
+        let cycle_nodes: Vec<Uuid> = tasks
             .iter()
             .filter(|task| in_degree.get(&task.id).copied().unwrap_or(0) > 0)
             .map(|task| task.id)
             .collect();
+        warn!(cycle_node_count = cycle_nodes.len(), "dependency cycle detected in task DAG");
         return Err(SchedulerError::CycleDetected(cycle_nodes));
     }
 
+    debug!(ordered_count = ordered.len(), "DAG validation passed");
     Ok(ordered)
 }
 

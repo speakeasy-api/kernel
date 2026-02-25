@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use tracing::{debug, error, info, instrument};
 
 use super::prompt::{self, UX_AGENT_SYSTEM_PROMPT};
 use super::store::RecommendationStore;
@@ -48,7 +49,9 @@ struct RawRecommendation {
 }
 
 impl UxAgentRuntime {
+    #[instrument(skip(invoker))]
     pub fn new(model: String, invoker: Box<dyn ModelInvoker>) -> Self {
+        info!(model = %model, "UX agent runtime created");
         Self { model, invoker }
     }
 
@@ -66,6 +69,7 @@ impl UxAgentRuntime {
     /// 6. Persist recommendations with status=Pending
     /// 7. Update cursor state
     /// 8. Return the new recommendations
+    #[instrument(skip(self, pool, summary, config_snapshot, modes_snapshot), fields(model = %self.model, trigger_count = triggers.len()))]
     pub async fn run(
         &self,
         pool: &SqlitePool,
@@ -74,12 +78,19 @@ impl UxAgentRuntime {
         config_snapshot: &str,
         modes_snapshot: &str,
     ) -> Result<Vec<Recommendation>, RuntimeError> {
+        info!(
+            model = %self.model,
+            trigger_count = triggers.len(),
+            "UX agent run starting"
+        );
         let store = RecommendationStore::new(pool.clone());
 
         // 1. Load cursor state
+        debug!("loading cursor state");
         let _cursor = store.get_cursor().await?;
 
         // 2-3. Assemble context and build prompt
+        debug!("assembling context and building prompt");
         let dismissed = store.get_dismissed_patterns().await?;
         let user_message = prompt::build_user_message(
             triggers,
@@ -90,12 +101,23 @@ impl UxAgentRuntime {
         );
 
         // 4. Invoke model
-        let response_text = self.invoker.invoke(UX_AGENT_SYSTEM_PROMPT, &user_message)?;
+        debug!(model = %self.model, "invoking model");
+        let response_text = self.invoker.invoke(UX_AGENT_SYSTEM_PROMPT, &user_message)
+            .map_err(|e| {
+                error!(model = %self.model, error = %e, "model invocation failed");
+                e
+            })?;
 
         // 5. Parse response
-        let parsed: ModelResponse = serde_json::from_str(&response_text)?;
+        debug!("parsing model response");
+        let parsed: ModelResponse = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                error!(error = %e, "failed to parse model response as JSON");
+                e
+            })?;
 
         // 6. Persist recommendations
+        debug!(count = parsed.recommendations.len(), "persisting recommendations");
         let mut recommendations = Vec::with_capacity(parsed.recommendations.len());
         for raw in parsed.recommendations {
             let rec = Recommendation {
@@ -106,10 +128,12 @@ impl UxAgentRuntime {
                 status: RecommendationStatus::Pending,
             };
             let id = store.insert(&rec).await?;
+            debug!(recommendation_id = id, trigger_pattern = %rec.trigger_pattern, "recommendation persisted");
             recommendations.push(Recommendation { id, ..rec });
         }
 
         // 7. Update cursor state
+        debug!("updating cursor state");
         let now = chrono::Utc::now().to_rfc3339();
         let new_cursor = UxAgentState {
             last_event_id: summary
@@ -123,6 +147,10 @@ impl UxAgentRuntime {
         store.set_cursor(&new_cursor).await?;
 
         // 8. Return
+        info!(
+            recommendation_count = recommendations.len(),
+            "UX agent run completed"
+        );
         Ok(recommendations)
     }
 }

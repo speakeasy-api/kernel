@@ -1,3 +1,4 @@
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::types::{AgentRole, AgentStatus, SubAgent, TokenMetrics};
@@ -38,6 +39,7 @@ pub enum TransitionContext {
 
 /// Validate that a status transition is legal.
 pub fn validate_transition(from: &AgentStatus, to: &AgentStatus) -> Result<(), String> {
+    debug!(?from, ?to, "validating transition");
     match (from, to) {
         (AgentStatus::Spawning, AgentStatus::Running)
         | (AgentStatus::Running, AgentStatus::Reporting)
@@ -46,10 +48,13 @@ pub fn validate_transition(from: &AgentStatus, to: &AgentStatus) -> Result<(), S
         | (AgentStatus::WaitingOnUser, AgentStatus::Running)
         | (AgentStatus::Reporting, AgentStatus::Complete)
         | (AgentStatus::Reporting, AgentStatus::Failed) => Ok(()),
-        _ => Err(format!(
-            "invalid agent status transition: {:?} -> {:?}",
-            from, to
-        )),
+        _ => {
+            warn!(?from, ?to, "invalid agent status transition");
+            Err(format!(
+                "invalid agent status transition: {:?} -> {:?}",
+                from, to
+            ))
+        }
     }
 }
 
@@ -65,6 +70,7 @@ impl AgentLifecycleManager {
         event_context: TransitionContext,
     ) -> Result<Option<AgentEvent>, String> {
         let from = agent.status.clone();
+        info!(agent_id = %agent.id, ?from, ?to, "agent transition");
 
         match event_context {
             TransitionContext::Looped {
@@ -72,6 +78,7 @@ impl AgentLifecycleManager {
                 count,
             } => {
                 if !matches!(from, AgentStatus::Running) {
+                    error!(agent_id = %agent.id, ?from, "looped event requires agent to be Running");
                     return Err(format!(
                         "looped event requires agent to be Running, current status: {:?}",
                         from
@@ -79,6 +86,7 @@ impl AgentLifecycleManager {
                 }
 
                 if !matches!(to, AgentStatus::Running) {
+                    error!(agent_id = %agent.id, ?to, "looped event requires target status Running");
                     return Err(format!(
                         "looped event requires target status Running, got: {:?}",
                         to
@@ -93,6 +101,7 @@ impl AgentLifecycleManager {
             }
             TransitionContext::Failed { error } => {
                 if !matches!(to, AgentStatus::Failed) {
+                    error!(agent_id = %agent.id, ?to, "failed context requires target status Failed");
                     return Err(format!(
                         "failed context requires target status Failed, got: {:?}",
                         to
@@ -108,6 +117,7 @@ impl AgentLifecycleManager {
             }
             TransitionContext::Completed { summary } => {
                 if !matches!(to, AgentStatus::Complete) {
+                    error!(agent_id = %agent.id, ?to, "completed context requires target status Complete");
                     return Err(format!(
                         "completed context requires target status Complete, got: {:?}",
                         to

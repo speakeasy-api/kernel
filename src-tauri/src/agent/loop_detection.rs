@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -68,6 +69,7 @@ impl LoopDetector {
         call: ToolCallRecord,
         retry_count: u32,
     ) -> LoopAction {
+        debug!(%agent_id, tool = %call.tool_name, "recording tool call");
         let calls = self.history.entry(agent_id).or_default();
         calls.push(call);
 
@@ -80,6 +82,7 @@ impl LoopDetector {
             return LoopAction::Continue;
         };
 
+        warn!(%agent_id, tool = %tool, count = count, action = ?retry_count, "loop detected");
         let history = self.history(&agent_id);
         match retry_count {
             0 => LoopAction::RetryWithModifiedPrompt {
@@ -106,6 +109,7 @@ impl LoopDetector {
     /// Check if the recent tool calls for an agent contain a loop pattern.
     /// Returns Some((tool_name, count)) if a loop is detected.
     fn detect_loop(&self, agent_id: &Uuid) -> Option<(String, u32)> {
+        debug!(%agent_id, "running loop detection");
         let calls = self.history.get(agent_id)?;
         if calls.len() < LOOP_THRESHOLD {
             return None;
@@ -151,6 +155,7 @@ impl LoopDetector {
 
     /// Clear history for an agent (call when agent completes or fails).
     pub fn clear(&mut self, agent_id: &Uuid) {
+        debug!(%agent_id, "clearing agent history");
         self.history.remove(agent_id);
     }
 

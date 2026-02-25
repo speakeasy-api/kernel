@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument};
 
 use super::classify::{classify, ClassificationError, LlmClient};
 use super::model_registry::ModelInfo;
@@ -50,12 +51,15 @@ pub struct ReclassificationResult {
 /// This function reuses the existing classify() function but wraps it
 /// with reclassification-specific logic: it compares the new classification
 /// against the current mode and reports whether a switch is needed.
+#[instrument(skip(request, llm_client, available_models), fields(current_mode = %request.current_mode, trigger = ?request.trigger))]
 pub fn reclassify(
     request: &ReclassificationRequest,
     llm_client: &dyn LlmClient,
     router_model: &str,
     available_models: &[ModelInfo],
 ) -> Result<ReclassificationResult, ClassificationError> {
+    info!(current_mode = %request.current_mode, "reclassification attempt");
+
     let router_input = RouterInput {
         source: PromptSource::User,
         prompt: request.prompt.clone(),
@@ -66,6 +70,13 @@ pub fn reclassify(
 
     let new_output = classify(&router_input, llm_client, router_model, available_models)?;
     let mode_changed = new_output.mode != request.current_mode;
+
+    debug!(
+        new_mode = %new_output.mode,
+        mode_changed,
+        confidence = new_output.confidence,
+        "reclassification result"
+    );
 
     Ok(ReclassificationResult {
         new_output,

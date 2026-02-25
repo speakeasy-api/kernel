@@ -1,5 +1,7 @@
 use std::fmt::Write;
 
+use tracing::{debug, instrument};
+
 use super::triggers::{EventSummary, TriggerReason};
 
 pub const UX_AGENT_SYSTEM_PROMPT: &str = r#"You are Kernel's UX Agent, a background assistant that analyzes usage patterns and makes recommendations to improve the user's workflow.
@@ -42,6 +44,7 @@ Action variant fields:
 If there is nothing to recommend, return: { "recommendations": [] }
 "#;
 
+#[instrument(skip(summary, config_snapshot, modes_snapshot, dismissed_patterns), fields(trigger_count = triggers.len(), dismissed_count = dismissed_patterns.len()))]
 pub fn build_user_message(
     triggers: &[TriggerReason],
     summary: &EventSummary,
@@ -49,6 +52,12 @@ pub fn build_user_message(
     modes_snapshot: &str,
     dismissed_patterns: &[String],
 ) -> String {
+    debug!(
+        trigger_count = triggers.len(),
+        rejection_count = summary.rejection_count,
+        dismissed_count = dismissed_patterns.len(),
+        "building UX prompt user message"
+    );
     let mut msg = String::with_capacity(1024);
 
     // Triggers
@@ -104,7 +113,9 @@ pub fn build_user_message(
     msg
 }
 
+#[instrument]
 fn format_trigger(trigger: &TriggerReason) -> String {
+    debug!(?trigger, "formatting trigger for prompt");
     match trigger {
         TriggerReason::RejectionsAccumulated { count } => {
             format!("{count} rejections accumulated")

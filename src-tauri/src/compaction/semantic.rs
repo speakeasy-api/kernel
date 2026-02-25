@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::Deserialize;
+use tracing::{debug, error, info, instrument};
 
 use super::budget::{estimate_message_tokens, ContextBudget, Message};
 use super::preservation::PreservationRules;
@@ -49,17 +50,21 @@ impl<C: LlmClient> SemanticCompactor<C> {
 
     /// Run deep compaction on the message list.
     /// Returns a compacted message list targeting budget.target_after_compaction.
+    #[instrument(skip_all, fields(message_count = messages.len()))]
     pub async fn compact(
         &self,
         messages: &[Message],
         preservation_rules: &PreservationRules,
     ) -> Result<CompactedContext, CompactionError> {
+        info!(message_count = messages.len(), "starting semantic compaction");
         let preserved_facts = preservation_rules.extract_preserved_facts(messages);
         let target_tokens = self.budget.target_token_count();
+        debug!(target_tokens, preserved_facts = preserved_facts.len(), "compaction parameters");
 
         let (system_prompt, user_prompt) =
             build_compaction_prompt(messages, target_tokens, &preserved_facts);
 
+        debug!("sending compaction prompt to LLM");
         let response = self.client.complete(&system_prompt, &user_prompt).await?;
 
         let parsed = parse_compactor_response(&response)?;
@@ -76,11 +81,20 @@ impl<C: LlmClient> SemanticCompactor<C> {
         let token_count = estimate_message_tokens(&compacted_messages);
 
         if token_count > target_tokens {
+            error!(actual = token_count, target = target_tokens, "compacted output still over budget");
             return Err(CompactionError::StillOverBudget {
                 actual: token_count,
                 target: target_tokens,
             });
         }
+
+        info!(
+            before_messages = messages.len(),
+            after_messages = compacted_messages.len(),
+            token_count,
+            learnings = parsed.learnings.len(),
+            "semantic compaction complete"
+        );
 
         Ok(CompactedContext {
             messages: compacted_messages,

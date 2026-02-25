@@ -1,4 +1,5 @@
 use sqlx::SqlitePool;
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
 /// Cost thresholds from configuration.
@@ -53,11 +54,13 @@ pub enum CostCheckResult {
 }
 
 /// Add cost to a task and return the new total cost for that task.
+#[instrument(skip(pool))]
 pub async fn record_task_cost(
     pool: &SqlitePool,
     task_id: Uuid,
     cost_increment_usd: f64,
 ) -> Result<f64, sqlx::Error> {
+    debug!(%task_id, cost_increment_usd, "recording task cost increment");
     sqlx::query(
         "UPDATE tasks SET cost_usd = cost_usd + ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
     )
@@ -70,27 +73,33 @@ pub async fn record_task_cost(
         .bind(task_id.to_string())
         .fetch_one(pool)
         .await?;
+    debug!(%task_id, new_total_usd = row.0, "task cost recorded");
     Ok(row.0)
 }
 
 /// Get total cost for all tasks in a session.
+#[instrument(skip(pool))]
 pub async fn session_cost(pool: &SqlitePool, session_id: Uuid) -> Result<f64, sqlx::Error> {
+    debug!(%session_id, "calculating session cost");
     let row: (f64,) =
         sqlx::query_as("SELECT COALESCE(SUM(cost_usd), 0.0) FROM tasks WHERE session_id = ?1")
             .bind(session_id.to_string())
             .fetch_one(pool)
             .await?;
+    debug!(%session_id, cost_usd = row.0, "session cost calculated");
     Ok(row.0)
 }
 
 /// Check thresholds for a specific task and its session.
 /// Returns the most severe violation found: hard limit > warning > ok.
+#[instrument(skip(pool, thresholds))]
 pub async fn check_cost(
     pool: &SqlitePool,
     task_id: Uuid,
     session_id: Uuid,
     thresholds: &CostThresholds,
 ) -> Result<CostCheckResult, sqlx::Error> {
+    debug!(%task_id, %session_id, "checking cost thresholds");
     let row: (f64,) = sqlx::query_as("SELECT cost_usd FROM tasks WHERE id = ?1")
         .bind(task_id.to_string())
         .fetch_one(pool)
@@ -99,6 +108,7 @@ pub async fn check_cost(
 
     // Hard limits are enforced immediately (>=) with no grace period.
     if task_cost >= thresholds.hard_limit_task_usd {
+        warn!(%task_id, task_cost, limit = thresholds.hard_limit_task_usd, "task cost hard limit reached");
         return Ok(CostCheckResult::TaskHardLimit {
             task_id,
             cost_usd: task_cost,
@@ -109,6 +119,7 @@ pub async fn check_cost(
     let session_cost_total = session_cost(pool, session_id).await?;
 
     if session_cost_total >= thresholds.hard_limit_session_usd {
+        warn!(%session_id, session_cost_total, limit = thresholds.hard_limit_session_usd, "session cost hard limit reached");
         return Ok(CostCheckResult::SessionHardLimit {
             session_id,
             cost_usd: session_cost_total,
@@ -117,6 +128,7 @@ pub async fn check_cost(
     }
 
     if task_cost >= thresholds.warn_at_task_usd {
+        warn!(%task_id, task_cost, threshold = thresholds.warn_at_task_usd, "task cost warning threshold exceeded");
         return Ok(CostCheckResult::TaskWarning {
             task_id,
             cost_usd: task_cost,
@@ -125,6 +137,7 @@ pub async fn check_cost(
     }
 
     if session_cost_total >= thresholds.warn_at_session_usd {
+        warn!(%session_id, session_cost_total, threshold = thresholds.warn_at_session_usd, "session cost warning threshold exceeded");
         return Ok(CostCheckResult::SessionWarning {
             session_id,
             cost_usd: session_cost_total,
@@ -132,6 +145,7 @@ pub async fn check_cost(
         });
     }
 
+    debug!(%task_id, %session_id, "cost check passed — all thresholds ok");
     Ok(CostCheckResult::Ok)
 }
 
@@ -148,6 +162,7 @@ pub enum CostAction {
 }
 
 pub fn enforcement_action(check: &CostCheckResult) -> CostAction {
+    debug!(?check, "determining enforcement action");
     match check {
         CostCheckResult::Ok => CostAction::Continue,
         CostCheckResult::TaskWarning {

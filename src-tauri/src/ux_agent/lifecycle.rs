@@ -2,6 +2,7 @@ use std::error::Error;
 
 use serde_json::json;
 use sqlx::SqlitePool;
+use tracing::{debug, error, info, instrument, warn};
 
 use super::store::RecommendationStore;
 use super::types::{ModeChanges, RecommendationAction, RecommendationStatus};
@@ -86,20 +87,30 @@ impl LifecycleManager {
     /// 3. Execute the action side-effect
     /// 4. Save version record with snapshot
     /// 5. Update recommendation status to Applied
+    #[instrument(skip(pool, mode_ops, config_ops))]
     pub async fn apply(
         pool: &SqlitePool,
         recommendation_id: u64,
         mode_ops: &dyn ModeOperations,
         config_ops: &dyn ConfigOperations,
     ) -> LifecycleResult<()> {
+        info!(recommendation_id, "applying recommendation");
         let store = RecommendationStore::new(pool.clone());
 
         let rec = store
             .get(recommendation_id)
             .await?
-            .ok_or_else(|| lifecycle_error(&format!("recommendation {recommendation_id} not found")))?;
+            .ok_or_else(|| {
+                error!(recommendation_id, "recommendation not found");
+                lifecycle_error(&format!("recommendation {recommendation_id} not found"))
+            })?;
 
         if rec.status != RecommendationStatus::Pending {
+            error!(
+                recommendation_id,
+                status = %rec.status,
+                "cannot apply recommendation in non-Pending status"
+            );
             return Err(lifecycle_error(&format!(
                 "cannot apply recommendation in {} status, expected Pending",
                 rec.status
@@ -115,6 +126,11 @@ impl LifecycleManager {
         store.insert_version(recommendation_id, next_version, &snapshot).await?;
         store.update_status(recommendation_id, RecommendationStatus::Applied).await?;
 
+        info!(
+            recommendation_id,
+            version = next_version,
+            "recommendation applied successfully"
+        );
         Ok(())
     }
 
@@ -122,15 +138,25 @@ impl LifecycleManager {
     ///
     /// 1. Validate recommendation is in Pending status
     /// 2. Update status to Dismissed
+    #[instrument(skip(pool))]
     pub async fn dismiss(pool: &SqlitePool, recommendation_id: u64) -> LifecycleResult<()> {
+        info!(recommendation_id, "dismissing recommendation");
         let store = RecommendationStore::new(pool.clone());
 
         let rec = store
             .get(recommendation_id)
             .await?
-            .ok_or_else(|| lifecycle_error(&format!("recommendation {recommendation_id} not found")))?;
+            .ok_or_else(|| {
+                error!(recommendation_id, "recommendation not found");
+                lifecycle_error(&format!("recommendation {recommendation_id} not found"))
+            })?;
 
         if rec.status != RecommendationStatus::Pending {
+            error!(
+                recommendation_id,
+                status = %rec.status,
+                "cannot dismiss recommendation in non-Pending status"
+            );
             return Err(lifecycle_error(&format!(
                 "cannot dismiss recommendation in {} status, expected Pending",
                 rec.status
@@ -139,6 +165,7 @@ impl LifecycleManager {
 
         store.update_status(recommendation_id, RecommendationStatus::Dismissed).await?;
 
+        info!(recommendation_id, "recommendation dismissed");
         Ok(())
     }
 
@@ -149,20 +176,30 @@ impl LifecycleManager {
     /// 3. Apply the snapshot (restore previous state)
     /// 4. Mark version as reverted
     /// 5. Update recommendation status to Reverted
+    #[instrument(skip(pool, mode_ops, config_ops))]
     pub async fn revert(
         pool: &SqlitePool,
         recommendation_id: u64,
         mode_ops: &dyn ModeOperations,
         config_ops: &dyn ConfigOperations,
     ) -> LifecycleResult<()> {
+        info!(recommendation_id, "reverting recommendation");
         let store = RecommendationStore::new(pool.clone());
 
         let rec = store
             .get(recommendation_id)
             .await?
-            .ok_or_else(|| lifecycle_error(&format!("recommendation {recommendation_id} not found")))?;
+            .ok_or_else(|| {
+                error!(recommendation_id, "recommendation not found");
+                lifecycle_error(&format!("recommendation {recommendation_id} not found"))
+            })?;
 
         if rec.status != RecommendationStatus::Applied {
+            error!(
+                recommendation_id,
+                status = %rec.status,
+                "cannot revert recommendation in non-Applied status"
+            );
             return Err(lifecycle_error(&format!(
                 "cannot revert recommendation in {} status, expected Applied",
                 rec.status
@@ -172,21 +209,31 @@ impl LifecycleManager {
         let versions = store.get_versions(recommendation_id).await?;
         let latest = versions
             .last()
-            .ok_or_else(|| lifecycle_error("no version records found for applied recommendation"))?;
+            .ok_or_else(|| {
+                error!(recommendation_id, "no version records found for applied recommendation");
+                lifecycle_error("no version records found for applied recommendation")
+            })?;
 
         restore_snapshot(&rec.action, &latest.snapshot, mode_ops, config_ops)?;
         store.mark_version_reverted(latest.id).await?;
         store.update_status(recommendation_id, RecommendationStatus::Reverted).await?;
 
+        info!(
+            recommendation_id,
+            version_id = latest.id,
+            "recommendation reverted successfully"
+        );
         Ok(())
     }
 }
 
+#[instrument(skip(mode_ops, _config_ops))]
 fn capture_snapshot(
     action: &RecommendationAction,
     mode_ops: &dyn ModeOperations,
     _config_ops: &dyn ConfigOperations,
 ) -> LifecycleResult<String> {
+    debug!(?action, "capturing snapshot before action");
     let snapshot = match action {
         RecommendationAction::ModeCreate { .. } => {
             json!({"existed": false}).to_string()
@@ -211,11 +258,13 @@ fn capture_snapshot(
     Ok(snapshot)
 }
 
+#[instrument(skip(mode_ops, config_ops))]
 fn execute_action(
     action: &RecommendationAction,
     mode_ops: &dyn ModeOperations,
     config_ops: &dyn ConfigOperations,
 ) -> LifecycleResult<()> {
+    info!(?action, "executing recommendation action");
     match action {
         RecommendationAction::ModeCreate {
             name,
@@ -252,12 +301,14 @@ fn execute_action(
     Ok(())
 }
 
+#[instrument(skip(snapshot, mode_ops, config_ops))]
 fn restore_snapshot(
     action: &RecommendationAction,
     snapshot: &str,
     mode_ops: &dyn ModeOperations,
     config_ops: &dyn ConfigOperations,
 ) -> LifecycleResult<()> {
+    info!(?action, "restoring snapshot");
     match action {
         RecommendationAction::ModeCreate { name, .. } => {
             mode_ops.restore_mode_snapshot(name, snapshot)?;

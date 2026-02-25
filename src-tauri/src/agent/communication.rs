@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::types::{AgentRole, TokenMetrics};
@@ -81,6 +82,7 @@ impl SummaryBuilder {
     }
 
     pub fn build_success(self, summary: String) -> AgentSummary {
+        info!(agent_id = %self.agent_id, outcome = "success", "building agent summary");
         AgentSummary {
             agent_id: self.agent_id,
             role: self.role,
@@ -94,6 +96,7 @@ impl SummaryBuilder {
     }
 
     pub fn build_partial(self, summary: String, issues: Vec<String>) -> AgentSummary {
+        info!(agent_id = %self.agent_id, outcome = "partial", issue_count = issues.len(), "building agent summary");
         AgentSummary {
             agent_id: self.agent_id,
             role: self.role,
@@ -107,6 +110,7 @@ impl SummaryBuilder {
     }
 
     pub fn build_failure(self, error: String, attempted: String) -> AgentSummary {
+        info!(agent_id = %self.agent_id, outcome = "failure", "building agent summary");
         AgentSummary {
             agent_id: self.agent_id,
             role: self.role,
@@ -135,12 +139,14 @@ impl OrchestratorContext {
 
     /// Add a child agent's summary.
     pub fn add_summary(&mut self, summary: AgentSummary) {
+        debug!(agent_id = %summary.agent_id, role = ?summary.role, "adding agent summary");
         self.child_summaries.push(summary);
     }
 
     /// Format all summaries into a single text block suitable for
     /// embedding into the orchestrator's context/prompt.
     pub fn format_for_context(&self) -> String {
+        debug!(child_count = self.child_summaries.len(), "formatting context");
         let mut output = String::from("## Agent Results\n\n");
 
         for summary in &self.child_summaries {
@@ -182,10 +188,12 @@ impl OrchestratorContext {
 
     /// Get all failed summaries (for orchestrator to decide on retries).
     pub fn failed_summaries(&self) -> Vec<&AgentSummary> {
-        self.child_summaries
+        let failed: Vec<&AgentSummary> = self.child_summaries
             .iter()
             .filter(|summary| matches!(summary.outcome, AgentOutcome::Failure { .. }))
-            .collect()
+            .collect();
+        debug!(count = failed.len(), "failed summaries");
+        failed
     }
 
     /// Get all learnings aggregated across all child agents.
@@ -198,9 +206,11 @@ impl OrchestratorContext {
 
     /// Check if all children succeeded.
     pub fn all_succeeded(&self) -> bool {
-        self.child_summaries
+        let result = self.child_summaries
             .iter()
-            .all(|summary| matches!(summary.outcome, AgentOutcome::Success { .. }))
+            .all(|summary| matches!(summary.outcome, AgentOutcome::Success { .. }));
+        debug!(all_succeeded = result, "all succeeded check");
+        result
     }
 
     /// Count of summaries.
@@ -217,6 +227,7 @@ impl Default for OrchestratorContext {
 
 impl From<AgentSummary> for super::orchestrator::AgentReport {
     fn from(summary: AgentSummary) -> Self {
+        debug!(agent_id = %summary.agent_id, "converting summary to report");
         let (success, summary_text, error) = match &summary.outcome {
             AgentOutcome::Success { summary } => (true, summary.clone(), None),
             AgentOutcome::PartialSuccess { summary, .. } => (true, summary.clone(), None),

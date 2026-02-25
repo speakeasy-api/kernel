@@ -4,6 +4,7 @@ use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 use super::types::{ContentBlock, Message, Role, ToolDefinition, Usage};
 
@@ -58,6 +59,7 @@ pub struct LlmClient2 {
 impl LlmClient2 {
     /// Build from explicit values.
     pub fn new(api_key: String, base_url: String, auth_style: AuthStyle) -> Self {
+        info!(base_url = %base_url, auth_style = ?auth_style, "creating LLM client");
         Self {
             http: reqwest::Client::new(),
             api_key,
@@ -71,6 +73,7 @@ impl LlmClient2 {
     /// Looks up `provider_name` in the config. Falls back to env-var
     /// detection if the provider isn't configured.
     pub fn from_config(models_config: &ModelsConfig, provider_name: &str) -> Result<Self, String> {
+        debug!(provider = %provider_name, "resolving LLM provider from config");
         if let Some(pc) = models_config.providers.get(provider_name) {
             return Self::from_provider_config(provider_name, pc);
         }
@@ -80,6 +83,7 @@ impl LlmClient2 {
 
     /// Build from a single `ProviderConfig` entry.
     fn from_provider_config(name: &str, pc: &ProviderConfig) -> Result<Self, String> {
+        debug!(name = %name, "building client from provider config");
         let env_var = pc
             .api_key_env
             .as_deref()
@@ -98,6 +102,7 @@ impl LlmClient2 {
     /// Auto-detect from environment variables.
     /// Checks OPENROUTER_API_KEY, then ANTHROPIC_API_KEY.
     pub fn from_env() -> Result<Self, String> {
+        debug!("auto-detecting LLM provider from env");
         if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
             return Ok(Self::new(
                 key,
@@ -146,16 +151,20 @@ impl LlmClient2 {
     /// Normalize a model ID for the current provider.
     /// OpenRouter requires `anthropic/` prefix and full model IDs.
     fn normalize_model(&self, model: &str) -> String {
-        if self.auth_style == AuthStyle::ApiKey {
+        let result = if self.auth_style == AuthStyle::ApiKey {
             // Native Anthropic — pass through as-is
-            return model.to_string();
-        }
-        // OpenRouter / Bearer providers need `anthropic/` prefix
-        if model.contains('/') { model.to_string() } else { format!("anthropic/{model}") }
+            model.to_string()
+        } else {
+            // OpenRouter / Bearer providers need `anthropic/` prefix
+            if model.contains('/') { model.to_string() } else { format!("anthropic/{model}") }
+        };
+        debug!(input = %model, output = %result, "normalizing model");
+        result
     }
 
     /// Non-streaming completion for classification.
     pub async fn complete_async(&self, prompt: &str, model: &str) -> Result<String, String> {
+        debug!(model = %model, "completing async");
         self.complete_with_usage(prompt, model)
             .await
             .map(|r| r.text)
@@ -167,6 +176,7 @@ impl LlmClient2 {
         prompt: &str,
         model: &str,
     ) -> Result<CompletionResult, String> {
+        info!(model = %model, "completing with usage tracking");
         let model = self.normalize_model(model);
         let body = serde_json::json!({
             "model": model,
@@ -192,7 +202,9 @@ impl LlmClient2 {
             .map_err(|e| format!("Failed to read response: {e}"))?;
 
         if !status.is_success() {
-            return Err(format_api_error(status, &text));
+            let err = format_api_error(status, &text);
+            error!(model = %model, status = %status, error = %err, "completion request failed");
+            return Err(err);
         }
 
         let json: Value =
@@ -206,6 +218,12 @@ impl LlmClient2 {
             .ok_or_else(|| format!("Unexpected response structure: {text}"))?;
 
         let usage: Usage = serde_json::from_value(json["usage"].clone()).unwrap_or_default();
+
+        debug!(
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            "completion usage"
+        );
 
         Ok(CompletionResult {
             text: content_text,
@@ -222,6 +240,7 @@ impl LlmClient2 {
         model: &str,
         max_tokens: u32,
     ) -> Result<String, String> {
+        debug!(model = %model, max_tokens = max_tokens, "completing with system prompt");
         let model = self.normalize_model(model);
         let body = serde_json::json!({
             "model": model,
@@ -248,7 +267,9 @@ impl LlmClient2 {
             .map_err(|e| format!("Failed to read response: {e}"))?;
 
         if !status.is_success() {
-            return Err(format_api_error(status, &text));
+            let err = format_api_error(status, &text);
+            error!(model = %model, status = %status, error = %err, "system completion request failed");
+            return Err(err);
         }
 
         let json: Value =
@@ -267,6 +288,12 @@ impl LlmClient2 {
         &self,
         req: &StreamRequest<'_>,
     ) -> Result<mpsc::Receiver<StreamChunk>, String> {
+        info!(
+            model = %req.model,
+            max_tokens = req.max_tokens,
+            tools_count = req.tools.len(),
+            "starting streaming request"
+        );
         let model = self.normalize_model(req.model);
 
         let messages_json: Vec<Value> = req
@@ -319,9 +346,12 @@ impl LlmClient2 {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unknown error".into());
-            return Err(format_api_error(status, &text));
+            let err = format_api_error(status, &text);
+            error!(status = %status, error = %err, "stream request failed");
+            return Err(err);
         }
 
+        debug!("stream channel established");
         let (tx, rx) = mpsc::channel::<StreamChunk>(64);
         let mut stream = resp.bytes_stream();
 
@@ -344,6 +374,7 @@ impl LlmClient2 {
                                 }
                                 if let Ok(json) = serde_json::from_str::<Value>(data) {
                                     if let Some(chunk) = parse_sse_event(&json) {
+                                        debug!("stream chunk received");
                                         if tx.send(chunk).await.is_err() {
                                             return;
                                         }
@@ -353,6 +384,7 @@ impl LlmClient2 {
                         }
                     }
                     Err(e) => {
+                        warn!(error = %e, "stream error");
                         let _ = tx
                             .send(StreamChunk::Error {
                                 message: e.to_string(),
@@ -375,6 +407,7 @@ impl LlmClient2 {
         user_msg: &str,
         model: &str,
     ) -> Result<mpsc::Receiver<StreamChunk>, String> {
+        debug!(model = %model, "streaming single message");
         let messages = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -475,6 +508,7 @@ fn parse_sse_event(json: &Value) -> Option<StreamChunk> {
 
 impl LlmClient for LlmClient2 {
     fn complete(&self, prompt: &str, model: &str) -> Result<String, ClassificationError> {
+        debug!(model = %model, "sync LLM complete");
         // dispatch() runs inside spawn_blocking, so block_on is safe here.
         let handle = tokio::runtime::Handle::current();
         handle

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use tracing::debug;
+
 use super::orchestrator::RoleModelDefaults;
 use super::types::AgentRole;
 
@@ -39,31 +41,36 @@ pub fn route_model(
     role: &AgentRole,
     explicit_override: Option<&str>,
 ) -> String {
-    if let Some(model) = explicit_override {
-        return model.to_string();
-    }
-
-    config
-        .role_defaults
-        .get(role)
-        .cloned()
-        .unwrap_or_else(|| config.fallback_model.clone())
+    let model = if let Some(model) = explicit_override {
+        model.to_string()
+    } else {
+        config
+            .role_defaults
+            .get(role)
+            .cloned()
+            .unwrap_or_else(|| config.fallback_model.clone())
+    };
+    debug!(?role, ?explicit_override, result = %model, "routing model");
+    model
 }
 
 /// Suggest the default mode for a given agent role.
 pub fn default_mode_for_role(role: &AgentRole) -> &'static str {
-    match role {
+    let mode = match role {
         AgentRole::Orchestrator => "plan",
         AgentRole::Research => "research",
         AgentRole::Implementation => "implement",
         AgentRole::Test => "implement",
         AgentRole::Review => "review",
         AgentRole::Unstuck => "debug",
-    }
+    };
+    debug!(?role, mode, "default mode for role");
+    mode
 }
 
 /// Default tool permissions for a given agent role.
 pub fn default_tools_for_role(role: &AgentRole) -> Vec<String> {
+    debug!(?role, "default tools for role");
     match role {
         AgentRole::Orchestrator => vec![],
         AgentRole::Research => vec!["fs_read", "glob", "grep", "web_search", "web_fetch"]

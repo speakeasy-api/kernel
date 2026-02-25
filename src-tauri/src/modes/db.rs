@@ -1,4 +1,5 @@
 use sqlx::SqlitePool;
+use tracing::{debug, error, info, instrument, warn};
 
 use super::types::{Mode, ModeOrigin};
 
@@ -41,17 +42,22 @@ fn row_to_mode(row: ModeRow) -> Mode {
     }
 }
 
+#[instrument(skip(pool))]
 pub async fn list_modes(pool: &SqlitePool) -> Result<Vec<Mode>, sqlx::Error> {
+    debug!("listing all modes");
     let rows = sqlx::query_as::<_, ModeRow>(
         "SELECT name, description, system_prompt, default_model, allowed_tools, origin, version
          FROM modes",
     )
     .fetch_all(pool)
     .await?;
+    debug!(count = rows.len(), "modes listed");
     Ok(rows.into_iter().map(row_to_mode).collect())
 }
 
+#[instrument(skip(pool))]
 pub async fn get_mode(pool: &SqlitePool, name: &str) -> Result<Option<Mode>, sqlx::Error> {
+    debug!(name, "getting mode");
     let row = sqlx::query_as::<_, ModeRow>(
         "SELECT name, description, system_prompt, default_model, allowed_tools, origin, version
          FROM modes WHERE name = ?1",
@@ -59,10 +65,15 @@ pub async fn get_mode(pool: &SqlitePool, name: &str) -> Result<Option<Mode>, sql
     .bind(name)
     .fetch_optional(pool)
     .await?;
+    if row.is_none() {
+        debug!(name, "mode not found");
+    }
     Ok(row.map(row_to_mode))
 }
 
+#[instrument(skip(pool, mode), fields(name = %mode.name))]
 pub async fn create_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Error> {
+    info!(name = %mode.name, origin = %mode.created_by, "creating mode");
     let tools_json = serde_json::to_string(&mode.allowed_tools).unwrap();
     sqlx::query(
         "INSERT INTO modes (name, description, system_prompt, default_model, allowed_tools, origin, version)
@@ -80,11 +91,13 @@ pub async fn create_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Err
     Ok(())
 }
 
+#[instrument(skip(pool, mode), fields(name))]
 pub async fn update_mode(
     pool: &SqlitePool,
     name: &str,
     mode: &Mode,
 ) -> Result<(), ModeError> {
+    info!(name, "updating mode");
     let tools_json = serde_json::to_string(&mode.allowed_tools).unwrap();
     let result = sqlx::query(
         "UPDATE modes SET description = ?1, system_prompt = ?2, default_model = ?3,
@@ -101,11 +114,14 @@ pub async fn update_mode(
     .execute(pool)
     .await?;
     if result.rows_affected() == 0 {
+        warn!(name, "mode not found for update");
         return Err(ModeError::NotFound(name.to_string()));
     }
+    debug!(name, "mode updated");
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn delete_mode(pool: &SqlitePool, name: &str) -> Result<bool, ModeError> {
     let origin: Option<(String,)> =
         sqlx::query_as("SELECT origin FROM modes WHERE name = ?1")
@@ -114,8 +130,12 @@ pub async fn delete_mode(pool: &SqlitePool, name: &str) -> Result<bool, ModeErro
             .await?;
 
     match origin {
-        None => Ok(false),
+        None => {
+            debug!(name, "mode not found for deletion");
+            Ok(false)
+        }
         Some((ref o,)) if o == "builtin" => {
+            warn!(name, "attempted to delete builtin mode");
             Err(ModeError::CannotDeleteBuiltin(name.to_string()))
         }
         Some(_) => {
@@ -123,12 +143,15 @@ pub async fn delete_mode(pool: &SqlitePool, name: &str) -> Result<bool, ModeErro
                 .bind(name)
                 .execute(pool)
                 .await?;
+            info!(name, "mode deleted");
             Ok(true)
         }
     }
 }
 
+#[instrument(skip(pool, mode), fields(name = %mode.name))]
 pub async fn upsert_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Error> {
+    debug!(name = %mode.name, "upserting mode");
     let tools_json = serde_json::to_string(&mode.allowed_tools).unwrap();
     sqlx::query(
         "INSERT INTO modes (name, description, system_prompt, default_model, allowed_tools, origin, version)

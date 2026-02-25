@@ -1,11 +1,14 @@
 use sqlx::SqlitePool;
+use tracing::{debug, info, instrument};
 
 use super::models::RetentionReport;
 
+#[instrument(skip(pool))]
 pub async fn run_retention(
     pool: &SqlitePool,
     raw_ttl_days: u32,
 ) -> Result<RetentionReport, sqlx::Error> {
+    info!(ttl_days = raw_ttl_days, "running retention cleanup");
     let cutoff = format!("-{raw_ttl_days} days");
 
     let eligible_session_clause =
@@ -20,6 +23,7 @@ pub async fn run_retention(
     .bind(&cutoff)
     .execute(pool)
     .await?;
+    debug!(count = events_result.rows_affected(), "deleted old events");
 
     // 2. Delete old agents (null out parent_agent_id first)
     sqlx::query(&format!(
@@ -39,6 +43,7 @@ pub async fn run_retention(
     .bind(&cutoff)
     .execute(pool)
     .await?;
+    debug!(count = agents_result.rows_affected(), "deleted old agents");
 
     // 3. Delete old tasks (clean up task_deps and parent_task FKs first)
     sqlx::query(&format!(
@@ -74,6 +79,7 @@ pub async fn run_retention(
     .bind(&cutoff)
     .execute(pool)
     .await?;
+    debug!(count = tasks_result.rows_affected(), "deleted old tasks");
 
     // 4. Delete old sessions with no remaining children
     let sessions_result = sqlx::query(
@@ -86,6 +92,15 @@ pub async fn run_retention(
     .bind(&cutoff)
     .execute(pool)
     .await?;
+    debug!(count = sessions_result.rows_affected(), "deleted old sessions");
+
+    info!(
+        events = events_result.rows_affected(),
+        agents = agents_result.rows_affected(),
+        tasks = tasks_result.rows_affected(),
+        sessions = sessions_result.rows_affected(),
+        "retention complete"
+    );
 
     Ok(RetentionReport {
         events_deleted: events_result.rows_affected(),

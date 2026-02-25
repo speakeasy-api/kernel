@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::orchestrator::SpawnRequest;
@@ -52,6 +53,7 @@ impl BranchManager {
         context: CompactedContextRef,
         default_model: &str,
     ) -> Vec<SpawnRequest> {
+        info!(count = config.parallel_count, "creating branch requests");
         (0..config.parallel_count)
             .map(|i| {
                 let model = if config.models.is_empty() {
@@ -81,6 +83,7 @@ impl BranchManager {
 
     /// Create a new branch session from config and prompt.
     pub fn create_session(config: BranchConfig, prompt: String) -> BranchSession {
+        info!(parallel_count = config.parallel_count, "creating branch session");
         assert!(
             config.parallel_count >= 2,
             "branching mode requires parallel_count >= 2"
@@ -98,6 +101,7 @@ impl BranchManager {
 
     /// Record a branch agent spawn in the session.
     pub fn record_spawn(session: &mut BranchSession, agent_id: Uuid) {
+        debug!(%agent_id, "recording branch spawn");
         session.branch_agent_ids.push(agent_id);
         if session.status == BranchStatus::Preparing {
             session.status = BranchStatus::Running;
@@ -106,6 +110,7 @@ impl BranchManager {
 
     /// Record a branch completion result in the session.
     pub fn record_result(session: &mut BranchSession, result: BranchResult) {
+        debug!(agent_id = %result.agent_id, success = result.success, "recording branch result");
         if let Some(existing) = session
             .results
             .iter_mut()
@@ -144,10 +149,12 @@ impl BranchManager {
         } else {
             BranchStatus::PartiallyCompleted
         };
+        debug!(new_status = ?session.status, "updating branch status");
     }
 
     /// Return ranked results (rank if available, otherwise cost efficiency).
     pub fn ranked_results(session: &BranchSession) -> Vec<&BranchResult> {
+        debug!(result_count = session.results.len(), auto_rank = session.config.auto_rank, "ranking branch results");
         let mut ordered: Vec<&BranchResult> = session.results.iter().collect();
 
         if session.config.auto_rank && session.results.iter().any(|result| result.rank.is_some()) {
@@ -174,12 +181,14 @@ impl BranchManager {
 
     /// Sum token usage across all branch results.
     pub fn total_tokens(session: &BranchSession) -> TokenMetrics {
-        session
+        let totals = session
             .results
             .iter()
             .fold(TokenMetrics::default(), |acc, result| {
                 acc + result.token_usage.clone()
-            })
+            });
+        debug!(input = totals.input, output = totals.output, cost_usd = totals.cost_usd, "branch total tokens");
+        totals
     }
 }
 

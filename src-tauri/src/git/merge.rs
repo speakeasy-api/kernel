@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tracing::{debug, error, info, warn};
 
 use super::diff::{parse_unified_diff, FileDiff, Hunk};
 
@@ -118,6 +119,12 @@ pub fn merge_to_target(
     merge_target_ref: &str,
     strategy: MergeStrategy,
 ) -> Result<String, MergeError> {
+    info!(
+        branch = %branch,
+        target = %merge_target_ref,
+        strategy = ?strategy,
+        "merging branch to target"
+    );
     // Work from the project root (not a worktree) so we can checkout the target
     git(project_root, &["checkout", merge_target_ref])?;
 
@@ -130,16 +137,23 @@ pub fn merge_to_target(
     // On conflict, abort the in-progress merge/cherry-pick before returning.
     // Squash merges don't set MERGE_HEAD, so --abort won't work; reset --merge
     // handles all cases.
-    if let Err(MergeError::Conflict(_)) = &result {
+    if let Err(MergeError::Conflict(ref files)) = &result {
+        warn!(conflicting_files = ?files, "merge conflict detected");
         let _ = git_try(project_root, &["merge", "--abort"]);
         let _ = git_try(project_root, &["cherry-pick", "--abort"]);
         let _ = git_try(project_root, &["reset", "--merge"]);
+    }
+
+    match &result {
+        Ok(sha) => info!(commit = %sha, "merge complete"),
+        Err(e) => error!(error = %e, "merge failed"),
     }
 
     result
 }
 
 fn do_squash_merge(dir: &Path, branch: &str) -> Result<String, MergeError> {
+    debug!(branch = %branch, "performing squash merge");
     match git_try(dir, &["merge", "--squash", branch]) {
         Ok(_) => {}
         Err((stderr, _)) => {
@@ -159,6 +173,7 @@ fn do_squash_merge(dir: &Path, branch: &str) -> Result<String, MergeError> {
 }
 
 fn do_full_merge(dir: &Path, branch: &str) -> Result<String, MergeError> {
+    debug!(branch = %branch, "performing full merge");
     let msg = format!("Merge branch '{branch}'");
     match git_try(dir, &["merge", "--no-ff", branch, "-m", &msg]) {
         Ok(_) => {}
@@ -176,6 +191,7 @@ fn do_full_merge(dir: &Path, branch: &str) -> Result<String, MergeError> {
 }
 
 fn do_cherry_pick(dir: &Path, branch: &str, base_commit: &str) -> Result<String, MergeError> {
+    debug!(branch = %branch, base_commit = %base_commit, "performing cherry-pick merge");
     // Get the list of commits to cherry-pick (oldest first)
     let log_output = git(
         dir,
@@ -217,6 +233,12 @@ pub fn partial_merge(
     merge_target_ref: &str,
     accepted_hunks: &[(String, Vec<usize>)],
 ) -> Result<PartialMergeResult, MergeError> {
+    info!(
+        branch = %branch,
+        target = %merge_target_ref,
+        accepted_files = accepted_hunks.len(),
+        "starting partial merge"
+    );
     // Get the full diff from the branch
     let wt_path = worktree_path(project_root, branch);
     let range = format!("{base_commit}..HEAD");
@@ -278,6 +300,11 @@ pub fn partial_merge(
         .trim()
         .to_string();
 
+    info!(
+        commit = %sha,
+        rejected_hunks_count = rejected.len(),
+        "partial merge complete"
+    );
     Ok(PartialMergeResult {
         merged_commit: sha,
         rejected_hunks: rejected,

@@ -1,23 +1,30 @@
+use tracing::{debug, instrument};
 use uuid::Uuid;
 
 use super::types::{EngagementLevel, Task, TaskStatus};
 
 /// Resolve the effective engagement level for a task.
 /// Per-task override takes precedence over the default.
+#[instrument(skip(task), fields(task_id = %task.id))]
 pub fn resolve_engagement(task: &Task, default: EngagementLevel) -> EngagementLevel {
-    task.engagement_override.unwrap_or(default)
+    let effective = task.engagement_override.unwrap_or(default);
+    debug!(task_id = %task.id, ?default, override_ = ?task.engagement_override, ?effective, "resolved engagement level");
+    effective
 }
 
 /// Determines if a gate check is needed before proceeding after a task reaches the given status.
 /// Returns true if the system should pause and wait for user review/input.
+#[instrument]
 pub fn needs_gate_check(engagement: EngagementLevel, task_status: TaskStatus) -> bool {
-    match engagement {
+    let needs_gate = match engagement {
         EngagementLevel::Autonomous => false,
         EngagementLevel::ReviewGates => matches!(task_status, TaskStatus::Review),
         EngagementLevel::Collaborative => {
             matches!(task_status, TaskStatus::InProgress | TaskStatus::Review)
         }
-    }
+    };
+    debug!(?engagement, ?task_status, needs_gate, "gate check evaluated");
+    needs_gate
 }
 
 /// Returns a human-readable description of the engagement level behavior.
@@ -46,6 +53,7 @@ pub enum SchedulingAction {
     WaitForCollaboration { task_id: Uuid },
 }
 
+#[instrument(skip(task), fields(task_id = %task.id))]
 pub fn post_transition_action(
     task: &Task,
     new_status: TaskStatus,
@@ -53,7 +61,7 @@ pub fn post_transition_action(
 ) -> SchedulingAction {
     let engagement = resolve_engagement(task, default_engagement);
 
-    match (engagement, new_status) {
+    let action = match (engagement, new_status) {
         (EngagementLevel::Autonomous, _) => SchedulingAction::Continue,
         (EngagementLevel::ReviewGates, TaskStatus::Review) => {
             SchedulingAction::WaitForReview { task_id: task.id }
@@ -66,16 +74,21 @@ pub fn post_transition_action(
             SchedulingAction::WaitForReview { task_id: task.id }
         }
         (EngagementLevel::Collaborative, _) => SchedulingAction::Continue,
-    }
+    };
+    debug!(task_id = %task.id, ?new_status, ?engagement, ?action, "post-transition action determined");
+    action
 }
 
 /// Returns the effective max concurrent tasks for the given engagement level.
 /// Collaborative mode forces max_concurrent to 1.
+#[instrument]
 pub fn effective_max_concurrent(engagement: EngagementLevel, configured_max: usize) -> usize {
-    match engagement {
+    let effective = match engagement {
         EngagementLevel::Collaborative => 1,
         _ => configured_max,
-    }
+    };
+    debug!(?engagement, configured_max, effective, "effective max concurrent calculated");
+    effective
 }
 
 #[cfg(test)]

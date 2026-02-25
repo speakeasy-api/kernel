@@ -1,3 +1,5 @@
+use tracing::debug;
+
 use super::types::Usage;
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +70,7 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
 /// Returns 0.0 for unknown models.
 pub fn calculate_cost(model: &str, usage: &Usage) -> f64 {
     let Some(pricing) = pricing_for_model(model) else {
+        debug!(model = %model, "unknown model for pricing, returning zero cost");
         return 0.0;
     };
 
@@ -78,7 +81,17 @@ pub fn calculate_cost(model: &str, usage: &Usage) -> f64 {
     let cache_read_cost =
         usage.cache_read_input_tokens as f64 * pricing.cache_read_per_mtok / 1_000_000.0;
 
-    input_cost + output_cost + cache_write_cost + cache_read_cost
+    let total = input_cost + output_cost + cache_write_cost + cache_read_cost;
+    debug!(
+        model = %model,
+        input_tokens = usage.input_tokens,
+        output_tokens = usage.output_tokens,
+        cache_write_tokens = usage.cache_creation_input_tokens,
+        cache_read_tokens = usage.cache_read_input_tokens,
+        cost_usd = total,
+        "calculated cost"
+    );
+    total
 }
 
 #[cfg(test)]

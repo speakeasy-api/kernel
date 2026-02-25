@@ -8,11 +8,14 @@ use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use tracing::{debug, error, info, instrument};
 
 const KERNEL_DIR: &str = ".kernel";
 const DB_FILE: &str = "kernel.db";
 
+#[instrument(skip(db_url))]
 pub async fn create_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    info!("creating database pool");
     let options: SqliteConnectOptions = db_url.parse::<SqliteConnectOptions>()?
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .foreign_keys(true)
@@ -24,19 +27,25 @@ pub async fn create_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .await?;
 
     sqlx::migrate!().run(&pool).await?;
+    debug!("migrations applied");
 
     Ok(pool)
 }
 
 pub fn kernel_data_dir() -> PathBuf {
-    dirs::home_dir()
+    let path = dirs::home_dir()
         .expect("could not determine home directory")
-        .join(KERNEL_DIR)
+        .join(KERNEL_DIR);
+    debug!(path = %path.display(), "resolved kernel data directory");
+    path
 }
 
+#[instrument]
 pub async fn open_pool() -> Result<SqlitePool, sqlx::Error> {
+    info!("opening database pool");
     let kernel_dir = kernel_data_dir();
     fs::create_dir_all(&kernel_dir).map_err(|e| {
+        error!(error = %e, path = %kernel_dir.display(), "failed to create kernel directory");
         sqlx::Error::Configuration(
             format!("failed to create {}: {e}", kernel_dir.display()).into(),
         )

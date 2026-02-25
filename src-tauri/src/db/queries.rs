@@ -1,11 +1,14 @@
 use sqlx::SqlitePool;
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 use super::models::{Agent, ConversationRow, Event, Mode, Session, SnapshotRow, StatsRollup, Task};
 
 // ---- Sessions ----
 
+#[instrument(skip(pool))]
 pub async fn create_session(pool: &SqlitePool, project_path: &str) -> Result<Session, sqlx::Error> {
+    info!(project_path, "creating session");
     let id = Uuid::new_v4().to_string();
     sqlx::query("INSERT INTO sessions (id, project_path) VALUES (?1, ?2)")
         .bind(&id)
@@ -18,7 +21,9 @@ pub async fn create_session(pool: &SqlitePool, project_path: &str) -> Result<Ses
         .await
 }
 
+#[instrument(skip(pool))]
 pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<Session>, sqlx::Error> {
+    debug!("listing sessions");
     sqlx::query_as::<_, Session>(
         "SELECT id, project_path, created_at FROM sessions ORDER BY created_at DESC",
     )
@@ -26,7 +31,9 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<Session>, sqlx::Erro
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn get_session(pool: &SqlitePool, id: &str) -> Result<Option<Session>, sqlx::Error> {
+    debug!(id, "getting session");
     sqlx::query_as::<_, Session>(
         "SELECT id, project_path, created_at FROM sessions WHERE id = ?1",
     )
@@ -35,7 +42,9 @@ pub async fn get_session(pool: &SqlitePool, id: &str) -> Result<Option<Session>,
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn delete_session(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    info!(id, "deleting session");
     // Delete dependent data first
     sqlx::query("DELETE FROM conversation_messages WHERE session_id = ?1")
         .bind(id)
@@ -58,6 +67,7 @@ pub async fn delete_session(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Err
 
 // ---- Events ----
 
+#[instrument(skip(pool, data))]
 pub async fn insert_event(
     pool: &SqlitePool,
     session_id: &str,
@@ -65,6 +75,7 @@ pub async fn insert_event(
     kind: &str,
     data: &str,
 ) -> Result<Event, sqlx::Error> {
+    debug!(kind, session_id, "inserting event");
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO events (id, session_id, agent_id, kind, data) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -84,11 +95,13 @@ pub async fn insert_event(
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn events_since(
     pool: &SqlitePool,
     session_id: &str,
     since: &str,
 ) -> Result<Vec<Event>, sqlx::Error> {
+    debug!(session_id, since, "fetching events since");
     sqlx::query_as::<_, Event>(
         "SELECT id, kind, session_id, agent_id, data, created_at
          FROM events
@@ -101,11 +114,13 @@ pub async fn events_since(
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn events_by_kind(
     pool: &SqlitePool,
     kind: &str,
     since: &str,
 ) -> Result<Vec<Event>, sqlx::Error> {
+    debug!(kind, since, "fetching events by kind");
     sqlx::query_as::<_, Event>(
         "SELECT id, kind, session_id, agent_id, data, created_at
          FROM events
@@ -126,6 +141,7 @@ const TASK_COLUMNS: &str = "id, session_id, title, description, status, priority
      cost_usd, created_at, updated_at";
 
 #[allow(clippy::too_many_arguments)]
+#[instrument(skip(pool, description, parent_task, base_ref, base_commit, merge_target_ref))]
 pub async fn create_task(
     pool: &SqlitePool,
     session_id: &str,
@@ -137,6 +153,7 @@ pub async fn create_task(
     base_commit: &str,
     merge_target_ref: &str,
 ) -> Result<Task, sqlx::Error> {
+    info!(title, priority, "creating task");
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO tasks (id, session_id, title, description, parent_task, priority,
@@ -160,18 +177,22 @@ pub async fn create_task(
         .await
 }
 
+#[instrument(skip(pool))]
 pub async fn get_task(pool: &SqlitePool, id: &str) -> Result<Option<Task>, sqlx::Error> {
+    debug!(id, "getting task");
     sqlx::query_as::<_, Task>(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))
         .bind(id)
         .fetch_optional(pool)
         .await
 }
 
+#[instrument(skip(pool))]
 pub async fn list_tasks(
     pool: &SqlitePool,
     session_id: &str,
     status_filter: Option<&str>,
 ) -> Result<Vec<Task>, sqlx::Error> {
+    debug!(session_id, status_filter, "listing tasks");
     match status_filter {
         Some(status) => {
             sqlx::query_as::<_, Task>(&format!(
@@ -203,6 +224,7 @@ pub async fn list_tasks(
     }
 }
 
+#[instrument(skip(pool, outcome_kind, outcome_data))]
 pub async fn update_task_status(
     pool: &SqlitePool,
     id: &str,
@@ -210,6 +232,7 @@ pub async fn update_task_status(
     outcome_kind: Option<&str>,
     outcome_data: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    info!(id, status, "updating task status");
     sqlx::query(
         "UPDATE tasks
          SET status = ?1, outcome_kind = ?2, outcome_data = ?3,
@@ -225,11 +248,13 @@ pub async fn update_task_status(
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn add_task_dep(
     pool: &SqlitePool,
     task_id: &str,
     depends_on_task_id: &str,
 ) -> Result<(), sqlx::Error> {
+    debug!(task_id, depends_on_task_id, "adding task dependency");
     sqlx::query("INSERT INTO task_deps (task_id, depends_on_task_id) VALUES (?1, ?2)")
         .bind(task_id)
         .bind(depends_on_task_id)
@@ -238,7 +263,9 @@ pub async fn add_task_dep(
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn get_task_deps(pool: &SqlitePool, task_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    debug!(task_id, "getting task dependencies");
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT depends_on_task_id FROM task_deps WHERE task_id = ?1")
             .bind(task_id)
@@ -247,10 +274,12 @@ pub async fn get_task_deps(pool: &SqlitePool, task_id: &str) -> Result<Vec<Strin
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
+#[instrument(skip(pool))]
 pub async fn next_unblocked(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Vec<Task>, sqlx::Error> {
+    debug!(session_id, "finding next unblocked tasks");
     sqlx::query_as::<_, Task>(&format!(
         "SELECT {TASK_COLUMNS}
          FROM tasks t
@@ -276,6 +305,7 @@ pub async fn next_unblocked(
 const AGENT_COLUMNS: &str = "id, session_id, parent_agent_id, task_id, role, model, mode, status,
      token_input, token_output, created_at, finished_at";
 
+#[instrument(skip(pool))]
 pub async fn create_agent(
     pool: &SqlitePool,
     session_id: &str,
@@ -284,6 +314,7 @@ pub async fn create_agent(
     model: &str,
     mode: &str,
 ) -> Result<Agent, sqlx::Error> {
+    info!(role, model, "creating agent");
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO agents (id, session_id, parent_agent_id, role, model, mode)
@@ -305,7 +336,9 @@ pub async fn create_agent(
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn get_agent(pool: &SqlitePool, id: &str) -> Result<Option<Agent>, sqlx::Error> {
+    debug!(id, "getting agent");
     sqlx::query_as::<_, Agent>(&format!(
         "SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"
     ))
@@ -314,11 +347,13 @@ pub async fn get_agent(pool: &SqlitePool, id: &str) -> Result<Option<Agent>, sql
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn update_agent_status(
     pool: &SqlitePool,
     id: &str,
     status: &str,
 ) -> Result<(), sqlx::Error> {
+    info!(id, status, "updating agent status");
     let finished_at_clause = match status {
         "complete" | "failed" => ", finished_at = CURRENT_TIMESTAMP",
         _ => "",
@@ -333,12 +368,14 @@ pub async fn update_agent_status(
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn update_agent_tokens(
     pool: &SqlitePool,
     id: &str,
     input_tokens: i64,
     output_tokens: i64,
 ) -> Result<(), sqlx::Error> {
+    debug!(id, input_tokens, output_tokens, "updating agent tokens");
     sqlx::query(
         "UPDATE agents
          SET token_input = token_input + ?1, token_output = token_output + ?2
@@ -357,7 +394,9 @@ pub async fn update_agent_tokens(
 const MODE_COLUMNS: &str = "name, description, system_prompt, default_model, allowed_tools,
      origin, version, created_at, updated_at";
 
+#[instrument(skip(pool, mode), fields(name = %mode.name))]
 pub async fn insert_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Error> {
+    info!(name = %mode.name, "inserting mode");
     sqlx::query(
         "INSERT INTO modes (name, description, system_prompt, default_model,
                             allowed_tools, origin, version)
@@ -375,7 +414,9 @@ pub async fn insert_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Err
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn get_mode(pool: &SqlitePool, name: &str) -> Result<Option<Mode>, sqlx::Error> {
+    debug!(name, "getting mode");
     sqlx::query_as::<_, Mode>(&format!(
         "SELECT {MODE_COLUMNS} FROM modes WHERE name = ?1"
     ))
@@ -384,7 +425,9 @@ pub async fn get_mode(pool: &SqlitePool, name: &str) -> Result<Option<Mode>, sql
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn list_modes(pool: &SqlitePool) -> Result<Vec<Mode>, sqlx::Error> {
+    debug!("listing modes");
     sqlx::query_as::<_, Mode>(&format!(
         "SELECT {MODE_COLUMNS} FROM modes ORDER BY name ASC"
     ))
@@ -392,6 +435,7 @@ pub async fn list_modes(pool: &SqlitePool) -> Result<Vec<Mode>, sqlx::Error> {
     .await
 }
 
+#[instrument(skip(pool, description, system_prompt, default_model, allowed_tools))]
 pub async fn update_mode(
     pool: &SqlitePool,
     name: &str,
@@ -400,6 +444,7 @@ pub async fn update_mode(
     default_model: Option<Option<&str>>,
     allowed_tools: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    info!(name, "updating mode");
     sqlx::query(
         "UPDATE modes SET
             description = COALESCE(?2, description),
@@ -421,7 +466,9 @@ pub async fn update_mode(
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn delete_mode(pool: &SqlitePool, name: &str) -> Result<(), sqlx::Error> {
+    info!(name, "deleting mode");
     sqlx::query("DELETE FROM modes WHERE name = ?1")
         .bind(name)
         .execute(pool)
@@ -431,6 +478,7 @@ pub async fn delete_mode(pool: &SqlitePool, name: &str) -> Result<(), sqlx::Erro
 
 // ---- Recommendations ----
 
+#[instrument(skip(pool, recommendation, action_payload))]
 pub async fn insert_recommendation(
     pool: &SqlitePool,
     trigger_pattern: &str,
@@ -438,6 +486,7 @@ pub async fn insert_recommendation(
     action_type: &str,
     action_payload: &str,
 ) -> Result<i64, sqlx::Error> {
+    info!(trigger_pattern, action_type, "inserting recommendation");
     let result = sqlx::query(
         "INSERT INTO recommendations (trigger_pattern, recommendation, action, status)
          VALUES (?1, ?2, ?3, 'pending')",
@@ -452,6 +501,7 @@ pub async fn insert_recommendation(
 
 // ---- Stats Rollups ----
 
+#[instrument(skip(pool))]
 pub async fn insert_rollup(
     pool: &SqlitePool,
     scope: &str,
@@ -461,6 +511,7 @@ pub async fn insert_rollup(
     metric: &str,
     value: f64,
 ) -> Result<StatsRollup, sqlx::Error> {
+    debug!(scope, metric, value, "inserting stats rollup");
     let result = sqlx::query(
         "INSERT INTO stats_rollups (scope, scope_id, period_start, period_end, metric, value)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -483,6 +534,7 @@ pub async fn insert_rollup(
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn query_rollups(
     pool: &SqlitePool,
     scope: &str,
@@ -490,6 +542,7 @@ pub async fn query_rollups(
     metric: &str,
     since: &str,
 ) -> Result<Vec<StatsRollup>, sqlx::Error> {
+    debug!(scope, metric, since, "querying stats rollups");
     sqlx::query_as::<_, StatsRollup>(
         "SELECT id, period_start, period_end, scope, scope_id, metric, CAST(value AS REAL) as value
          FROM stats_rollups
@@ -507,10 +560,12 @@ pub async fn query_rollups(
 
 // ---- UX Agent State ----
 
+#[instrument(skip(pool))]
 pub async fn get_ux_state(
     pool: &SqlitePool,
     scope: &str,
 ) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
+    debug!(scope, "getting UX state");
     sqlx::query_as::<_, (Option<String>, Option<String>)>(
         "SELECT last_event_id, last_event_at FROM ux_agent_state WHERE id = 1",
     )
@@ -518,12 +573,14 @@ pub async fn get_ux_state(
     .await
 }
 
+#[instrument(skip(pool))]
 pub async fn update_ux_state(
     pool: &SqlitePool,
     _scope: &str,
     last_event_id: &str,
     last_event_at: &str,
 ) -> Result<(), sqlx::Error> {
+    debug!(last_event_id, "updating UX state");
     sqlx::query(
         "INSERT INTO ux_agent_state (id, last_event_id, last_event_at)
          VALUES (1, ?1, ?2)
@@ -541,12 +598,14 @@ pub async fn update_ux_state(
 // ---- Conversation Messages ----
 
 /// Append a message. Ordinal = MAX(ordinal)+1 for the session. Returns the ordinal.
+#[instrument(skip(pool, content_json))]
 pub async fn append_conversation_message(
     pool: &SqlitePool,
     session_id: &str,
     role: &str,
     content_json: &str,
 ) -> Result<i64, sqlx::Error> {
+    debug!(session_id, role, "appending conversation message");
     let id = Uuid::new_v4().to_string();
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO conversation_messages (id, session_id, ordinal, role, content)
@@ -563,10 +622,12 @@ pub async fn append_conversation_message(
 }
 
 /// Load all messages for a session (full history).
+#[instrument(skip(pool))]
 pub async fn get_conversation_messages(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Vec<ConversationRow>, sqlx::Error> {
+    debug!(session_id, "getting conversation messages");
     sqlx::query_as::<_, ConversationRow>(
         "SELECT ordinal, role, content FROM conversation_messages
          WHERE session_id = ?1 ORDER BY ordinal ASC",
@@ -577,11 +638,13 @@ pub async fn get_conversation_messages(
 }
 
 /// Load messages after a given ordinal (for building agent context from snapshot).
+#[instrument(skip(pool))]
 pub async fn get_conversation_messages_since(
     pool: &SqlitePool,
     session_id: &str,
     after_ordinal: i64,
 ) -> Result<Vec<ConversationRow>, sqlx::Error> {
+    debug!(session_id, after_ordinal, "getting conversation messages since ordinal");
     sqlx::query_as::<_, ConversationRow>(
         "SELECT ordinal, role, content FROM conversation_messages
          WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal ASC",
@@ -593,10 +656,12 @@ pub async fn get_conversation_messages_since(
 }
 
 /// Get the latest snapshot for a session.
+#[instrument(skip(pool))]
 pub async fn get_latest_snapshot(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Option<SnapshotRow>, sqlx::Error> {
+    debug!(session_id, "getting latest snapshot");
     sqlx::query_as::<_, SnapshotRow>(
         "SELECT up_to_ordinal, summary_messages FROM context_snapshots
          WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
@@ -607,12 +672,14 @@ pub async fn get_latest_snapshot(
 }
 
 /// Save a compaction snapshot.
+#[instrument(skip(pool, summary_json))]
 pub async fn save_context_snapshot(
     pool: &SqlitePool,
     session_id: &str,
     up_to_ordinal: i64,
     summary_json: &str,
 ) -> Result<(), sqlx::Error> {
+    info!(session_id, up_to_ordinal, "saving context snapshot");
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO context_snapshots (id, session_id, up_to_ordinal, summary_messages)
@@ -628,10 +695,12 @@ pub async fn save_context_snapshot(
 }
 
 /// Get the max ordinal for a session (or None if no messages).
+#[instrument(skip(pool))]
 pub async fn get_max_ordinal(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
+    debug!(session_id, "getting max ordinal");
     let row: Option<(Option<i64>,)> = sqlx::query_as(
         "SELECT MAX(ordinal) FROM conversation_messages WHERE session_id = ?1",
     )

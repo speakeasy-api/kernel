@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument};
 
 use super::store::RecommendationStore;
 
@@ -73,7 +74,9 @@ pub struct ExtractedConvention {
 ///
 /// Groups corrections by type, looks for repeated patterns in corrected values,
 /// and produces convention statements with confidence scores.
+#[instrument(skip(corrections), fields(correction_count = corrections.len()))]
 pub fn extract_conventions(corrections: &[Correction]) -> Vec<ExtractedConvention> {
+    debug!(correction_count = corrections.len(), "analyzing corrections for convention extraction");
     let mut extracted = Vec::new();
 
     // Group corrections by type.
@@ -99,10 +102,29 @@ pub fn extract_conventions(corrections: &[Correction]) -> Vec<ExtractedConventio
         extracted.extend(extract_steering_conventions(steerings));
     }
 
+    if !extracted.is_empty() {
+        info!(
+            convention_count = extracted.len(),
+            "patterns detected from corrections"
+        );
+        for conv in &extracted {
+            info!(
+                convention = %conv.convention,
+                confidence = conv.confidence,
+                correction_ids = ?conv.correction_ids,
+                "extracted convention"
+            );
+        }
+    } else {
+        debug!("no conventions extracted from corrections");
+    }
+
     extracted
 }
 
+#[instrument(skip(overrides), fields(override_count = overrides.len()))]
 fn extract_mode_override_conventions(overrides: &[&Correction]) -> Vec<ExtractedConvention> {
+    debug!(override_count = overrides.len(), "extracting mode override conventions");
     // Group by (original_value, corrected_value) pair.
     let mut pattern_groups: HashMap<(String, String), Vec<u64>> = HashMap::new();
     for c in overrides {
@@ -127,10 +149,12 @@ fn extract_mode_override_conventions(overrides: &[&Correction]) -> Vec<Extracted
         .collect()
 }
 
+#[instrument(skip(rejections), fields(rejection_count = rejections.len()))]
 fn extract_rejection_conventions(
     rejections: &[&Correction],
     rejection_type: &str,
 ) -> Vec<ExtractedConvention> {
+    debug!(rejection_count = rejections.len(), rejection_type, "extracting rejection conventions");
     // Group by corrected_value (user feedback) using exact match for v1.
     let mut feedback_groups: HashMap<String, Vec<u64>> = HashMap::new();
     for c in rejections {
@@ -169,7 +193,9 @@ fn extract_rejection_conventions(
         .collect()
 }
 
+#[instrument(skip(steerings), fields(steering_count = steerings.len()))]
 fn extract_steering_conventions(steerings: &[&Correction]) -> Vec<ExtractedConvention> {
+    debug!(steering_count = steerings.len(), "extracting steering conventions");
     // Group by corrected_value (the steering instruction).
     let mut instruction_groups: HashMap<String, Vec<u64>> = HashMap::new();
     for c in steerings {
@@ -203,21 +229,41 @@ fn extract_steering_conventions(steerings: &[&Correction]) -> Vec<ExtractedConve
 ///
 /// Returns a structured string describing unincorporated corrections and
 /// proposed conventions.
+#[instrument(skip(store))]
 pub async fn build_learning_context(
     store: &RecommendationStore,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    debug!("building learning context from store");
     let corrections = store.get_unincorporated_corrections().await?;
     let conventions = extract_conventions(&corrections);
     let proposed = store.get_proposed_conventions().await?;
 
+    debug!(
+        corrections = corrections.len(),
+        extracted_conventions = conventions.len(),
+        proposed_conventions = proposed.len(),
+        "learning context assembled"
+    );
+
     Ok(format_learning_context(&corrections, &conventions, &proposed))
 }
 
+#[instrument(skip(corrections, extracted, proposed), fields(
+    corrections = corrections.len(),
+    extracted = extracted.len(),
+    proposed = proposed.len()
+))]
 fn format_learning_context(
     corrections: &[Correction],
     extracted: &[ExtractedConvention],
     proposed: &[Convention],
 ) -> String {
+    debug!(
+        corrections = corrections.len(),
+        extracted = extracted.len(),
+        proposed = proposed.len(),
+        "formatting learning context"
+    );
     if corrections.is_empty() && extracted.is_empty() && proposed.is_empty() {
         return String::new();
     }

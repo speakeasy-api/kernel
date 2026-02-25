@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::tree::AgentTree;
@@ -61,6 +62,7 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     pub fn new(session_id: Uuid) -> Self {
+        info!(%session_id, "creating orchestrator");
         let mut tree = AgentTree::new();
         tree.set_root(SubAgent {
             id: session_id,
@@ -82,6 +84,7 @@ impl Orchestrator {
         subtasks: Vec<SubTaskDescription>,
         role_defaults: &RoleModelDefaults,
     ) -> Vec<SpawnRequest> {
+        debug!(count = subtasks.len(), "planning spawn requests");
         subtasks
             .into_iter()
             .map(|task| SpawnRequest {
@@ -103,6 +106,7 @@ impl Orchestrator {
 
     pub fn spawn(&mut self, parent_id: Uuid, request: SpawnRequest) -> Uuid {
         let agent_id = Uuid::new_v4();
+        info!(%parent_id, role = ?request.role, %agent_id, "spawning agent");
         let default_model = default_model_for_role(&request.role);
 
         let agent = SubAgent {
@@ -122,6 +126,7 @@ impl Orchestrator {
     }
 
     pub fn collect_report(&mut self, report: AgentReport) {
+        info!(agent_id = %report.agent_id, success = report.success, "collecting agent report");
         if let Some(agent) = self.tree.get_mut(&report.agent_id) {
             agent.token_usage = report.token_usage;
             agent.status = if report.success {
@@ -129,22 +134,28 @@ impl Orchestrator {
             } else {
                 AgentStatus::Failed
             };
+        } else {
+            warn!(agent_id = %report.agent_id, "agent not found when collecting report");
         }
     }
 
     pub fn completed_reports(&self, parent_id: &Uuid) -> Vec<&SubAgent> {
-        self.tree
+        let reports: Vec<&SubAgent> = self.tree
             .children_of(parent_id)
             .into_iter()
             .filter(|agent| matches!(agent.status, AgentStatus::Complete | AgentStatus::Failed))
-            .collect()
+            .collect();
+        debug!(%parent_id, count = reports.len(), "completed reports");
+        reports
     }
 
     pub fn all_children_done(&self, parent_id: &Uuid) -> bool {
-        self.tree
+        let done = self.tree
             .children_of(parent_id)
             .into_iter()
-            .all(|child| matches!(child.status, AgentStatus::Complete | AgentStatus::Failed))
+            .all(|child| matches!(child.status, AgentStatus::Complete | AgentStatus::Failed));
+        debug!(%parent_id, all_done = done, "all children done check");
+        done
     }
 
     pub fn tree(&self) -> &AgentTree {
@@ -152,12 +163,14 @@ impl Orchestrator {
     }
 
     pub fn total_tokens(&self) -> TokenMetrics {
-        self.tree
+        let totals = self.tree
             .all_agents()
             .into_iter()
             .fold(TokenMetrics::default(), |acc, agent| {
                 acc + agent.token_usage.clone()
-            })
+            });
+        debug!(input = totals.input, output = totals.output, cost_usd = totals.cost_usd, "total tokens");
+        totals
     }
 
     pub fn session_id(&self) -> Uuid {

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 use sqlx::SqlitePool;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use super::scheduler::{validate_dag, SchedulerError};
@@ -52,10 +53,13 @@ pub enum DecompositionError {
     DbError(#[from] sqlx::Error),
 }
 
+#[instrument(skip(result), fields(task_count = result.tasks.len()))]
 pub fn validate_decomposition(result: &DecompositionResult) -> Result<(), DecompositionError> {
+    debug!("validating decomposition");
     let mut seen_titles: HashSet<&str> = HashSet::with_capacity(result.tasks.len());
     for task in &result.tasks {
         if !seen_titles.insert(task.title.as_str()) {
+            warn!(title = %task.title, "duplicate task title in decomposition");
             return Err(DecompositionError::DuplicateTitle(task.title.clone()));
         }
     }
@@ -63,6 +67,7 @@ pub fn validate_decomposition(result: &DecompositionResult) -> Result<(), Decomp
     for task in &result.tasks {
         for dep_title in &task.depends_on_titles {
             if !seen_titles.contains(dep_title.as_str()) {
+                warn!(task = %task.title, dependency = %dep_title, "unknown dependency reference");
                 return Err(DecompositionError::UnknownDependency {
                     task: task.title.clone(),
                     dependency: dep_title.clone(),
@@ -71,6 +76,7 @@ pub fn validate_decomposition(result: &DecompositionResult) -> Result<(), Decomp
         }
         if let Some(parent) = &task.parent_title {
             if !seen_titles.contains(parent.as_str()) {
+                warn!(task = %task.title, parent = %parent, "unknown parent reference");
                 return Err(DecompositionError::UnknownParent {
                     task: task.title.clone(),
                     parent: parent.clone(),
@@ -126,17 +132,25 @@ pub fn validate_decomposition(result: &DecompositionResult) -> Result<(), Decomp
     }
 
     match validate_dag(&temporary_tasks, &edges) {
-        Ok(_) => Ok(()),
-        Err(SchedulerError::CycleDetected(_)) => Err(DecompositionError::CycleDetected),
+        Ok(_) => {
+            debug!("decomposition validation passed");
+            Ok(())
+        }
+        Err(SchedulerError::CycleDetected(_)) => {
+            warn!("dependency cycle detected in decomposition");
+            Err(DecompositionError::CycleDetected)
+        }
         Err(SchedulerError::DbError(err)) => Err(DecompositionError::DbError(err)),
     }
 }
 
+#[instrument(skip(pool, result), fields(session_id = %request.session_id, task_count = result.tasks.len()))]
 pub async fn persist_decomposition(
     pool: &SqlitePool,
     request: &DecompositionRequest,
     result: &DecompositionResult,
 ) -> Result<Vec<Task>, DecompositionError> {
+    info!(%request.session_id, task_count = result.tasks.len(), "decomposing task plan");
     validate_decomposition(result)?;
 
     let mut title_to_id: HashMap<&str, Uuid> = HashMap::with_capacity(result.tasks.len());
@@ -189,10 +203,12 @@ pub async fn persist_decomposition(
 
     let mut tx = pool.begin().await?;
     for task in &tasks {
+        debug!(task_id = %task.id, title = %task.title, "persisting subtask");
         super::db::insert_task_in_tx(&mut tx, task).await?;
     }
     tx.commit().await?;
 
+    info!(subtask_count = tasks.len(), "decomposition complete");
     Ok(tasks)
 }
 

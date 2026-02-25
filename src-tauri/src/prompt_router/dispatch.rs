@@ -1,3 +1,5 @@
+use tracing::{debug, info, instrument, warn};
+
 use super::classify::{classify, ClassificationError, LlmClient};
 use super::model_registry::{ModelInfo, FALLBACK_MODEL};
 use super::reclassify::{reclassify, ReclassificationRequest};
@@ -96,6 +98,7 @@ impl From<OverrideError> for DispatchError {
 /// Resolve the model to use: prefer router-selected, fall back to mode default.
 /// When `available_models` is non-empty, validates the candidate against the
 /// list and substitutes the fallback model if not found.
+#[instrument(skip(loaded_mode, available_models))]
 fn resolve_model(
     router_model: &str,
     loaded_mode: &LoadedMode,
@@ -111,13 +114,15 @@ fn resolve_model(
     };
 
     if available_models.is_empty() {
+        debug!(model = %candidate, "no model list, using candidate as-is");
         return candidate;
     }
 
     if available_models.iter().any(|m| m.id == candidate) {
+        debug!(model = %candidate, "model validated against available models");
         candidate
     } else {
-        tracing::warn!(
+        warn!(
             model = %candidate,
             fallback = FALLBACK_MODEL,
             "router selected unknown model, falling back"
@@ -130,6 +135,7 @@ fn resolve_model(
 /// the handoff payload for the agent system.
 ///
 /// This is the primary entry point for the prompt router module.
+#[instrument(skip(input, llm_client, mode_loader, event_sink, available_models), fields(session_id, user_override))]
 pub fn dispatch(
     input: &RouterInput,
     user_override: Option<&str>,
@@ -140,6 +146,7 @@ pub fn dispatch(
     session_id: &str,
     available_models: &[ModelInfo],
 ) -> Result<AgentHandoff, DispatchError> {
+    info!(session_id, override_mode = ?user_override, "dispatching prompt");
     // Step 1: Classify or Override
     let output = if let Some(override_mode) = user_override {
         let default_output = RouterOutput {
@@ -168,6 +175,13 @@ pub fn dispatch(
     let model = resolve_model(&output.model, &loaded_mode, available_models);
 
     // Step 4: Build AgentHandoff
+    debug!(
+        mode = %output.mode,
+        model = %model,
+        confidence = output.confidence,
+        tools = loaded_mode.allowed_tools.len(),
+        "dispatch handoff prepared"
+    );
     Ok(AgentHandoff {
         mode_name: output.mode,
         system_prompt: loaded_mode.system_prompt,
@@ -183,6 +197,7 @@ pub fn dispatch(
 /// new mode and prepares a fresh handoff.
 ///
 /// Returns `Some(AgentHandoff)` if the mode changed, `None` if it stayed the same.
+#[instrument(skip(request, llm_client, mode_loader, event_sink, available_models), fields(session_id))]
 pub fn dispatch_reclassification(
     request: &ReclassificationRequest,
     llm_client: &dyn LlmClient,
@@ -192,17 +207,24 @@ pub fn dispatch_reclassification(
     session_id: &str,
     available_models: &[ModelInfo],
 ) -> Result<Option<AgentHandoff>, DispatchError> {
+    info!(session_id, "dispatching reclassification");
     let result = reclassify(request, llm_client, router_model, available_models)?;
 
     event_sink.emit_prompt_classified(session_id, &result.new_output);
 
     if !result.mode_changed {
+        debug!("reclassification: mode unchanged");
         return Ok(None);
     }
 
     let loaded_mode = mode_loader.load_mode(&result.new_output.mode)?;
     let model = resolve_model(&result.new_output.model, &loaded_mode, available_models);
 
+    info!(
+        new_mode = %result.new_output.mode,
+        new_model = %model,
+        "reclassification: mode changed, new handoff prepared"
+    );
     Ok(Some(AgentHandoff {
         mode_name: result.new_output.mode,
         system_prompt: loaded_mode.system_prompt,

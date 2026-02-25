@@ -1,5 +1,6 @@
 use chrono::NaiveDateTime;
 use sqlx::SqlitePool;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::db::queries;
@@ -56,6 +57,7 @@ pub async fn emit(
     data: EventData,
 ) -> Result<Event, EmitError> {
     let kind = data.kind();
+    debug!(kind = %kind, session_id = %session_id, agent_id = ?agent_id, "emitting event");
 
     // Serialize EventData, extract only the variant fields (the "data" content).
     // EventData uses #[serde(tag = "kind", content = "data")], so the serialized
@@ -72,7 +74,10 @@ pub async fn emit(
     // Parse DB-authoritative timestamp (SQLite CURRENT_TIMESTAMP format)
     let timestamp = NaiveDateTime::parse_from_str(&db_event.created_at, "%Y-%m-%d %H:%M:%S")
         .map(|ndt| ndt.and_utc())
-        .map_err(|_| EmitError::InvalidTimestamp(db_event.created_at.clone()))?;
+        .map_err(|_| {
+            error!(kind = %kind, session_id = %session_id, timestamp = %db_event.created_at, "invalid timestamp from DB");
+            EmitError::InvalidTimestamp(db_event.created_at.clone())
+        })?;
 
     Ok(Event {
         metadata: EventMetadata {

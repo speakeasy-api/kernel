@@ -1,3 +1,5 @@
+use tracing::{debug, info, instrument};
+
 /// Threshold for accumulated rejection events (plan, diff, or hunk rejections).
 pub const REJECTION_THRESHOLD: usize = 3;
 
@@ -33,6 +35,7 @@ pub struct EventSummary {
 /// Build an `EventSummary` from raw event counts.
 ///
 /// In production this will be called with data from the events query layer.
+#[instrument(skip(tool_failures, mode_overrides))]
 pub fn build_event_summary(
     rejection_count: usize,
     is_new_session: bool,
@@ -42,6 +45,16 @@ pub fn build_event_summary(
     mode_overrides: Vec<(String, usize)>,
     has_new_events: bool,
 ) -> EventSummary {
+    debug!(
+        rejection_count,
+        is_new_session,
+        recent_cost_usd,
+        baseline_cost_usd,
+        tool_failure_count = tool_failures.len(),
+        mode_override_count = mode_overrides.len(),
+        has_new_events,
+        "building event summary"
+    );
     EventSummary {
         rejection_count,
         is_new_session,
@@ -55,10 +68,18 @@ pub fn build_event_summary(
 
 /// Evaluate which triggers have fired given an event summary.
 ///
-/// Returns all triggers that fired — multiple may fire simultaneously.
+/// Returns all triggers that fired -- multiple may fire simultaneously.
 /// Returns an empty vec when `has_new_events` is false.
+#[instrument(skip(summary), fields(has_new_events = summary.has_new_events, rejection_count = summary.rejection_count))]
 pub fn evaluate_triggers(summary: &EventSummary) -> Vec<TriggerReason> {
+    debug!(
+        has_new_events = summary.has_new_events,
+        rejection_count = summary.rejection_count,
+        is_new_session = summary.is_new_session,
+        "evaluating triggers"
+    );
     if !summary.has_new_events {
+        debug!("no new events, skipping trigger evaluation");
         return Vec::new();
     }
 
@@ -99,6 +120,13 @@ pub fn evaluate_triggers(summary: &EventSummary) -> Vec<TriggerReason> {
                 count: *count,
             });
         }
+    }
+
+    for trigger in &triggers {
+        info!(?trigger, "trigger fired");
+    }
+    if triggers.is_empty() {
+        debug!("no triggers fired");
     }
 
     triggers

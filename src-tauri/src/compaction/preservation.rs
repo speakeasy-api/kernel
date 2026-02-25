@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, instrument};
 
 use super::Message;
 
@@ -40,6 +41,7 @@ impl PreservationRules {
 
     /// Extract all preserved facts from a slice of messages.
     /// Returns a deduplicated list of strings that must be preserved during compaction.
+    #[instrument(skip_all, fields(message_count = messages.len(), pattern_count = self.preserved_patterns.len()))]
     pub fn extract_preserved_facts(&self, messages: &[Message]) -> Vec<String> {
         let mut facts = Vec::new();
         for msg in messages {
@@ -49,11 +51,13 @@ impl PreservationRules {
         }
         facts.sort();
         facts.dedup();
+        debug!(facts_count = facts.len(), "extracted preserved facts");
         facts
     }
 
     /// Determine which messages should never be removed (only compacted in place).
     /// Returns indices of messages that are protected.
+    #[instrument(skip_all, fields(message_count = messages.len()))]
     pub fn protected_message_indices(&self, messages: &[Message]) -> Vec<usize> {
         let mut indices = Vec::new();
         for (i, msg) in messages.iter().enumerate() {
@@ -69,6 +73,7 @@ impl PreservationRules {
                 indices.push(i);
             }
         }
+        debug!(protected_count = indices.len(), "identified protected messages");
         indices
     }
 }

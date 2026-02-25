@@ -1,4 +1,5 @@
 use sqlx::SqlitePool;
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use super::db;
@@ -23,6 +24,7 @@ pub enum LifecycleError {
     TaskNotFound(Uuid),
 }
 
+#[instrument]
 pub fn validate_transition(
     from: TaskStatus,
     to: TaskStatus,
@@ -42,16 +44,20 @@ pub fn validate_transition(
     );
 
     if !valid {
+        warn!(?from, ?to, "invalid task transition");
         return Err(LifecycleError::InvalidTransition { from, to });
     }
 
     if to == TaskStatus::Done && outcome.is_none() {
+        warn!(?from, ?to, "transition to Done missing outcome");
         return Err(LifecycleError::MissingOutcome);
     }
 
+    debug!(?from, ?to, "transition validated");
     Ok(())
 }
 
+#[instrument(skip(pool, outcome))]
 pub async fn apply_transition(
     pool: &SqlitePool,
     task_id: Uuid,
@@ -61,16 +67,19 @@ pub async fn apply_transition(
     let task = db::get_task(pool, task_id)
         .await?
         .ok_or(LifecycleError::TaskNotFound(task_id))?;
+    info!(%task_id, from = ?task.status, ?to, "applying task transition");
     validate_transition(task.status, to, outcome)?;
     db::update_task_status(pool, task_id, to, outcome).await?;
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn cascade_unblock(
     pool: &SqlitePool,
     completed_task_id: Uuid,
 ) -> Result<Vec<Uuid>, LifecycleError> {
     let dependents = db::find_dependents(pool, completed_task_id).await?;
+    debug!(%completed_task_id, dependent_count = dependents.len(), "checking cascade unblock");
     let mut unblocked = Vec::new();
 
     for dependent_task_id in dependents {
@@ -79,6 +88,7 @@ pub async fn cascade_unblock(
             .ok_or(LifecycleError::TaskNotFound(dependent_task_id))?;
 
         if task.status != TaskStatus::Blocked {
+            debug!(%dependent_task_id, status = ?task.status, "dependent not blocked, skipping");
             continue;
         }
 
@@ -94,11 +104,13 @@ pub async fn cascade_unblock(
         }
 
         if all_done {
+            info!(%dependent_task_id, "unblocking task — all dependencies done");
             db::update_task_status(pool, dependent_task_id, TaskStatus::Pending, None).await?;
             unblocked.push(dependent_task_id);
         }
     }
 
+    info!(%completed_task_id, unblocked_count = unblocked.len(), "cascade unblock complete");
     Ok(unblocked)
 }
 

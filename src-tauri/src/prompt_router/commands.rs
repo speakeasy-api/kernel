@@ -8,6 +8,7 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 use tauri::{Emitter, State};
 use tokio::sync::Mutex;
+use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
 
 use crate::anthropic::client::StreamRequest;
@@ -91,6 +92,7 @@ impl Drop for CancellationGuard {
 
 /// Load the agent's working context: latest snapshot + messages after it.
 /// Falls back to all messages if no snapshot exists.
+#[instrument(skip(pool))]
 async fn load_agent_context(pool: &SqlitePool, session_id: &str) -> Result<Vec<Message>, String> {
     let mut rows = if let Some(snapshot) =
         crate::db::queries::get_latest_snapshot(pool, session_id)
@@ -252,11 +254,13 @@ fn resolve_client(project_path: &str) -> Result<LlmClient2, String> {
     // Try each configured provider in order
     for (name, _pc) in &config.models.providers {
         if let Ok(client) = LlmClient2::from_config(&config.models, name) {
+            debug!(provider = %name, "resolved LLM client from config");
             return Ok(client);
         }
     }
 
     // No configured providers worked — fall back to env detection
+    debug!("falling back to env-based LLM client");
     LlmClient2::from_env()
 }
 
@@ -275,19 +279,23 @@ fn is_model_unsupported_error(error: &str) -> bool {
 
 /// Return the raw conversation context for a session (what the LLM actually sees).
 #[tauri::command]
+#[instrument(skip(pool))]
 pub async fn get_conversation_context(
     session_id: String,
     pool: State<'_, SqlitePool>,
 ) -> Result<Vec<Message>, String> {
+    debug!(session_id, "fetching conversation context");
     load_agent_context(&*pool, &session_id).await
 }
 
 /// Return the full conversation history for the UI timeline.
 #[tauri::command]
+#[instrument(skip(pool))]
 pub async fn get_conversation_history(
     session_id: String,
     pool: State<'_, SqlitePool>,
 ) -> Result<ConversationHistory, String> {
+    debug!(session_id, "fetching conversation history");
     build_conversation_history(&*pool, &session_id).await
 }
 
@@ -411,15 +419,18 @@ async fn build_conversation_history(
 }
 
 #[tauri::command]
+#[instrument(skip(flags))]
 pub async fn cancel_prompt(
     session_id: String,
     flags: State<'_, Arc<CancellationFlags>>,
 ) -> Result<(), String> {
+    info!(session_id, "cancelling prompt");
     flags.cancel(&session_id).await;
     Ok(())
 }
 
 #[tauri::command]
+#[instrument(skip(app, pool, registry, cancel_flags, prompt), fields(session_id, mode_override))]
 pub async fn submit_prompt(
     session_id: String,
     prompt: String,
@@ -429,11 +440,16 @@ pub async fn submit_prompt(
     registry: State<'_, Arc<ModelRegistry>>,
     cancel_flags: State<'_, Arc<CancellationFlags>>,
 ) -> Result<(), String> {
+    info!(session_id, mode_override = ?mode_override, "submit_prompt called");
+
     // 0. Look up session to get project_path
     let session = crate::db::queries::get_session(&*pool, &session_id)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("session not found: {session_id}"))?;
+        .ok_or_else(|| {
+            error!(session_id, "session not found");
+            format!("session not found: {session_id}")
+        })?;
 
     let config = load_config(Path::new(&session.project_path)).unwrap_or_default();
 
@@ -772,6 +788,7 @@ struct ContextUsage {
 /// Run the agentic loop: stream LLM, execute tool calls, feed results back, repeat.
 /// Appends assistant/tool messages to `messages` in place and persists to DB.
 /// Returns `(full_text, accumulated_usage)` on success.
+#[instrument(skip_all, fields(session_id, model, context_window))]
 async fn run_agent_loop(
     client: &LlmClient2,
     system_prompt: &str,
@@ -786,6 +803,7 @@ async fn run_agent_loop(
     config: &KernelConfig,
     context_window: usize,
 ) -> Result<(String, Usage), String> {
+    info!(model, context_window, tools = allowed_tools.len(), "starting agent loop");
     let tool_defs = tool_definitions(allowed_tools);
     let project = Path::new(project_path);
 
@@ -1195,6 +1213,7 @@ const RESERVED_RESPONSE: usize = 4_096;
 /// Run the compaction pipeline on messages before storing them.
 /// Only triggers deep compaction when token count exceeds the budget trigger.
 /// Falls back to returning originals if compaction fails.
+#[instrument(skip_all, fields(message_count = messages.len(), context_window))]
 async fn maybe_compact_for_storage(
     messages: Vec<Message>,
     system_prompt: &str,

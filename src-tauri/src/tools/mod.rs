@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+use tracing::{debug, error, info, instrument};
 
 use crate::anthropic::types::ToolDefinition;
 
@@ -143,15 +144,25 @@ fn truncate(s: String) -> String {
 }
 
 /// Execute a tool by name. Returns Ok(output) or Err(error_message).
+#[instrument(skip(input, project_path), fields(tool = name))]
 pub async fn execute_tool(name: &str, input: &Value, project_path: &Path) -> Result<String, String> {
-    match name {
+    info!(tool = name, "executing tool");
+    let result = match name {
         "fs_read" => exec_fs_read(input, project_path).await,
         "fs_write" => exec_fs_write(input, project_path).await,
         "glob" => exec_glob(input, project_path).await,
         "grep" => exec_grep(input, project_path).await,
         "shell" => exec_shell(input, project_path).await,
-        other => Err(format!("Unknown tool: {other}")),
+        other => {
+            error!(tool = other, "unknown tool");
+            Err(format!("Unknown tool: {other}"))
+        }
+    };
+    match &result {
+        Ok(output) => debug!(tool = name, bytes = output.len(), success = true, "tool completed"),
+        Err(err) => error!(tool = name, error = %err, "tool failed"),
     }
+    result
 }
 
 fn resolve_path(project: &Path, rel: &str) -> PathBuf {
@@ -172,6 +183,7 @@ fn format_lines_numbered(lines: &[&str], start: usize) -> String {
     out
 }
 
+#[instrument(skip(input, project))]
 async fn exec_fs_read(input: &Value, project: &Path) -> Result<String, String> {
     let path = input["path"]
         .as_str()
@@ -218,6 +230,7 @@ async fn exec_fs_read(input: &Value, project: &Path) -> Result<String, String> {
     }
 }
 
+#[instrument(skip(input, project))]
 async fn exec_fs_write(input: &Value, project: &Path) -> Result<String, String> {
     let path = input["path"]
         .as_str()
@@ -252,6 +265,7 @@ fn load_gitignore(project: &Path) -> Gitignore {
 }
 
 
+#[instrument(skip(input, project))]
 async fn exec_glob(input: &Value, project: &Path) -> Result<String, String> {
     let pattern = input["pattern"]
         .as_str()
@@ -408,6 +422,7 @@ fn exec_grep_sync(
     Ok(truncate(output.trim_end().to_string()))
 }
 
+#[instrument(skip(input, project))]
 async fn exec_grep(input: &Value, project: &Path) -> Result<String, String> {
     let pattern = input["pattern"]
         .as_str()
@@ -428,6 +443,7 @@ async fn exec_grep(input: &Value, project: &Path) -> Result<String, String> {
     .map_err(|e| format!("grep task failed: {e}"))?
 }
 
+#[instrument(skip(input, project))]
 async fn exec_shell(input: &Value, project: &Path) -> Result<String, String> {
     let command = input["command"]
         .as_str()

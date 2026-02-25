@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument, warn};
 
 use super::types::{ModeInfo, RouterOutput};
 
@@ -39,6 +40,7 @@ impl std::error::Error for OverrideError {}
 /// - `mode` set to `override_mode`
 /// - `model` set to `override_model` when provided, otherwise preserved from `original`
 /// - `confidence` set to `1.0` because user choice is explicit
+#[instrument(skip(original, available_modes))]
 pub fn apply_override(
     original: &RouterOutput,
     override_mode: &str,
@@ -49,10 +51,18 @@ pub fn apply_override(
         .iter()
         .any(|mode| mode.name == override_mode);
     if !mode_exists {
+        warn!(override_mode, "user override rejected: unknown mode");
         return Err(OverrideError {
             message: format!("mode '{override_mode}' is not in available modes"),
         });
     }
+
+    info!(
+        from_mode = %original.mode,
+        to_mode = override_mode,
+        override_model = ?override_model,
+        "user override detected"
+    );
 
     let output = RouterOutput {
         mode: override_mode.to_string(),
@@ -65,6 +75,7 @@ pub fn apply_override(
         to_mode: override_mode.to_string(),
     };
 
+    debug!(mode = %output.mode, model = %output.model, "override applied");
     Ok((output, event))
 }
 

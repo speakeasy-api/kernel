@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use sqlx::SqlitePool;
+use tracing::debug;
 
 use super::types::{Event, EventData};
 use crate::db::queries::{get_ux_state, update_ux_state};
@@ -60,6 +61,7 @@ impl EventAccumulator {
     /// Feed an event into the accumulator. Returns `Some(reason)` when a
     /// threshold is crossed, `None` for routine events.
     pub fn accumulate(&mut self, event: &Event) -> Option<TriggerReason> {
+        debug!(event_id = %event.metadata.id, kind = %event.data.kind(), "accumulating event");
         // Track cursor position
         self.cursor.last_event_id = Some(event.metadata.id.to_string());
         self.cursor.last_event_at = Some(event.metadata.timestamp.to_rfc3339());
@@ -139,6 +141,7 @@ impl EventAccumulator {
     /// restart.
     pub async fn persist_cursor(&self, pool: &SqlitePool) -> Result<(), sqlx::Error> {
         if let (Some(id), Some(at)) = (&self.cursor.last_event_id, &self.cursor.last_event_at) {
+            debug!(last_event_id = %id, last_event_at = %at, "persisting accumulator cursor");
             update_ux_state(pool, "accumulator", id, at).await?;
         }
         Ok(())
@@ -146,17 +149,25 @@ impl EventAccumulator {
 
     /// Load a previously-persisted cursor from the database.
     pub async fn restore_cursor(pool: &SqlitePool) -> Result<AccumulatorCursor, sqlx::Error> {
+        debug!("restoring accumulator cursor from DB");
         match get_ux_state(pool, "accumulator").await? {
-            Some((last_event_id, last_event_at)) => Ok(AccumulatorCursor {
-                last_event_id,
-                last_event_at,
-            }),
-            None => Ok(AccumulatorCursor::default()),
+            Some((last_event_id, last_event_at)) => {
+                debug!(last_event_id = ?last_event_id, last_event_at = ?last_event_at, "cursor restored");
+                Ok(AccumulatorCursor {
+                    last_event_id,
+                    last_event_at,
+                })
+            }
+            None => {
+                debug!("no cursor found, using default");
+                Ok(AccumulatorCursor::default())
+            }
         }
     }
 
     /// Clear all counters after the UX agent has processed the trigger.
     pub fn reset(&mut self) {
+        debug!("resetting accumulator counters");
         self.rejection_count = 0;
         self.last_cost_rate = 0.0;
         self.override_counts.clear();

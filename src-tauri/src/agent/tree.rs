@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::types::{AgentStatus, SubAgent, TokenMetrics};
@@ -18,6 +19,7 @@ impl AgentTree {
     }
 
     pub fn set_root(&mut self, mut agent: SubAgent) {
+        info!(agent_id = %agent.id, "setting tree root");
         agent.parent_id = None;
         let root_id = agent.id;
         self.agents.insert(root_id, agent);
@@ -25,6 +27,7 @@ impl AgentTree {
     }
 
     pub fn add_child(&mut self, parent_id: Uuid, mut child: SubAgent) {
+        debug!(%parent_id, child_id = %child.id, "adding child agent");
         let child_id = child.id;
         child.parent_id = Some(parent_id);
         self.agents.insert(child_id, child);
@@ -49,6 +52,7 @@ impl AgentTree {
     }
 
     pub fn update_status(&mut self, id: &Uuid, status: AgentStatus) {
+        debug!(agent_id = %id, new_status = ?status, "updating agent status");
         if let Some(agent) = self.agents.get_mut(id) {
             agent.status = status;
         }
@@ -56,7 +60,9 @@ impl AgentTree {
 
     pub fn rollup_tokens(&self, id: &Uuid) -> TokenMetrics {
         let mut visited = HashSet::new();
-        self.rollup_tokens_recursive(id, &mut visited)
+        let totals = self.rollup_tokens_recursive(id, &mut visited);
+        debug!(agent_id = %id, input = totals.input, output = totals.output, cost_usd = totals.cost_usd, "rollup tokens");
+        totals
     }
 
     pub fn all_agents(&self) -> Vec<&SubAgent> {

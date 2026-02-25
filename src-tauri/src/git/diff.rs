@@ -4,6 +4,7 @@ use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::Lines;
+use tracing::debug;
 
 const KERNEL_DIR: &str = ".kernel";
 const WORKTREES_DIR: &str = "worktrees";
@@ -98,10 +99,13 @@ pub fn diff_for_task(
     branch: &str,
     base_commit: &str,
 ) -> Result<Vec<FileDiff>, DiffError> {
+    debug!(branch = %branch, base_commit = %base_commit, "computing diff for task");
     let wt_path = worktree_path(project_root, branch);
     let range = format!("{base_commit}..HEAD");
     let output = git(&wt_path, &["diff", "-M", &range])?;
-    parse_unified_diff(&output)
+    let files = parse_unified_diff(&output)?;
+    debug!(files_changed = files.len(), "diff computed");
+    Ok(files)
 }
 
 /// Returns summary diff statistics between `base_commit` and HEAD in the
@@ -111,10 +115,18 @@ pub fn diff_stat(
     branch: &str,
     base_commit: &str,
 ) -> Result<DiffStat, DiffError> {
+    debug!(branch = %branch, base_commit = %base_commit, "computing diff stat");
     let wt_path = worktree_path(project_root, branch);
     let range = format!("{base_commit}..HEAD");
     let output = git(&wt_path, &["diff", "--shortstat", &range])?;
-    parse_shortstat(&output)
+    let stat = parse_shortstat(&output)?;
+    debug!(
+        files_changed = stat.files_changed,
+        insertions = stat.insertions,
+        deletions = stat.deletions,
+        "diff stat computed"
+    );
+    Ok(stat)
 }
 
 // ── Parsing ──────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::SqlitePool;
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 use super::types::*;
@@ -12,14 +13,18 @@ const TASK_COLUMNS: &str = "id, session_id, title, description, status, priority
      parent_task, worktree_branch, base_ref, base_commit, merge_target_ref, outcome_kind, \
      outcome_data, engagement_override, cost_usd, created_at, updated_at";
 
+#[instrument(skip(pool, task), fields(task_id = %task.id, title = %task.title))]
 pub async fn insert_task(pool: &SqlitePool, task: &Task) -> Result<(), sqlx::Error> {
+    info!(%task.session_id, ?task.priority, "inserting task");
     insert_task_rows(pool, task).await
 }
 
+#[instrument(skip(tx, task), fields(task_id = %task.id, title = %task.title))]
 pub async fn insert_task_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     task: &Task,
 ) -> Result<(), sqlx::Error> {
+    info!(%task.session_id, ?task.priority, "inserting task in transaction");
     insert_task_rows_tx(&mut **tx, task).await
 }
 
@@ -118,7 +123,9 @@ async fn insert_task_rows_tx(
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn get_task(pool: &SqlitePool, task_id: Uuid) -> Result<Option<Task>, sqlx::Error> {
+    debug!(%task_id, "fetching task");
     let row = sqlx::query_as::<_, TaskRow>(&format!(
         "SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"
     ))
@@ -136,11 +143,13 @@ pub async fn get_task(pool: &SqlitePool, task_id: Uuid) -> Result<Option<Task>, 
     }
 }
 
+#[instrument(skip(pool))]
 pub async fn list_tasks(
     pool: &SqlitePool,
     session_id: Uuid,
     status_filter: Option<TaskStatus>,
 ) -> Result<Vec<Task>, sqlx::Error> {
+    debug!(%session_id, ?status_filter, "listing tasks");
     let rows = match status_filter {
         Some(status) => {
             sqlx::query_as::<_, TaskRow>(&format!(
@@ -180,12 +189,14 @@ pub async fn list_tasks(
     Ok(tasks)
 }
 
+#[instrument(skip(pool, outcome))]
 pub async fn update_task_status(
     pool: &SqlitePool,
     task_id: Uuid,
     status: TaskStatus,
     outcome: Option<&TaskOutcome>,
 ) -> Result<(), sqlx::Error> {
+    info!(%task_id, ?status, has_outcome = outcome.is_some(), "updating task status");
     let (outcome_kind, outcome_data) = outcome_to_columns(outcome);
     sqlx::query(
         "UPDATE tasks
@@ -201,11 +212,13 @@ pub async fn update_task_status(
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn update_task_engagement(
     pool: &SqlitePool,
     task_id: Uuid,
     engagement: Option<EngagementLevel>,
 ) -> Result<(), sqlx::Error> {
+    info!(%task_id, ?engagement, "updating task engagement");
     sqlx::query(
         "UPDATE tasks
          SET engagement_override = ?1, updated_at = CURRENT_TIMESTAMP
@@ -218,10 +231,12 @@ pub async fn update_task_engagement(
     Ok(())
 }
 
+#[instrument(skip(pool))]
 pub async fn get_task_tree(
     pool: &SqlitePool,
     session_id: Uuid,
 ) -> Result<(Vec<Task>, Vec<(Uuid, Uuid)>), sqlx::Error> {
+    debug!(%session_id, "fetching task tree");
     let tasks = list_tasks(pool, session_id, None).await?;
 
     let edge_rows: Vec<(String, String)> = sqlx::query_as(
@@ -247,10 +262,12 @@ pub async fn get_task_tree(
     Ok((tasks, edges))
 }
 
+#[instrument(skip(pool))]
 pub async fn next_unblocked(
     pool: &SqlitePool,
     session_id: Uuid,
 ) -> Result<Vec<Task>, sqlx::Error> {
+    debug!(%session_id, "querying next unblocked tasks");
     let rows = sqlx::query_as::<_, TaskRow>(&format!(
         "SELECT {TASK_COLUMNS}
          FROM tasks t
@@ -290,7 +307,9 @@ pub async fn next_unblocked(
     Ok(tasks)
 }
 
+#[instrument(skip(pool))]
 pub async fn find_dependents(pool: &SqlitePool, task_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    debug!(%task_id, "finding dependents");
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT task_id
          FROM task_deps

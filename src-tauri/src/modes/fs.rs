@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use sqlx::SqlitePool;
+use tracing::{debug, info, instrument, warn};
 
 use super::db;
 use super::types::{Mode, ModeOrigin};
@@ -42,6 +43,7 @@ fn default_version() -> u32 {
 }
 
 /// Parse a TOML mode file into a Mode struct.
+#[instrument(skip(content))]
 pub fn parse_toml_mode(content: &str) -> Result<Mode, String> {
     let parsed: TomlMode = toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
     let origin = parsed
@@ -63,6 +65,7 @@ pub fn parse_toml_mode(content: &str) -> Result<Mode, String> {
 
 /// Parse a Markdown mode file (with YAML-like frontmatter) into a Mode struct.
 /// Frontmatter is between --- delimiters. Body after frontmatter is the system_prompt.
+#[instrument(skip(content))]
 pub fn parse_markdown_mode(content: &str) -> Result<Mode, String> {
     let content = content.trim();
     if !content.starts_with("---") {
@@ -151,6 +154,7 @@ pub fn parse_markdown_mode(content: &str) -> Result<Mode, String> {
 }
 
 /// Parse a mode file, auto-detecting format from extension.
+#[instrument(fields(path = %path.display()))]
 pub fn parse_mode_file(path: &Path) -> Result<Mode, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
@@ -165,9 +169,12 @@ pub fn parse_mode_file(path: &Path) -> Result<Mode, String> {
 
 /// Scan the .kernel/modes/ directory and return all parsed modes.
 /// Skips files that fail to parse (log a warning but don't fail).
+#[instrument(fields(dir = %project_root.display()))]
 pub fn scan_mode_files(project_root: &Path) -> Vec<Mode> {
     let modes_dir = project_root.join(".kernel").join("modes");
+    info!(dir = %modes_dir.display(), "scanning mode files");
     if !modes_dir.is_dir() {
+        debug!("modes directory does not exist, returning empty");
         return Vec::new();
     }
 
@@ -186,17 +193,20 @@ pub fn scan_mode_files(project_root: &Path) -> Vec<Mode> {
         match parse_mode_file(&path) {
             Ok(mode) => modes.push(mode),
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping mode file");
+                warn!(path = %path.display(), error = %e, "skipping mode file");
             }
         }
     }
+    debug!(count = modes.len(), "found mode files");
     modes
 }
 
 /// Sync mode files to database. For each file-based mode, upsert into DB.
 /// File-based modes take precedence over DB state.
 /// Returns the number of modes synced.
+#[instrument(skip(pool), fields(project_root = %project_root.display()))]
 pub async fn sync_modes_to_db(pool: &SqlitePool, project_root: &Path) -> Result<usize, String> {
+    info!("syncing mode files to database");
     let modes = scan_mode_files(project_root);
     let count = modes.len();
     for mode in &modes {
@@ -204,6 +214,7 @@ pub async fn sync_modes_to_db(pool: &SqlitePool, project_root: &Path) -> Result<
             .await
             .map_err(|e| format!("failed to upsert mode '{}': {e}", mode.name))?;
     }
+    info!(count, "mode files synced to database");
     Ok(count)
 }
 

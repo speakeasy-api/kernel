@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, instrument};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BudgetError {
@@ -22,6 +23,7 @@ pub struct ContextBudget {
 }
 
 impl ContextBudget {
+    #[instrument]
     pub fn new(
         max_tokens: usize,
         reserved_system: usize,
@@ -53,6 +55,15 @@ impl ContextBudget {
             });
         }
 
+        debug!(
+            max_tokens,
+            reserved_system,
+            reserved_response,
+            compaction_trigger,
+            target_after_compaction,
+            "context budget created"
+        );
+
         Ok(Self {
             max_tokens,
             reserved_system,
@@ -75,12 +86,21 @@ impl ContextBudget {
     }
 
     pub fn needs_deep_compaction(&self, current_tokens: usize) -> bool {
-        current_tokens >= self.trigger_token_count()
+        let needs = current_tokens >= self.trigger_token_count();
+        debug!(
+            current_tokens,
+            trigger = self.trigger_token_count(),
+            needs_compaction = needs,
+            "deep compaction check"
+        );
+        needs
     }
 
     pub fn tokens_to_reclaim(&self, current_tokens: usize) -> usize {
         if self.needs_deep_compaction(current_tokens) {
-            current_tokens.saturating_sub(self.target_token_count())
+            let reclaim = current_tokens.saturating_sub(self.target_token_count());
+            debug!(current_tokens, target = self.target_token_count(), reclaim, "tokens to reclaim");
+            reclaim
         } else {
             0
         }

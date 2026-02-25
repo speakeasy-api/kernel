@@ -2,6 +2,7 @@ use std::error::Error;
 use std::str::FromStr;
 
 use sqlx::SqlitePool;
+use tracing::{debug, info, instrument, warn};
 
 use super::learning::{Convention, Correction, CorrectionType};
 use super::types::{
@@ -20,7 +21,9 @@ impl RecommendationStore {
         Self { pool }
     }
 
+    #[instrument(skip(self, rec), fields(trigger_pattern = %rec.trigger_pattern))]
     pub async fn insert(&self, rec: &Recommendation) -> StoreResult<u64> {
+        debug!(trigger_pattern = %rec.trigger_pattern, status = %rec.status, "inserting recommendation");
         let action_json = serde_json::to_string(&rec.action)?;
         let result = sqlx::query(
             "INSERT INTO recommendations (trigger_pattern, recommendation, action, status)
@@ -32,10 +35,14 @@ impl RecommendationStore {
         .bind(rec.status.to_string())
         .execute(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid() as u64)
+        let id = result.last_insert_rowid() as u64;
+        info!(id, trigger_pattern = %rec.trigger_pattern, "recommendation inserted");
+        Ok(id)
     }
 
+    #[instrument(skip(self))]
     pub async fn get(&self, id: u64) -> StoreResult<Option<Recommendation>> {
+        debug!(id, "fetching recommendation");
         let row: Option<RecommendationRow> = sqlx::query_as(
             "SELECT id, trigger_pattern, recommendation, action, status
              FROM recommendations WHERE id = ?1",
@@ -45,15 +52,22 @@ impl RecommendationStore {
         .await?;
         match row {
             Some(r) => Ok(Some(row_to_recommendation(r)?)),
-            None => Ok(None),
+            None => {
+                debug!(id, "recommendation not found");
+                Ok(None)
+            }
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn list_pending(&self) -> StoreResult<Vec<Recommendation>> {
+        debug!("listing pending recommendations");
         self.list_by_status(RecommendationStatus::Pending).await
     }
 
+    #[instrument(skip(self))]
     pub async fn list_all(&self) -> StoreResult<Vec<Recommendation>> {
+        debug!("listing all recommendations");
         let rows: Vec<RecommendationRow> = sqlx::query_as(
             "SELECT id, trigger_pattern, recommendation, action, status
              FROM recommendations
@@ -61,14 +75,17 @@ impl RecommendationStore {
         )
         .fetch_all(&self.pool)
         .await?;
+        debug!(count = rows.len(), "fetched all recommendations");
         rows.into_iter().map(row_to_recommendation).collect()
     }
 
+    #[instrument(skip(self))]
     pub async fn update_status(
         &self,
         id: u64,
         status: RecommendationStatus,
     ) -> StoreResult<()> {
+        info!(id, %status, "updating recommendation status");
         sqlx::query("UPDATE recommendations SET status = ?1 WHERE id = ?2")
             .bind(status.to_string())
             .bind(id as i64)
@@ -77,7 +94,9 @@ impl RecommendationStore {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_cursor(&self) -> StoreResult<UxAgentState> {
+        debug!("fetching UX agent cursor state");
         let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT last_event_id, last_event_at, last_run_at
              FROM ux_agent_state WHERE id = 1",
@@ -90,11 +109,16 @@ impl RecommendationStore {
                 last_event_at,
                 last_run_at,
             }),
-            None => Ok(UxAgentState::default()),
+            None => {
+                debug!("no cursor state found, returning default");
+                Ok(UxAgentState::default())
+            }
         }
     }
 
+    #[instrument(skip(self, state))]
     pub async fn set_cursor(&self, state: &UxAgentState) -> StoreResult<()> {
+        debug!(last_event_id = ?state.last_event_id, last_run_at = ?state.last_run_at, "updating UX agent cursor state");
         sqlx::query(
             "INSERT INTO ux_agent_state (id, last_event_id, last_event_at, last_run_at)
              VALUES (1, ?1, ?2, ?3)
@@ -111,12 +135,14 @@ impl RecommendationStore {
         Ok(())
     }
 
+    #[instrument(skip(self, snapshot))]
     pub async fn insert_version(
         &self,
         recommendation_id: u64,
         version: u32,
         snapshot: &str,
     ) -> StoreResult<()> {
+        info!(recommendation_id, version, "inserting recommendation version");
         sqlx::query(
             "INSERT INTO recommendation_versions (recommendation_id, version, applied_at, snapshot)
              VALUES (?1, ?2, CURRENT_TIMESTAMP, ?3)",
@@ -129,10 +155,12 @@ impl RecommendationStore {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_versions(
         &self,
         recommendation_id: u64,
     ) -> StoreResult<Vec<RecommendationVersion>> {
+        debug!(recommendation_id, "fetching recommendation versions");
         let rows: Vec<VersionRow> = sqlx::query_as(
             "SELECT id, recommendation_id, version, applied_at, reverted_at, snapshot
              FROM recommendation_versions
@@ -142,10 +170,13 @@ impl RecommendationStore {
         .bind(recommendation_id as i64)
         .fetch_all(&self.pool)
         .await?;
+        debug!(recommendation_id, count = rows.len(), "fetched recommendation versions");
         Ok(rows.into_iter().map(row_to_version).collect())
     }
 
+    #[instrument(skip(self))]
     pub async fn mark_version_reverted(&self, version_id: u64) -> StoreResult<()> {
+        info!(version_id, "marking version as reverted");
         sqlx::query(
             "UPDATE recommendation_versions SET reverted_at = CURRENT_TIMESTAMP WHERE id = ?1",
         )
@@ -155,18 +186,27 @@ impl RecommendationStore {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_dismissed_patterns(&self) -> StoreResult<Vec<String>> {
+        debug!("fetching dismissed patterns");
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT trigger_pattern FROM recommendations WHERE lower(status) = 'dismissed'",
         )
         .fetch_all(&self.pool)
         .await?;
+        debug!(count = rows.len(), "fetched dismissed patterns");
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
     // --- Corrections ---
 
+    #[instrument(skip(self, correction), fields(correction_type = correction.correction_type.as_str()))]
     pub async fn insert_correction(&self, correction: &Correction) -> StoreResult<u64> {
+        debug!(
+            correction_type = correction.correction_type.as_str(),
+            session_id = ?correction.session_id,
+            "inserting correction"
+        );
         let result = sqlx::query(
             "INSERT INTO corrections (session_id, correction_type, original_value, corrected_value, context, incorporated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -179,10 +219,14 @@ impl RecommendationStore {
         .bind(correction.incorporated as i32)
         .execute(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid() as u64)
+        let id = result.last_insert_rowid() as u64;
+        info!(id, correction_type = correction.correction_type.as_str(), "correction inserted");
+        Ok(id)
     }
 
+    #[instrument(skip(self))]
     pub async fn get_unincorporated_corrections(&self) -> StoreResult<Vec<Correction>> {
+        debug!("fetching unincorporated corrections");
         let rows: Vec<CorrectionRow> = sqlx::query_as(
             "SELECT id, session_id, correction_type, original_value, corrected_value, context, created_at, incorporated
              FROM corrections
@@ -191,13 +235,16 @@ impl RecommendationStore {
         )
         .fetch_all(&self.pool)
         .await?;
+        debug!(count = rows.len(), "fetched unincorporated corrections");
         rows.into_iter().map(row_to_correction).collect()
     }
 
+    #[instrument(skip(self))]
     pub async fn get_corrections_by_type(
         &self,
         correction_type: &str,
     ) -> StoreResult<Vec<Correction>> {
+        debug!(correction_type, "fetching corrections by type");
         let rows: Vec<CorrectionRow> = sqlx::query_as(
             "SELECT id, session_id, correction_type, original_value, corrected_value, context, created_at, incorporated
              FROM corrections
@@ -207,13 +254,17 @@ impl RecommendationStore {
         .bind(correction_type)
         .fetch_all(&self.pool)
         .await?;
+        debug!(correction_type, count = rows.len(), "fetched corrections by type");
         rows.into_iter().map(row_to_correction).collect()
     }
 
+    #[instrument(skip(self), fields(count = ids.len()))]
     pub async fn mark_corrections_incorporated(&self, ids: &[u64]) -> StoreResult<()> {
         if ids.is_empty() {
+            debug!("no correction ids to mark as incorporated");
             return Ok(());
         }
+        info!(count = ids.len(), "marking corrections as incorporated");
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
             "UPDATE corrections SET incorporated = 1 WHERE id IN ({})",
@@ -229,12 +280,14 @@ impl RecommendationStore {
 
     // --- Conventions ---
 
+    #[instrument(skip(self, source_ids))]
     pub async fn insert_convention(
         &self,
         convention: &str,
         source_ids: &[u64],
         target_mode: Option<&str>,
     ) -> StoreResult<u64> {
+        debug!(convention, target_mode, source_count = source_ids.len(), "inserting convention");
         let source_json = serde_json::to_string(source_ids)?;
         let result = sqlx::query(
             "INSERT INTO conventions (convention, source_corrections, target_mode)
@@ -245,10 +298,14 @@ impl RecommendationStore {
         .bind(target_mode)
         .execute(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid() as u64)
+        let id = result.last_insert_rowid() as u64;
+        info!(id, convention, "convention inserted");
+        Ok(id)
     }
 
+    #[instrument(skip(self))]
     pub async fn get_proposed_conventions(&self) -> StoreResult<Vec<Convention>> {
+        debug!("fetching proposed conventions");
         let rows: Vec<ConventionRow> = sqlx::query_as(
             "SELECT id, convention, source_corrections, target_mode, status, created_at
              FROM conventions
@@ -257,10 +314,13 @@ impl RecommendationStore {
         )
         .fetch_all(&self.pool)
         .await?;
+        debug!(count = rows.len(), "fetched proposed conventions");
         rows.into_iter().map(row_to_convention).collect()
     }
 
+    #[instrument(skip(self))]
     pub async fn update_convention_status(&self, id: u64, status: &str) -> StoreResult<()> {
+        info!(id, status, "updating convention status");
         sqlx::query("UPDATE conventions SET status = ?1 WHERE id = ?2")
             .bind(status)
             .bind(id as i64)
@@ -269,10 +329,12 @@ impl RecommendationStore {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     async fn list_by_status(
         &self,
         status: RecommendationStatus,
     ) -> StoreResult<Vec<Recommendation>> {
+        debug!(%status, "listing recommendations by status");
         let rows: Vec<RecommendationRow> = sqlx::query_as(
             "SELECT id, trigger_pattern, recommendation, action, status
              FROM recommendations
@@ -282,6 +344,7 @@ impl RecommendationStore {
         .bind(status.to_string())
         .fetch_all(&self.pool)
         .await?;
+        debug!(%status, count = rows.len(), "fetched recommendations by status");
         rows.into_iter().map(row_to_recommendation).collect()
     }
 }
@@ -330,9 +393,15 @@ struct ConventionRow {
 }
 
 fn row_to_recommendation(row: RecommendationRow) -> StoreResult<Recommendation> {
-    let action: RecommendationAction = serde_json::from_str(&row.action)?;
+    let action: RecommendationAction = serde_json::from_str(&row.action).map_err(|e| {
+        warn!(id = row.id, error = %e, "failed to parse recommendation action JSON");
+        e
+    })?;
     let status = RecommendationStatus::from_str(&row.status)
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        .map_err(|e| {
+            warn!(id = row.id, status = %row.status, "unknown recommendation status");
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
     Ok(Recommendation {
         id: row.id as u64,
         trigger_pattern: row.trigger_pattern,
@@ -355,6 +424,7 @@ fn row_to_version(row: VersionRow) -> RecommendationVersion {
 
 fn row_to_correction(row: CorrectionRow) -> StoreResult<Correction> {
     let correction_type = CorrectionType::from_str(&row.correction_type).ok_or_else(|| {
+        warn!(id = row.id, correction_type = %row.correction_type, "unknown correction type");
         Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown correction type: {}", row.correction_type),
@@ -373,7 +443,10 @@ fn row_to_correction(row: CorrectionRow) -> StoreResult<Correction> {
 }
 
 fn row_to_convention(row: ConventionRow) -> StoreResult<Convention> {
-    let source_corrections: Vec<u64> = serde_json::from_str(&row.source_corrections)?;
+    let source_corrections: Vec<u64> = serde_json::from_str(&row.source_corrections).map_err(|e| {
+        warn!(id = row.id, error = %e, "failed to parse convention source_corrections JSON");
+        e
+    })?;
     Ok(Convention {
         id: row.id as u64,
         convention: row.convention,

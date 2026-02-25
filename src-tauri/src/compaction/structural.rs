@@ -1,3 +1,5 @@
+use tracing::{debug, instrument};
+
 use super::budget::Message;
 
 pub struct StructuralFilter;
@@ -5,11 +7,15 @@ pub struct StructuralFilter;
 impl StructuralFilter {
     /// Applies all structural filters to the message list.
     /// The system prompt (role "system") is never modified.
+    #[instrument(skip_all, fields(input_count = messages.len()))]
     pub fn apply(messages: &[Message]) -> Vec<Message> {
+        debug!(input_count = messages.len(), "applying structural filters");
         let messages = Self::collapse_tool_outputs(messages);
+        debug!(after_collapse = messages.len(), "tool outputs collapsed");
         let messages = Self::deduplicate_reads(&messages);
+        debug!(after_dedup = messages.len(), "duplicate reads removed");
 
-        messages
+        let result: Vec<Message> = messages
             .into_iter()
             .filter_map(|mut msg| {
                 if !msg.role.eq_ignore_ascii_case("system") {
@@ -25,7 +31,9 @@ impl StructuralFilter {
                     None
                 }
             })
-            .collect()
+            .collect();
+        debug!(output_count = result.len(), "structural filtering complete");
+        result
     }
 
     fn strip_thinking_tags(content: &str) -> String {

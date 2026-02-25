@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument, warn};
 
 use crate::ux_agent::triggers::{EventSummary, TriggerReason};
 use crate::ux_agent::types::{ModeChanges, RecommendationAction};
@@ -28,11 +29,18 @@ pub struct DecisionCandidate {
 /// Generate decision candidates from triggers and context.
 ///
 /// These candidates are included in the model prompt to guide its output.
+#[instrument(skip(_summary, context), fields(trigger_count = triggers.len()))]
 pub fn generate_candidates(
     triggers: &[TriggerReason],
     _summary: &EventSummary,
     context: &DecisionContext,
 ) -> Vec<DecisionCandidate> {
+    info!(
+        trigger_count = triggers.len(),
+        available_modes = ?context.available_modes,
+        dismissed_patterns = context.dismissed_patterns.len(),
+        "making UX decision from triggers"
+    );
     let mut candidates = Vec::new();
 
     for trigger in triggers {
@@ -104,16 +112,31 @@ pub fn generate_candidates(
     }
 
     // Filter out candidates matching dismissed patterns
+    let pre_filter_count = candidates.len();
     candidates.retain(|c| {
-        !context
+        let dominated = context
             .dismissed_patterns
             .iter()
-            .any(|p| c.trigger.contains(p))
+            .any(|p| c.trigger.contains(p));
+        if dominated {
+            warn!(trigger = %c.trigger, "filtering out candidate matching dismissed pattern");
+        }
+        !dominated
     });
 
+    if pre_filter_count != candidates.len() {
+        debug!(
+            before = pre_filter_count,
+            after = candidates.len(),
+            "candidates filtered by dismissed patterns"
+        );
+    }
+
+    info!(candidate_count = candidates.len(), "UX decision made");
     candidates
 }
 
+#[instrument(skip(system_prompt))]
 pub fn build_mode_create_action(
     name: &str,
     description: &str,
@@ -121,6 +144,7 @@ pub fn build_mode_create_action(
     default_model: Option<&str>,
     allowed_tools: &[&str],
 ) -> RecommendationAction {
+    info!(name, description, default_model, tools = ?allowed_tools, "building mode_create action");
     RecommendationAction::ModeCreate {
         name: name.to_string(),
         description: description.to_string(),
@@ -130,18 +154,22 @@ pub fn build_mode_create_action(
     }
 }
 
+#[instrument]
 pub fn build_mode_edit_action(mode_name: &str, changes: ModeChanges) -> RecommendationAction {
+    info!(mode_name, ?changes, "building mode_edit action");
     RecommendationAction::ModeEdit {
         mode_name: mode_name.to_string(),
         changes,
     }
 }
 
+#[instrument]
 pub fn build_model_change_action(
     role: &str,
     from_model: &str,
     to_model: &str,
 ) -> RecommendationAction {
+    info!(role, from_model, to_model, "building model_change action");
     RecommendationAction::ModelChange {
         role: role.to_string(),
         from_model: from_model.to_string(),
@@ -149,11 +177,13 @@ pub fn build_model_change_action(
     }
 }
 
+#[instrument]
 pub fn build_config_change_action(
     key: &str,
     old_value: &str,
     new_value: &str,
 ) -> RecommendationAction {
+    info!(key, old_value, new_value, "building config_change action");
     RecommendationAction::ConfigChange {
         key: key.to_string(),
         old_value: old_value.to_string(),
@@ -161,11 +191,13 @@ pub fn build_config_change_action(
     }
 }
 
+#[instrument(skip(old_fragment, new_fragment))]
 pub fn build_prompt_edit_action(
     mode_name: &str,
     old_fragment: &str,
     new_fragment: &str,
 ) -> RecommendationAction {
+    info!(mode_name, "building prompt_edit action");
     RecommendationAction::PromptEdit {
         mode_name: mode_name.to_string(),
         old_fragment: old_fragment.to_string(),

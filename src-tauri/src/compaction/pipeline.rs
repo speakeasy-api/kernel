@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument, warn};
 
 use super::budget::{
     estimate_message_tokens, estimate_tokens, BudgetError, ContextBudget, Message,
@@ -69,50 +70,70 @@ impl<C: LlmClient> CompactionPipeline<C> {
 
     /// Run compaction on the given messages. This is the main entry point
     /// called after each agent turn.
+    #[instrument(skip_all, fields(message_count = messages.len()))]
     pub async fn compact(
         &self,
         system_prompt: &str,
         messages: &[Message],
     ) -> Result<CompactedContext, CompactionError> {
+        info!(message_count = messages.len(), "starting compaction pipeline");
         let mut working_messages = messages.to_vec();
 
         // Step 1: Light compaction.
         if self.light_every_turn {
+            debug!("applying light compaction (structural filters)");
             working_messages = StructuralFilter::apply(&working_messages);
+            debug!(after_light = working_messages.len(), "light compaction done");
         }
 
         // Step 2: Deep-compaction budget check.
         let current_tokens =
             estimate_message_tokens(&working_messages) + estimate_tokens(system_prompt);
+        debug!(current_tokens, "checking deep compaction budget");
 
         if self.budget.needs_deep_compaction(current_tokens) {
             // Step 3: Extract preservation facts before deep compaction.
+            debug!("extracting preservation facts");
             let _ = self
                 .preservation_rules
                 .extract_preserved_facts(&working_messages);
 
             // Step 4: Deep compaction with graceful fallback.
+            debug!("running semantic deep compaction");
             match self
                 .semantic_compactor
                 .compact(&working_messages, &self.preservation_rules)
                 .await
             {
                 Ok(compacted) => {
+                    debug!(compacted_messages = compacted.messages.len(), "deep compaction succeeded");
                     working_messages = compacted.messages;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "deep compaction failed, using light compaction only");
+                    warn!(error = %e, "deep compaction failed, using light compaction only");
                 }
             }
+        } else {
+            debug!(current_tokens, "below deep compaction trigger, skipping");
         }
 
         // Step 5: Build output from final state.
+        debug!("building compaction output");
         let preserved_facts = self
             .preservation_rules
             .extract_preserved_facts(&working_messages);
         let learnings = Self::extract_learnings(&working_messages);
         let token_count =
             estimate_message_tokens(&working_messages) + estimate_tokens(system_prompt);
+
+        info!(
+            before_messages = messages.len(),
+            after_messages = working_messages.len(),
+            token_count,
+            learnings = learnings.len(),
+            preserved_facts = preserved_facts.len(),
+            "compaction pipeline complete"
+        );
 
         Ok(CompactedContext {
             system_prompt: system_prompt.to_string(),

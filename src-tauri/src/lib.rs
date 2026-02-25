@@ -28,6 +28,8 @@ pub fn run() {
         .with_target(true)
         .init();
 
+    tracing::info!("kernel backend starting");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
