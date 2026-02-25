@@ -149,6 +149,43 @@ async fn load_agent_context(pool: &SqlitePool, session_id: &str) -> Result<Vec<M
     Ok(rows)
 }
 
+/// Inject revert notifications from FileRevert events into the context so the
+/// LLM is aware of user reversions. Called only when building context for the
+/// API call, not when serving context to the frontend.
+#[instrument(skip(pool, messages))]
+async fn inject_revert_messages(pool: &SqlitePool, session_id: &str, messages: &mut Vec<Message>) {
+    let events = crate::db::queries::events_since(pool, session_id, "1970-01-01T00:00:00Z")
+        .await
+        .unwrap_or_default();
+    for ev in events {
+        if ev.kind != "FileRevert" {
+            continue;
+        }
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+            let tool_use_id = data["tool_use_id"].as_str().unwrap_or("unknown");
+            let path = data["path"].as_str().unwrap_or("unknown");
+            let reason = data["reason"].as_str().unwrap_or("");
+            let msg = if reason.is_empty() {
+                format!(
+                    "[file_revert] The result of tool_use id={tool_use_id} (fs_write to `{path}`) \
+                     was reverted by the user. The file has been restored to its previous state. \
+                     Do not re-apply this change unless explicitly asked."
+                )
+            } else {
+                format!(
+                    "[file_revert] The result of tool_use id={tool_use_id} (fs_write to `{path}`) \
+                     was reverted by the user. Reason: {reason}. The file has been restored to its \
+                     previous state. Do not re-apply this change unless explicitly asked."
+                )
+            };
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: msg }],
+            });
+        }
+    }
+}
+
 /// Append a Message to the conversation log and return its ordinal.
 async fn append_message(
     pool: &SqlitePool,
@@ -488,18 +525,6 @@ pub async fn revert_file(
         .to_string();
         let _ = crate::db::queries::insert_event(&*pool, &session_id, None, "FileRevert", &revert_data).await;
 
-        // Append revert info to conversation so LLM is aware
-        let revert_msg = if reason.is_empty() {
-            format!("I reverted your file write to {path}. The file has been restored to its previous state.")
-        } else {
-            format!("I reverted your file write to {path}. Reason: {reason}. The file has been restored to its previous state.")
-        };
-        let revert_message = crate::anthropic::types::Message {
-            role: crate::anthropic::types::Role::User,
-            content: vec![crate::anthropic::types::ContentBlock::Text { text: revert_msg }],
-        };
-        let _ = append_message(&*pool, &session_id, &revert_message).await;
-
         // Emit event for live frontend
         let _ = app.emit("file-reverted", FileRevertedEvent {
             tool_use_id,
@@ -639,6 +664,7 @@ pub async fn submit_prompt(
 
     // Load conversation history from DB and append user message
     let mut history = load_agent_context(&*pool, &session.id).await?;
+    inject_revert_messages(&*pool, &session.id, &mut history).await;
     let user_msg = Message {
         role: Role::User,
         content: vec![ContentBlock::Text {

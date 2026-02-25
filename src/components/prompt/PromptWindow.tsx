@@ -180,18 +180,26 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     [selectedMode.name],
   );
 
-  const displayItems = historyView === "agent" && agentContext ? agentContext : items;
+  const displayItems = useMemo(() => {
+    if (historyView === "agent" && agentContext) {
+      // Merge file_reverted events from the live stream into agent context
+      const revertItems = items.filter((i) => i.kind === "file_reverted");
+      return revertItems.length > 0 ? [...agentContext, ...revertItems] : agentContext;
+    }
+    return items;
+  }, [historyView, agentContext, items]);
 
-  // Pre-pass: build set of reverted tool_use_ids and their reasons
+  // Pre-pass: build set of reverted tool_use_ids and their reasons.
+  // Always source from `items` (event-driven) so it works in both views.
   const revertedMap = useMemo(() => {
     const map = new Map<string, string>();
-    for (const item of displayItems) {
+    for (const item of items) {
       if (item.kind === "file_reverted") {
         map.set(item.toolUseId, item.reason);
       }
     }
     return map;
-  }, [displayItems]);
+  }, [items]);
 
   // Pre-pass: build set of tool_use_ids that have a file_change following them
   const fileChangeIds = useMemo(() => {
@@ -338,8 +346,19 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
                   );
                 }
 
-                // file_reverted items are consumed by the revertedMap pre-pass
-                if (item.kind === "file_reverted") return null;
+                // In full view, file_reverted is consumed by the revertedMap (DiffView shows badge).
+                // In agent view, render as a distinct divider.
+                if (item.kind === "file_reverted") {
+                  if (historyView === "full") return null;
+                  return (
+                    <RevertDivider
+                      key={i}
+                      path={item.path}
+                      reason={item.reason}
+                      toolUseId={item.toolUseId}
+                    />
+                  );
+                }
 
                 return null;
               })}
@@ -483,3 +502,21 @@ function CompactionDivider({ beforeMessages, afterMessages }: CompactionDividerP
     </div>
   );
 }
+
+function RevertDivider({ path, reason, toolUseId }: { path: string; reason: string; toolUseId: string }) {
+  return (
+    <div className="flex items-center gap-2 py-1">
+      <div className="flex-1 border-t border-dashed border-red-500/20" />
+      <span className="shrink-0 flex items-center gap-1.5 text-[10px] text-red-400/60">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" className="shrink-0">
+          <path d="M1 5h8M5 1 1 5l4 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        reverted {path}
+        {reason && <span className="text-red-400/40">&mdash; {reason}</span>}
+        <span className="font-mono text-red-400/30">{toolUseId.slice(0, 12)}</span>
+      </span>
+      <div className="flex-1 border-t border-dashed border-red-500/20" />
+    </div>
+  );
+}
+
