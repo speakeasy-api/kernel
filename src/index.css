@@ -24,6 +24,13 @@
   --color-accent-subtle: rgba(124, 106, 239, 0.08);
   --color-accent-glow: rgba(124, 106, 239, 0.15);
 
+  --color-diff-add-bg: rgba(80, 200, 120, 0.06);
+  --color-diff-add-border: rgba(80, 200, 120, 0.4);
+  --color-diff-add-num: rgba(80, 200, 120, 0.4);
+  --color-diff-remove-bg: rgba(248, 81, 73, 0.06);
+  --color-diff-remove-border: rgba(248, 81, 73, 0.4);
+  --color-diff-remove-num: rgba(248, 81, 73, 0.4);
+
   --font-sans: "Inter Variable", "Inter", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono Variable", "SF Mono", "Menlo", monospace;
 

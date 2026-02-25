@@ -240,6 +240,36 @@ struct LlmToolResultEvent {
     is_error: bool,
 }
 
+#[derive(Clone, Serialize)]
+struct FileChangeEvent {
+    tool_use_id: String,
+    path: String,
+    status: String,
+    hunks: Vec<HunkPayload>,
+    bytes_written: usize,
+    before_content: Option<String>,
+    after_content: String,
+}
+
+#[derive(Clone, Serialize)]
+struct HunkPayload {
+    header: String,
+    lines: Vec<DiffLinePayload>,
+}
+
+#[derive(Clone, Serialize)]
+struct DiffLinePayload {
+    kind: String,
+    content: String,
+}
+
+#[derive(Clone, Serialize)]
+struct FileRevertedEvent {
+    tool_use_id: String,
+    path: String,
+    reason: String,
+}
+
 struct InFlightToolCall {
     id: String,
     name: String,
@@ -416,6 +446,69 @@ async fn build_conversation_history(
     }
 
     Ok(ConversationHistory { entries, last_mode })
+}
+
+#[tauri::command]
+#[instrument(skip(app, pool))]
+pub async fn revert_file(
+    session_id: String,
+    tool_use_id: String,
+    path: String,
+    before_content: Option<String>,
+    after_content: String,
+    reason: String,
+    force: Option<bool>,
+    app: tauri::AppHandle,
+    pool: State<'_, SqlitePool>,
+) -> Result<crate::tools::RevertResult, String> {
+    info!(session_id, path = %path, tool_use_id, "revert_file called");
+
+    let session = crate::db::queries::get_session(&*pool, &session_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+
+    let project = std::path::Path::new(&session.project_path);
+    let result = crate::tools::revert_file_write(
+        project,
+        &path,
+        before_content.as_deref(),
+        &after_content,
+        force.unwrap_or(false),
+    )
+    .await;
+
+    if matches!(result, crate::tools::RevertResult::Success) {
+        // Persist FileRevert event
+        let revert_data = serde_json::json!({
+            "tool_use_id": tool_use_id,
+            "path": path,
+            "reason": reason,
+        })
+        .to_string();
+        let _ = crate::db::queries::insert_event(&*pool, &session_id, None, "FileRevert", &revert_data).await;
+
+        // Append revert info to conversation so LLM is aware
+        let revert_msg = if reason.is_empty() {
+            format!("I reverted your file write to {path}. The file has been restored to its previous state.")
+        } else {
+            format!("I reverted your file write to {path}. Reason: {reason}. The file has been restored to its previous state.")
+        };
+        let revert_message = crate::anthropic::types::Message {
+            role: crate::anthropic::types::Role::User,
+            content: vec![crate::anthropic::types::ContentBlock::Text { text: revert_msg }],
+        };
+        let _ = append_message(&*pool, &session_id, &revert_message).await;
+
+        // Emit event for live frontend
+        let _ = app.emit("file-reverted", FileRevertedEvent {
+            tool_use_id,
+            path,
+            reason,
+        });
+    }
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -977,15 +1070,15 @@ async fn run_agent_loop(
                 );
 
                 tracing::debug!(tool = %name, "executing tool");
-                let result = execute_tool(name, input, project).await;
-                let (content, is_error) = match &result {
+                let tool_output = execute_tool(name, input, project).await;
+                let (content, is_error, file_change) = match &tool_output {
                     Ok(output) => {
-                        tracing::debug!(tool = %name, bytes = output.len(), "tool ok");
-                        (output.clone(), false)
+                        tracing::debug!(tool = %name, bytes = output.content.len(), "tool ok");
+                        (output.content.clone(), false, output.file_change.clone())
                     }
                     Err(err) => {
                         tracing::warn!(tool = %name, error = %err, "tool error");
-                        (err.clone(), true)
+                        (err.clone(), true, None)
                     }
                 };
 
@@ -1001,6 +1094,41 @@ async fn run_agent_loop(
                         is_error,
                     },
                 );
+
+                // Emit and persist structured file-change data (for diff view + revert)
+                if let Some(fc) = file_change {
+                    let status_str = match &fc.status {
+                        crate::tools::FileChangeStatus::Created => "created",
+                        crate::tools::FileChangeStatus::Modified => "modified",
+                    };
+                    let hunks_payload: Vec<HunkPayload> = fc.hunks.iter().map(|h| HunkPayload {
+                        header: h.header.clone(),
+                        lines: h.lines.iter().map(|l| DiffLinePayload {
+                            kind: match l.kind {
+                                crate::git::diff::LineKind::Context => "context",
+                                crate::git::diff::LineKind::Add => "add",
+                                crate::git::diff::LineKind::Remove => "remove",
+                            }.into(),
+                            content: l.content.clone(),
+                        }).collect(),
+                    }).collect();
+
+                    let fc_event = FileChangeEvent {
+                        tool_use_id: id.clone(),
+                        path: fc.path.clone(),
+                        status: status_str.into(),
+                        hunks: hunks_payload,
+                        bytes_written: fc.bytes_written,
+                        before_content: fc.before_content.clone(),
+                        after_content: fc.after_content.clone(),
+                    };
+
+                    // Persist as DB event
+                    let fc_data = serde_json::to_string(&fc_event).unwrap_or_default();
+                    let _ = crate::db::queries::insert_event(pool, session_id, None, "FileChange", &fc_data).await;
+
+                    let _ = app.emit("file-change", fc_event);
+                }
 
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),

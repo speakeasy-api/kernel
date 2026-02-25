@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { submitPrompt, cancelPrompt, getConversationHistory } from "../lib/commands";
+import { submitPrompt, cancelPrompt, getConversationHistory, eventsSince } from "../lib/commands";
 import type { ContextBlock } from "../lib/commands";
+
+export interface DiffHunk {
+  header: string;
+  lines: Array<{ kind: "context" | "add" | "remove"; content: string }>;
+}
 
 export type ChatItem =
   | { kind: "text"; role: "user" | "assistant"; content: string }
   | { kind: "tool_call"; id: string; name: string; input: Record<string, unknown> }
   | { kind: "tool_result"; id: string; content: string; isError: boolean }
+  | { kind: "file_change"; toolUseId: string; path: string; status: "created" | "modified"; hunks: DiffHunk[]; bytesWritten: number; beforeContent: string | null; afterContent: string }
+  | { kind: "file_reverted"; toolUseId: string; path: string; reason: string }
   | { kind: "compaction"; beforeMessages: number; afterMessages: number }
   | { kind: "interrupted" };
 
@@ -44,6 +51,25 @@ interface LlmToolResult {
   is_error: boolean;
 }
 
+interface FileChangePayload {
+  tool_use_id: string;
+  path: string;
+  status: "created" | "modified";
+  hunks: Array<{
+    header: string;
+    lines: Array<{ kind: "context" | "add" | "remove"; content: string }>;
+  }>;
+  bytes_written: number;
+  before_content: string | null;
+  after_content: string;
+}
+
+interface FileRevertedPayload {
+  tool_use_id: string;
+  path: string;
+  reason: string;
+}
+
 interface ContextUsageEvent {
   session_id: string;
   input_tokens: number;
@@ -78,10 +104,58 @@ function contextBlocksToChatItems(role: "user" | "assistant", content: ContextBl
 
 async function loadHistoryItems(sessionId: string): Promise<HistoryResult> {
   try {
-    const history = await getConversationHistory(sessionId);
+    const [history, events] = await Promise.all([
+      getConversationHistory(sessionId),
+      eventsSince(sessionId, "1970-01-01T00:00:00Z"),
+    ]);
+
+    // Build file change/revert items from events
+    const fileChangeItems: ChatItem[] = [];
+    for (const ev of events) {
+      if (ev.kind === "FileChange") {
+        try {
+          const d = JSON.parse(ev.data);
+          fileChangeItems.push({
+            kind: "file_change",
+            toolUseId: d.tool_use_id,
+            path: d.path,
+            status: d.status,
+            hunks: d.hunks ?? [],
+            bytesWritten: d.bytes_written ?? 0,
+            beforeContent: d.before_content ?? null,
+            afterContent: d.after_content ?? "",
+          });
+        } catch { /* skip malformed */ }
+      } else if (ev.kind === "FileRevert") {
+        try {
+          const d = JSON.parse(ev.data);
+          fileChangeItems.push({
+            kind: "file_reverted",
+            toolUseId: d.tool_use_id,
+            path: d.path,
+            reason: d.reason ?? "",
+          });
+        } catch { /* skip malformed */ }
+      }
+    }
+
+    // Convert conversation history entries
     const items: ChatItem[] = history.entries.flatMap((entry) => {
       if (entry.type === "message" && entry.role && entry.content) {
-        return contextBlocksToChatItems(entry.role, entry.content);
+        const chatItems = contextBlocksToChatItems(entry.role, entry.content);
+        // After each tool_result for fs_write, insert the corresponding file_change
+        const enriched: ChatItem[] = [];
+        for (const item of chatItems) {
+          enriched.push(item);
+          if (item.kind === "tool_result") {
+            // Find matching file_change by toolUseId
+            const fc = fileChangeItems.find(
+              (fc) => fc.kind === "file_change" && fc.toolUseId === item.id,
+            );
+            if (fc) enriched.push(fc);
+          }
+        }
+        return enriched;
       }
       if (entry.type === "interrupted") return [{ kind: "interrupted" as const }];
       if (entry.type === "compaction") {
@@ -93,6 +167,12 @@ async function loadHistoryItems(sessionId: string): Promise<HistoryResult> {
       }
       return [];
     });
+
+    // Append any file_reverted items at the end (they're append-only events)
+    for (const item of fileChangeItems) {
+      if (item.kind === "file_reverted") items.push(item);
+    }
+
     const lastMode = history.last_mode
       ? { mode: history.last_mode.mode, model: history.last_mode.model, confidence: history.last_mode.confidence }
       : null;
@@ -199,6 +279,36 @@ export function useLlmStream(sessionId: string) {
       });
       if (cancelled) { u6(); return; }
       unlistens.push(u6);
+
+      const u_fc = await listen<FileChangePayload>("file-change", (e) => {
+        if (!isActive()) return;
+        const p = e.payload;
+        setItems((prev) => [...prev, {
+          kind: "file_change",
+          toolUseId: p.tool_use_id,
+          path: p.path,
+          status: p.status,
+          hunks: p.hunks,
+          bytesWritten: p.bytes_written,
+          beforeContent: p.before_content,
+          afterContent: p.after_content,
+        }]);
+      });
+      if (cancelled) { u_fc(); return; }
+      unlistens.push(u_fc);
+
+      const u_fr = await listen<FileRevertedPayload>("file-reverted", (e) => {
+        if (!isActive()) return;
+        const p = e.payload;
+        setItems((prev) => [...prev, {
+          kind: "file_reverted",
+          toolUseId: p.tool_use_id,
+          path: p.path,
+          reason: p.reason,
+        }]);
+      });
+      if (cancelled) { u_fr(); return; }
+      unlistens.push(u_fr);
 
       const u7 = await listen<ContextUsageEvent>("context-usage", (e) => {
         if (e.payload.session_id === sessionId) {
