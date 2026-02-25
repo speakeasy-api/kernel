@@ -2,13 +2,16 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{debug, error, info, instrument};
 
 use crate::anthropic::types::ToolDefinition;
+use crate::git::diff::{DiffLine, Hunk, LineKind};
 
 /// Build tool definitions for the subset of tools an agent is allowed to use.
 pub fn tool_definitions(allowed: &[String]) -> Vec<ToolDefinition> {
@@ -129,6 +132,58 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+// ── Tool output types ─────────────────────────────────────────────────────
+
+/// Result of a tool execution — carries the LLM-facing text plus optional
+/// structured file-change data for the frontend.
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    /// The text content returned to the LLM (unchanged from previous behaviour).
+    pub content: String,
+    /// Structured file-change data (only produced by fs_write).
+    pub file_change: Option<FileChange>,
+}
+
+impl ToolOutput {
+    pub fn text(content: String) -> Self {
+        Self { content, file_change: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub status: FileChangeStatus,
+    /// Content before the write (`None` for newly created files).
+    pub before_content: Option<String>,
+    /// Content after the write.
+    pub after_content: String,
+    /// Structured hunk data.
+    pub hunks: Vec<Hunk>,
+    /// Total bytes written.
+    pub bytes_written: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FileChangeStatus {
+    Created,
+    Modified,
+}
+
+/// Result of attempting to revert a file write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum RevertResult {
+    #[serde(rename = "success")]
+    Success,
+    #[serde(rename = "conflict")]
+    Conflict { expected_hash: String, actual_hash: String },
+    #[serde(rename = "not_found")]
+    NotFound,
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
 const MAX_OUTPUT: usize = 30_000;
 
 fn truncate(s: String) -> String {
@@ -143,23 +198,23 @@ fn truncate(s: String) -> String {
     }
 }
 
-/// Execute a tool by name. Returns Ok(output) or Err(error_message).
+/// Execute a tool by name. Returns Ok(ToolOutput) or Err(error_message).
 #[instrument(skip(input, project_path), fields(tool = name))]
-pub async fn execute_tool(name: &str, input: &Value, project_path: &Path) -> Result<String, String> {
+pub async fn execute_tool(name: &str, input: &Value, project_path: &Path) -> Result<ToolOutput, String> {
     info!(tool = name, "executing tool");
     let result = match name {
-        "fs_read" => exec_fs_read(input, project_path).await,
+        "fs_read" => exec_fs_read(input, project_path).await.map(ToolOutput::text),
         "fs_write" => exec_fs_write(input, project_path).await,
-        "glob" => exec_glob(input, project_path).await,
-        "grep" => exec_grep(input, project_path).await,
-        "shell" => exec_shell(input, project_path).await,
+        "glob" => exec_glob(input, project_path).await.map(ToolOutput::text),
+        "grep" => exec_grep(input, project_path).await.map(ToolOutput::text),
+        "shell" => exec_shell(input, project_path).await.map(ToolOutput::text),
         other => {
             error!(tool = other, "unknown tool");
             Err(format!("Unknown tool: {other}"))
         }
     };
     match &result {
-        Ok(output) => debug!(tool = name, bytes = output.len(), success = true, "tool completed"),
+        Ok(output) => debug!(tool = name, bytes = output.content.len(), has_file_change = output.file_change.is_some(), "tool completed"),
         Err(err) => error!(tool = name, error = %err, "tool failed"),
     }
     result
@@ -231,7 +286,7 @@ async fn exec_fs_read(input: &Value, project: &Path) -> Result<String, String> {
 }
 
 #[instrument(skip(input, project))]
-async fn exec_fs_write(input: &Value, project: &Path) -> Result<String, String> {
+async fn exec_fs_write(input: &Value, project: &Path) -> Result<ToolOutput, String> {
     let path = input["path"]
         .as_str()
         .ok_or_else(|| "missing 'path'".to_string())?;
@@ -239,6 +294,10 @@ async fn exec_fs_write(input: &Value, project: &Path) -> Result<String, String> 
         .as_str()
         .ok_or_else(|| "missing 'content'".to_string())?;
     let resolved = resolve_path(project, path);
+
+    // Read existing content before writing (None for new files).
+    let before = tokio::fs::read_to_string(&resolved).await.ok();
+
     if let Some(parent) = resolved.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -247,7 +306,108 @@ async fn exec_fs_write(input: &Value, project: &Path) -> Result<String, String> 
     tokio::fs::write(&resolved, content)
         .await
         .map_err(|e| format!("Error writing {path}: {e}"))?;
-    Ok(format!("Wrote {} bytes to {path}", content.len()))
+
+    let old_text = before.as_deref().unwrap_or("");
+    let hunks = build_hunks(old_text, content);
+    let status = if before.is_some() {
+        FileChangeStatus::Modified
+    } else {
+        FileChangeStatus::Created
+    };
+
+    Ok(ToolOutput {
+        content: format!("Wrote {} bytes to {path}", content.len()),
+        file_change: Some(FileChange {
+            path: path.to_string(),
+            status,
+            before_content: before,
+            after_content: content.to_string(),
+            hunks,
+            bytes_written: content.len(),
+        }),
+    })
+}
+
+/// Build structured hunks from before/after content using the `similar` crate.
+fn build_hunks(old: &str, new: &str) -> Vec<Hunk> {
+    let diff = TextDiff::from_lines(old, new);
+    let mut hunks = Vec::new();
+
+    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+        let header = hunk.header().to_string();
+        let lines = hunk
+            .iter_changes()
+            .map(|change| {
+                let kind = match change.tag() {
+                    ChangeTag::Equal => LineKind::Context,
+                    ChangeTag::Insert => LineKind::Add,
+                    ChangeTag::Delete => LineKind::Remove,
+                };
+                DiffLine {
+                    kind,
+                    content: change.value().trim_end_matches('\n').to_string(),
+                }
+            })
+            .collect();
+        hunks.push(Hunk { header, lines });
+    }
+
+    hunks
+}
+
+/// Revert a file write. Checks for conflicts before applying.
+pub async fn revert_file_write(
+    project_path: &Path,
+    rel_path: &str,
+    before_content: Option<&str>,
+    after_content: &str,
+    force: bool,
+) -> RevertResult {
+    let resolved = resolve_path(project_path, rel_path);
+
+    // Read current file content
+    let current = match tokio::fs::read_to_string(&resolved).await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RevertResult::NotFound;
+        }
+        Err(e) => {
+            return RevertResult::Error { message: format!("Failed to read file: {e}") };
+        }
+    };
+
+    // Conflict check: current content should match what we wrote
+    if !force && current != after_content {
+        return RevertResult::Conflict {
+            expected_hash: short_hash(after_content),
+            actual_hash: short_hash(&current),
+        };
+    }
+
+    // Apply revert
+    match before_content {
+        Some(content) => {
+            if let Err(e) = tokio::fs::write(&resolved, content).await {
+                return RevertResult::Error { message: format!("Failed to write: {e}") };
+            }
+        }
+        None => {
+            // File was newly created — delete it
+            if let Err(e) = tokio::fs::remove_file(&resolved).await {
+                return RevertResult::Error { message: format!("Failed to delete: {e}") };
+            }
+        }
+    }
+
+    RevertResult::Success
+}
+
+/// Simple 8-char hash for conflict diagnostics (not cryptographic).
+fn short_hash(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Tool command timeout.

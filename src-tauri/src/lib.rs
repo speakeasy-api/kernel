@@ -93,6 +93,7 @@ pub fn run() {
             // Prompt router commands
             prompt_router::commands::submit_prompt,
             prompt_router::commands::cancel_prompt,
+            prompt_router::commands::revert_file,
             prompt_router::commands::get_conversation_context,
             prompt_router::commands::get_conversation_history,
         ])

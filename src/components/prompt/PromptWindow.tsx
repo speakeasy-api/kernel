@@ -9,6 +9,7 @@ import { PromptInput } from "./PromptInput";
 import { ContextRing } from "./ContextRing";
 import { ToolCallBlock, ToolResultBlock } from "./ToolBlock";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { DiffView } from "./DiffView";
 import { useLlmStream, type ChatItem } from "../../hooks/useLlmStream";
 import { cn } from "../../lib/cn";
 
@@ -181,6 +182,26 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
 
   const displayItems = historyView === "agent" && agentContext ? agentContext : items;
 
+  // Pre-pass: build set of reverted tool_use_ids and their reasons
+  const revertedMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const item of displayItems) {
+      if (item.kind === "file_reverted") {
+        map.set(item.toolUseId, item.reason);
+      }
+    }
+    return map;
+  }, [displayItems]);
+
+  // Pre-pass: build set of tool_use_ids that have a file_change following them
+  const fileChangeIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const item of displayItems) {
+      if (item.kind === "file_change") set.add(item.toolUseId);
+    }
+    return set;
+  }, [displayItems]);
+
   // Use real API token count when available, fall back to chars/4 estimate
   const usedTokens = useMemo(() => {
     if (contextUsage) return contextUsage.inputTokens;
@@ -289,6 +310,8 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
                 }
 
                 if (item.kind === "tool_result") {
+                  // Suppress the plain text result when a file_change follows
+                  if (fileChangeIds.has(item.id)) return null;
                   return (
                     <ToolResultBlock
                       key={i}
@@ -297,6 +320,26 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
                     />
                   );
                 }
+
+                if (item.kind === "file_change") {
+                  return (
+                    <DiffView
+                      key={i}
+                      path={item.path}
+                      status={item.status}
+                      hunks={item.hunks}
+                      beforeContent={item.beforeContent}
+                      afterContent={item.afterContent}
+                      sessionId={session.id}
+                      toolUseId={item.toolUseId}
+                      isReverted={revertedMap.has(item.toolUseId)}
+                      revertReason={revertedMap.get(item.toolUseId)}
+                    />
+                  );
+                }
+
+                // file_reverted items are consumed by the revertedMap pre-pass
+                if (item.kind === "file_reverted") return null;
 
                 return null;
               })}

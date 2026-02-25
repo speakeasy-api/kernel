@@ -105,3 +105,31 @@ export function submitPrompt(
 export function cancelPrompt(sessionId: string) {
   return invoke<void>("cancel_prompt", { sessionId });
 }
+
+// -- File Revert --
+
+export type RevertResult =
+  | { status: "success" }
+  | { status: "conflict"; expected_hash: string; actual_hash: string }
+  | { status: "not_found" }
+  | { status: "error"; message: string };
+
+export function revertFile(
+  sessionId: string,
+  toolUseId: string,
+  path: string,
+  beforeContent: string | null,
+  afterContent: string,
+  reason: string,
+  force?: boolean,
+) {
+  return invoke<RevertResult>("revert_file", {
+    sessionId,
+    toolUseId,
+    path,
+    beforeContent,
+    afterContent,
+    reason,
+    force: force ?? false,
+  });
+}
