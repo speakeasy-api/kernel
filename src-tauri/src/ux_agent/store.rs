@@ -6,8 +6,7 @@ use tracing::{debug, info, instrument, warn};
 
 use super::learning::{Convention, Correction, CorrectionType};
 use super::types::{
-    Recommendation, RecommendationAction, RecommendationStatus, RecommendationVersion,
-    UxAgentState,
+    Recommendation, RecommendationAction, RecommendationStatus, RecommendationVersion, UxAgentState,
 };
 
 pub type StoreResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -80,11 +79,7 @@ impl RecommendationStore {
     }
 
     #[instrument(skip(self))]
-    pub async fn update_status(
-        &self,
-        id: u64,
-        status: RecommendationStatus,
-    ) -> StoreResult<()> {
+    pub async fn update_status(&self, id: u64, status: RecommendationStatus) -> StoreResult<()> {
         info!(id, %status, "updating recommendation status");
         sqlx::query("UPDATE recommendations SET status = ?1 WHERE id = ?2")
             .bind(status.to_string())
@@ -142,7 +137,10 @@ impl RecommendationStore {
         version: u32,
         snapshot: &str,
     ) -> StoreResult<()> {
-        info!(recommendation_id, version, "inserting recommendation version");
+        info!(
+            recommendation_id,
+            version, "inserting recommendation version"
+        );
         sqlx::query(
             "INSERT INTO recommendation_versions (recommendation_id, version, applied_at, snapshot)
              VALUES (?1, ?2, CURRENT_TIMESTAMP, ?3)",
@@ -170,7 +168,11 @@ impl RecommendationStore {
         .bind(recommendation_id as i64)
         .fetch_all(&self.pool)
         .await?;
-        debug!(recommendation_id, count = rows.len(), "fetched recommendation versions");
+        debug!(
+            recommendation_id,
+            count = rows.len(),
+            "fetched recommendation versions"
+        );
         Ok(rows.into_iter().map(row_to_version).collect())
     }
 
@@ -220,7 +222,11 @@ impl RecommendationStore {
         .execute(&self.pool)
         .await?;
         let id = result.last_insert_rowid() as u64;
-        info!(id, correction_type = correction.correction_type.as_str(), "correction inserted");
+        info!(
+            id,
+            correction_type = correction.correction_type.as_str(),
+            "correction inserted"
+        );
         Ok(id)
     }
 
@@ -254,7 +260,11 @@ impl RecommendationStore {
         .bind(correction_type)
         .fetch_all(&self.pool)
         .await?;
-        debug!(correction_type, count = rows.len(), "fetched corrections by type");
+        debug!(
+            correction_type,
+            count = rows.len(),
+            "fetched corrections by type"
+        );
         rows.into_iter().map(row_to_correction).collect()
     }
 
@@ -287,7 +297,12 @@ impl RecommendationStore {
         source_ids: &[u64],
         target_mode: Option<&str>,
     ) -> StoreResult<u64> {
-        debug!(convention, target_mode, source_count = source_ids.len(), "inserting convention");
+        debug!(
+            convention,
+            target_mode,
+            source_count = source_ids.len(),
+            "inserting convention"
+        );
         let source_json = serde_json::to_string(source_ids)?;
         let result = sqlx::query(
             "INSERT INTO conventions (convention, source_corrections, target_mode)
@@ -397,11 +412,10 @@ fn row_to_recommendation(row: RecommendationRow) -> StoreResult<Recommendation> 
         warn!(id = row.id, error = %e, "failed to parse recommendation action JSON");
         e
     })?;
-    let status = RecommendationStatus::from_str(&row.status)
-        .map_err(|e| {
-            warn!(id = row.id, status = %row.status, "unknown recommendation status");
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
+    let status = RecommendationStatus::from_str(&row.status).map_err(|e| {
+        warn!(id = row.id, status = %row.status, "unknown recommendation status");
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
     Ok(Recommendation {
         id: row.id as u64,
         trigger_pattern: row.trigger_pattern,
@@ -443,10 +457,11 @@ fn row_to_correction(row: CorrectionRow) -> StoreResult<Correction> {
 }
 
 fn row_to_convention(row: ConventionRow) -> StoreResult<Convention> {
-    let source_corrections: Vec<u64> = serde_json::from_str(&row.source_corrections).map_err(|e| {
-        warn!(id = row.id, error = %e, "failed to parse convention source_corrections JSON");
-        e
-    })?;
+    let source_corrections: Vec<u64> =
+        serde_json::from_str(&row.source_corrections).map_err(|e| {
+            warn!(id = row.id, error = %e, "failed to parse convention source_corrections JSON");
+            e
+        })?;
     Ok(Convention {
         id: row.id as u64,
         convention: row.convention,

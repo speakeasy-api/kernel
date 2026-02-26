@@ -16,7 +16,8 @@ const DB_FILE: &str = "kernel.db";
 #[instrument(skip(db_url))]
 pub async fn create_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
     info!("creating database pool");
-    let options: SqliteConnectOptions = db_url.parse::<SqliteConnectOptions>()?
+    let options: SqliteConnectOptions = db_url
+        .parse::<SqliteConnectOptions>()?
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .foreign_keys(true)
         .create_if_missing(true);
@@ -46,9 +47,7 @@ pub async fn open_pool() -> Result<SqlitePool, sqlx::Error> {
     let kernel_dir = kernel_data_dir();
     fs::create_dir_all(&kernel_dir).map_err(|e| {
         error!(error = %e, path = %kernel_dir.display(), "failed to create kernel directory");
-        sqlx::Error::Configuration(
-            format!("failed to create {}: {e}", kernel_dir.display()).into(),
-        )
+        sqlx::Error::Configuration(format!("failed to create {}: {e}", kernel_dir.display()).into())
     })?;
 
     let db_path = kernel_dir.join(DB_FILE);
@@ -61,9 +60,7 @@ pub async fn open_pool() -> Result<SqlitePool, sqlx::Error> {
 async fn open_pool_at(root: &Path) -> Result<SqlitePool, sqlx::Error> {
     let kernel_dir = root.join(KERNEL_DIR);
     fs::create_dir_all(&kernel_dir).map_err(|e| {
-        sqlx::Error::Configuration(
-            format!("failed to create {}: {e}", kernel_dir.display()).into(),
-        )
+        sqlx::Error::Configuration(format!("failed to create {}: {e}", kernel_dir.display()).into())
     })?;
     let db_path = kernel_dir.join(DB_FILE);
     let db_url = format!("sqlite:{}", db_path.display());
@@ -78,7 +75,10 @@ pub async fn test_pool() -> SqlitePool {
         .await
         .expect("failed to create test pool");
 
-    sqlx::migrate!().run(&pool).await.expect("failed to run migrations");
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .expect("failed to run migrations");
 
     pool
 }
@@ -126,12 +126,11 @@ mod tests {
     async fn test_tables_exist() {
         let pool = test_pool().await;
 
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
 
         let tables: Vec<String> = rows.into_iter().map(|r| r.0).collect();
 

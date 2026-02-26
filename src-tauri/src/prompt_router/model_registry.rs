@@ -91,17 +91,16 @@ impl ModelRegistry {
         }
 
         // Step 2: Fetch per-category indices
-        let all_categories: &[&str] = &[
-            "programming",
-            "technology",
-            "science",
-            "academia",
-        ];
+        let all_categories: &[&str] = &["programming", "technology", "science", "academia"];
 
         for &cat in all_categories {
             match self.fetch_category_ids(cat).await {
                 Ok(ids) => {
-                    debug!(category = cat, model_count = ids.len(), "fetched category index");
+                    debug!(
+                        category = cat,
+                        model_count = ids.len(),
+                        "fetched category index"
+                    );
                     let mut categories = self.categories.write().await;
                     categories.insert(cat.to_string(), ids);
                 }
@@ -128,8 +127,7 @@ impl ModelRegistry {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        let body: OpenRouterModelsResponse =
-            resp.json().await.map_err(|e| e.to_string())?;
+        let body: OpenRouterModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
 
         Ok(body
             .data
@@ -145,9 +143,7 @@ impl ModelRegistry {
 
     /// Fetch top N model IDs for a category.
     async fn fetch_category_ids(&self, category: &str) -> Result<Vec<String>, String> {
-        let url = format!(
-            "https://openrouter.ai/api/v1/models?category={category}"
-        );
+        let url = format!("https://openrouter.ai/api/v1/models?category={category}");
 
         let resp = self
             .client
@@ -160,8 +156,7 @@ impl ModelRegistry {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        let body: OpenRouterModelsResponse =
-            resp.json().await.map_err(|e| e.to_string())?;
+        let body: OpenRouterModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
 
         let mut models: Vec<(String, u64)> = body
             .data
@@ -255,10 +250,7 @@ mod tests {
         assert_eq!(categories_for_mode("plan"), &["programming", "technology"]);
         assert_eq!(categories_for_mode("implement"), &["programming"]);
         assert_eq!(categories_for_mode("review"), &["programming"]);
-        assert_eq!(
-            categories_for_mode("debug"),
-            &["programming", "technology"]
-        );
+        assert_eq!(categories_for_mode("debug"), &["programming", "technology"]);
         assert_eq!(
             categories_for_mode("research"),
             &["science", "technology", "academia"]
@@ -315,7 +307,9 @@ mod tests {
             registry.context_length_for_model("anthropic/claude-sonnet-4-6"),
             Some(200_000)
         );
-        assert!(registry.context_length_for_model("nonexistent/model").is_none());
+        assert!(registry
+            .context_length_for_model("nonexistent/model")
+            .is_none());
     }
 
     #[tokio::test]
@@ -335,14 +329,8 @@ mod tests {
         }
         {
             let mut categories = registry.categories.write().await;
-            categories.insert(
-                "programming".into(),
-                vec!["openai/gpt-4".into()],
-            );
-            categories.insert(
-                "technology".into(),
-                vec!["openai/gpt-4".into()],
-            );
+            categories.insert("programming".into(), vec!["openai/gpt-4".into()]);
+            categories.insert("technology".into(), vec!["openai/gpt-4".into()]);
         }
 
         // "plan" merges programming + technology — should deduplicate

@@ -96,44 +96,70 @@ impl From<OverrideError> for DispatchError {
     }
 }
 
-/// Resolve the model to use: prefer router-selected, fall back to mode default.
-/// Validates the candidate against the full model catalog (`known_model_ids`).
-/// Returns [`FALLBACK_MODEL`] when the candidate is empty, unknown, or the
-/// catalog itself is empty (cold cache / refresh failure).
+/// Resolve the model to use.
+///
+/// Priority: router-selected (validated against catalog) → mode default →
+/// config default → [`FALLBACK_MODEL`].
+///
+/// Router-selected models are validated; mode and config defaults are trusted
+/// as-is since they were explicitly configured by the user.
 #[instrument(skip(loaded_mode, known_model_ids))]
 fn resolve_model(
     router_model: Option<&str>,
     loaded_mode: &LoadedMode,
     known_model_ids: &HashSet<String>,
+    config_default: Option<&str>,
 ) -> String {
-    let candidate = match router_model {
-        Some(m) if !m.is_empty() => m.to_string(),
-        _ => loaded_mode.default_model.clone().unwrap_or_default(),
-    };
-
-    if candidate.is_empty() || known_model_ids.is_empty() {
-        debug!(fallback = FALLBACK_MODEL, "no candidate or empty catalog, using fallback");
-        return FALLBACK_MODEL.to_string();
+    // 1. Try the router-selected model (validated against catalog)
+    if let Some(m) = router_model {
+        if !m.is_empty() {
+            if known_model_ids.contains(m) {
+                debug!(model = %m, "router model validated against catalog");
+                return m.to_string();
+            }
+            debug!(model = %m, "router model not in catalog, trying defaults");
+        }
     }
 
-    if known_model_ids.contains(&candidate) {
-        debug!(model = %candidate, "model validated against catalog");
-        candidate
-    } else {
-        warn!(
-            model = %candidate,
-            fallback = FALLBACK_MODEL,
-            "router selected unknown model, falling back"
-        );
-        FALLBACK_MODEL.to_string()
+    // 2. Fall back to the mode's configured default — pass through as-is
+    if let Some(ref default) = loaded_mode.default_model {
+        if !default.is_empty() {
+            debug!(model = %default, "using mode default model");
+            return default.clone();
+        }
     }
+
+    // 3. Fall back to the global config default — pass through as-is
+    if let Some(default) = config_default {
+        if !default.is_empty() {
+            debug!(model = %default, "using config default model");
+            return default.to_string();
+        }
+    }
+
+    // 4. Nothing configured — use hardcoded fallback
+    debug!(
+        fallback = FALLBACK_MODEL,
+        "no candidate available, using fallback"
+    );
+    FALLBACK_MODEL.to_string()
 }
 
 /// Route a prompt through classification (or override) and prepare
 /// the handoff payload for the agent system.
 ///
 /// This is the primary entry point for the prompt router module.
-#[instrument(skip(input, llm_client, mode_loader, event_sink, available_models, known_model_ids), fields(session_id, user_override))]
+#[instrument(
+    skip(
+        input,
+        llm_client,
+        mode_loader,
+        event_sink,
+        available_models,
+        known_model_ids
+    ),
+    fields(session_id, user_override)
+)]
 pub fn dispatch(
     input: &RouterInput,
     user_override: Option<&str>,
@@ -144,6 +170,7 @@ pub fn dispatch(
     session_id: &str,
     available_models: &[ModelInfo],
     known_model_ids: &HashSet<String>,
+    config_default_model: Option<&str>,
 ) -> Result<AgentHandoff, DispatchError> {
     info!(session_id, override_mode = ?user_override, "dispatching prompt");
     // Step 1: Classify or Override
@@ -153,12 +180,8 @@ pub fn dispatch(
             model: Some(router_model.to_string()),
             confidence: 0.0,
         };
-        let (overridden, event) = apply_override(
-            &default_output,
-            override_mode,
-            None,
-            &input.available_modes,
-        )?;
+        let (overridden, event) =
+            apply_override(&default_output, override_mode, None, &input.available_modes)?;
         event_sink.emit_mode_overridden(session_id, &event);
         overridden
     } else {
@@ -171,7 +194,12 @@ pub fn dispatch(
     let loaded_mode = mode_loader.load_mode(&output.mode)?;
 
     // Step 3: Resolve the model against the full catalog
-    let model = resolve_model(output.model.as_deref(), &loaded_mode, known_model_ids);
+    let model = resolve_model(
+        output.model.as_deref(),
+        &loaded_mode,
+        known_model_ids,
+        config_default_model,
+    );
 
     // Step 4: Build AgentHandoff
     debug!(
@@ -196,7 +224,17 @@ pub fn dispatch(
 /// new mode and prepares a fresh handoff.
 ///
 /// Returns `Some(AgentHandoff)` if the mode changed, `None` if it stayed the same.
-#[instrument(skip(request, llm_client, mode_loader, event_sink, available_models, known_model_ids), fields(session_id))]
+#[instrument(
+    skip(
+        request,
+        llm_client,
+        mode_loader,
+        event_sink,
+        available_models,
+        known_model_ids
+    ),
+    fields(session_id)
+)]
 pub fn dispatch_reclassification(
     request: &ReclassificationRequest,
     llm_client: &dyn LlmClient,
@@ -206,6 +244,7 @@ pub fn dispatch_reclassification(
     session_id: &str,
     available_models: &[ModelInfo],
     known_model_ids: &HashSet<String>,
+    config_default_model: Option<&str>,
 ) -> Result<Option<AgentHandoff>, DispatchError> {
     info!(session_id, "dispatching reclassification");
     let result = reclassify(request, llm_client, router_model, available_models)?;
@@ -218,7 +257,12 @@ pub fn dispatch_reclassification(
     }
 
     let loaded_mode = mode_loader.load_mode(&result.new_output.mode)?;
-    let model = resolve_model(result.new_output.model.as_deref(), &loaded_mode, known_model_ids);
+    let model = resolve_model(
+        result.new_output.model.as_deref(),
+        &loaded_mode,
+        known_model_ids,
+        config_default_model,
+    );
 
     info!(
         new_mode = %result.new_output.mode,
@@ -269,7 +313,11 @@ mod tests {
                     name: "Implement".to_string(),
                     system_prompt: "You are a code generation assistant.".to_string(),
                     default_model: Some("code-model".to_string()),
-                    allowed_tools: vec!["read".to_string(), "write".to_string(), "exec".to_string()],
+                    allowed_tools: vec![
+                        "read".to_string(),
+                        "write".to_string(),
+                        "exec".to_string(),
+                    ],
                 }),
                 _ => Err(DispatchError::ModeNotFound(mode_name.to_string())),
             }
@@ -336,8 +384,9 @@ mod tests {
                 .to_string(),
         };
         let sink = RecordingEventSink::new();
-        let known: HashSet<String> =
-            ["anthropic/claude-sonnet-4-6".to_string()].into_iter().collect();
+        let known: HashSet<String> = ["anthropic/claude-sonnet-4-6".to_string()]
+            .into_iter()
+            .collect();
 
         let handoff = dispatch(
             &input,
@@ -349,6 +398,7 @@ mod tests {
             "sess-1",
             &[],
             &known,
+            None,
         )
         .unwrap();
 
@@ -380,12 +430,16 @@ mod tests {
             "sess-1",
             &[],
             &HashSet::new(),
+            None,
         )
         .unwrap();
 
         assert_eq!(handoff.mode_name, "Implement");
-        assert_eq!(handoff.system_prompt, "You are a code generation assistant.");
-        assert_eq!(handoff.model, FALLBACK_MODEL);
+        assert_eq!(
+            handoff.system_prompt,
+            "You are a code generation assistant."
+        );
+        assert_eq!(handoff.model, "code-model");
         assert_eq!(handoff.confidence, 1.0);
         assert_eq!(sink.classified.lock().unwrap().len(), 0);
         assert_eq!(sink.overridden.lock().unwrap().len(), 1);
@@ -411,6 +465,7 @@ mod tests {
             "sess-1",
             &[],
             &HashSet::new(),
+            None,
         )
         .unwrap_err();
 
@@ -441,6 +496,7 @@ mod tests {
             "sess-1",
             &[],
             &HashSet::new(),
+            None,
         )
         .unwrap_err();
 
@@ -454,8 +510,7 @@ mod tests {
             response: r#"{"mode":"Plan","model":"","confidence":0.9}"#.to_string(),
         };
         let sink = RecordingEventSink::new();
-        let known: HashSet<String> =
-            ["fallback-model".to_string()].into_iter().collect();
+        let known: HashSet<String> = ["fallback-model".to_string()].into_iter().collect();
 
         let handoff = dispatch(
             &input,
@@ -467,6 +522,7 @@ mod tests {
             "sess-1",
             &[],
             &known,
+            None,
         )
         .unwrap();
 
@@ -475,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_uses_fallback_when_catalog_empty() {
+    fn dispatch_uses_mode_default_when_catalog_empty() {
         let input = sample_input();
         let llm = MockLlmClient {
             response: r#"{"mode":"Plan","model":"some-model","confidence":0.9}"#.to_string(),
@@ -492,69 +548,69 @@ mod tests {
             "sess-1",
             &[],
             &HashSet::new(),
+            None,
         )
         .unwrap();
 
-        // Empty catalog → always returns FALLBACK_MODEL
-        assert_eq!(handoff.model, FALLBACK_MODEL);
+        // Empty catalog → router model not validated, falls to mode default
+        assert_eq!(handoff.model, "fallback-model");
     }
 
     #[test]
-    fn resolve_model_substitutes_fallback_for_unknown() {
+    fn resolve_model_validates_router_selection() {
         let loaded = LoadedMode {
             name: "Plan".into(),
             system_prompt: String::new(),
-            default_model: None,
+            default_model: Some("anthropic/claude-opus-4-6".into()),
             allowed_tools: vec![],
         };
-        let known: HashSet<String> =
-            ["anthropic/claude-sonnet-4-6".to_string()].into_iter().collect();
+        let known: HashSet<String> = ["anthropic/claude-sonnet-4-6".to_string()]
+            .into_iter()
+            .collect();
 
-        // Known model passes through
+        // Known router model passes through
         assert_eq!(
-            resolve_model(Some("anthropic/claude-sonnet-4-6"), &loaded, &known),
+            resolve_model(Some("anthropic/claude-sonnet-4-6"), &loaded, &known, None),
             "anthropic/claude-sonnet-4-6"
         );
 
-        // Unknown model gets substituted
+        // Unknown router model → falls to mode default (not FALLBACK_MODEL)
         assert_eq!(
-            resolve_model(Some("hallucinated/model-9000"), &loaded, &known),
-            FALLBACK_MODEL
+            resolve_model(Some("hallucinated/model-9000"), &loaded, &known, None),
+            "anthropic/claude-opus-4-6"
         );
     }
 
     #[test]
-    fn resolve_model_returns_fallback_when_catalog_empty() {
+    fn resolve_model_passes_through_mode_default() {
+        let loaded = LoadedMode {
+            name: "Plan".into(),
+            system_prompt: String::new(),
+            default_model: Some("anthropic/claude-opus-4-6".into()),
+            allowed_tools: vec![],
+        };
+
+        // Empty catalog → mode default passes through as-is
+        assert_eq!(
+            resolve_model(Some("any/model"), &loaded, &HashSet::new(), None),
+            "anthropic/claude-opus-4-6"
+        );
+    }
+
+    #[test]
+    fn resolve_model_returns_fallback_when_nothing_configured() {
         let loaded = LoadedMode {
             name: "Plan".into(),
             system_prompt: String::new(),
             default_model: None,
             allowed_tools: vec![],
         };
+        let known: HashSet<String> = ["anthropic/claude-sonnet-4-6".to_string()]
+            .into_iter()
+            .collect();
 
-        // Empty catalog → always returns fallback
-        assert_eq!(
-            resolve_model(Some("any/model"), &loaded, &HashSet::new()),
-            FALLBACK_MODEL
-        );
-    }
-
-    #[test]
-    fn resolve_model_returns_fallback_when_no_model_selected() {
-        let loaded = LoadedMode {
-            name: "Plan".into(),
-            system_prompt: String::new(),
-            default_model: None,
-            allowed_tools: vec![],
-        };
-        let known: HashSet<String> =
-            ["anthropic/claude-sonnet-4-6".to_string()].into_iter().collect();
-
-        // None (mode-only classification) → fallback
-        assert_eq!(
-            resolve_model(None, &loaded, &known),
-            FALLBACK_MODEL
-        );
+        // No router model, no mode default → FALLBACK_MODEL
+        assert_eq!(resolve_model(None, &loaded, &known, None), FALLBACK_MODEL);
     }
 
     #[test]
@@ -597,6 +653,7 @@ mod tests {
             "sess-1",
             &[],
             &HashSet::new(),
+            None,
         )
         .unwrap();
 
@@ -645,12 +702,16 @@ mod tests {
             "sess-1",
             &[],
             &known,
+            None,
         )
         .unwrap();
 
         let handoff = result.expect("should return Some when mode changed");
         assert_eq!(handoff.mode_name, "Implement");
-        assert_eq!(handoff.system_prompt, "You are a code generation assistant.");
+        assert_eq!(
+            handoff.system_prompt,
+            "You are a code generation assistant."
+        );
         assert_eq!(handoff.model, "code-model");
         assert_eq!(handoff.confidence, 0.85);
         assert_eq!(handoff.prompt, "Let's start coding");

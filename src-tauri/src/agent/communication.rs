@@ -146,7 +146,10 @@ impl OrchestratorContext {
     /// Format all summaries into a single text block suitable for
     /// embedding into the orchestrator's context/prompt.
     pub fn format_for_context(&self) -> String {
-        debug!(child_count = self.child_summaries.len(), "formatting context");
+        debug!(
+            child_count = self.child_summaries.len(),
+            "formatting context"
+        );
         let mut output = String::from("## Agent Results\n\n");
 
         for summary in &self.child_summaries {
@@ -188,7 +191,8 @@ impl OrchestratorContext {
 
     /// Get all failed summaries (for orchestrator to decide on retries).
     pub fn failed_summaries(&self) -> Vec<&AgentSummary> {
-        let failed: Vec<&AgentSummary> = self.child_summaries
+        let failed: Vec<&AgentSummary> = self
+            .child_summaries
             .iter()
             .filter(|summary| matches!(summary.outcome, AgentOutcome::Failure { .. }))
             .collect();
@@ -206,7 +210,8 @@ impl OrchestratorContext {
 
     /// Check if all children succeeded.
     pub fn all_succeeded(&self) -> bool {
-        let result = self.child_summaries
+        let result = self
+            .child_summaries
             .iter()
             .all(|summary| matches!(summary.outcome, AgentOutcome::Success { .. }));
         debug!(all_succeeded = result, "all succeeded check");

@@ -146,7 +146,10 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     pub fn text(content: String) -> Self {
-        Self { content, file_change: None }
+        Self {
+            content,
+            file_change: None,
+        }
     }
 }
 
@@ -177,7 +180,10 @@ pub enum RevertResult {
     #[serde(rename = "success")]
     Success,
     #[serde(rename = "conflict")]
-    Conflict { expected_hash: String, actual_hash: String },
+    Conflict {
+        expected_hash: String,
+        actual_hash: String,
+    },
     #[serde(rename = "not_found")]
     NotFound,
     #[serde(rename = "error")]
@@ -200,10 +206,16 @@ fn truncate(s: String) -> String {
 
 /// Execute a tool by name. Returns Ok(ToolOutput) or Err(error_message).
 #[instrument(skip(input, project_path), fields(tool = name))]
-pub async fn execute_tool(name: &str, input: &Value, project_path: &Path) -> Result<ToolOutput, String> {
+pub async fn execute_tool(
+    name: &str,
+    input: &Value,
+    project_path: &Path,
+) -> Result<ToolOutput, String> {
     info!(tool = name, "executing tool");
     let result = match name {
-        "fs_read" => exec_fs_read(input, project_path).await.map(ToolOutput::text),
+        "fs_read" => exec_fs_read(input, project_path)
+            .await
+            .map(ToolOutput::text),
         "fs_write" => exec_fs_write(input, project_path).await,
         "glob" => exec_glob(input, project_path).await.map(ToolOutput::text),
         "grep" => exec_grep(input, project_path).await.map(ToolOutput::text),
@@ -214,7 +226,12 @@ pub async fn execute_tool(name: &str, input: &Value, project_path: &Path) -> Res
         }
     };
     match &result {
-        Ok(output) => debug!(tool = name, bytes = output.content.len(), has_file_change = output.file_change.is_some(), "tool completed"),
+        Ok(output) => debug!(
+            tool = name,
+            bytes = output.content.len(),
+            has_file_change = output.file_change.is_some(),
+            "tool completed"
+        ),
         Err(err) => error!(tool = name, error = %err, "tool failed"),
     }
     result
@@ -261,7 +278,10 @@ async fn exec_fs_read(input: &Value, project: &Path) -> Result<String, String> {
         let end_idx = (start_idx + count).min(lines.len());
 
         if start_idx >= lines.len() {
-            return Ok(format!("(file has {} lines, offset {start} is past end)", lines.len()));
+            return Ok(format!(
+                "(file has {} lines, offset {start} is past end)",
+                lines.len()
+            ));
         }
 
         let slice = &lines[start_idx..end_idx];
@@ -372,7 +392,9 @@ pub async fn revert_file_write(
             return RevertResult::NotFound;
         }
         Err(e) => {
-            return RevertResult::Error { message: format!("Failed to read file: {e}") };
+            return RevertResult::Error {
+                message: format!("Failed to read file: {e}"),
+            };
         }
     };
 
@@ -388,13 +410,17 @@ pub async fn revert_file_write(
     match before_content {
         Some(content) => {
             if let Err(e) = tokio::fs::write(&resolved, content).await {
-                return RevertResult::Error { message: format!("Failed to write: {e}") };
+                return RevertResult::Error {
+                    message: format!("Failed to write: {e}"),
+                };
             }
         }
         None => {
             // File was newly created — delete it
             if let Err(e) = tokio::fs::remove_file(&resolved).await {
-                return RevertResult::Error { message: format!("Failed to delete: {e}") };
+                return RevertResult::Error {
+                    message: format!("Failed to delete: {e}"),
+                };
             }
         }
     }
@@ -423,7 +449,6 @@ fn load_gitignore(project: &Path) -> Gitignore {
     let _ = builder.add(project.join(".kernelignore"));
     builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
-
 
 #[instrument(skip(input, project))]
 async fn exec_glob(input: &Value, project: &Path) -> Result<String, String> {
@@ -597,7 +622,14 @@ async fn exec_grep(input: &Value, project: &Path) -> Result<String, String> {
     let project = project.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        exec_grep_sync(&pattern, &search_path, &project, include.as_deref(), before, after)
+        exec_grep_sync(
+            &pattern,
+            &search_path,
+            &project,
+            include.as_deref(),
+            before,
+            after,
+        )
     })
     .await
     .map_err(|e| format!("grep task failed: {e}"))?
@@ -698,7 +730,11 @@ mod tests {
     #[tokio::test]
     async fn fs_read_whole_file() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("hello.txt"), "line one\nline two\nline three\n").unwrap();
+        fs::write(
+            dir.path().join("hello.txt"),
+            "line one\nline two\nline three\n",
+        )
+        .unwrap();
 
         let input = json!({"path": "hello.txt"});
         let result = exec_fs_read(&input, dir.path()).await.unwrap();
@@ -711,7 +747,10 @@ mod tests {
     #[tokio::test]
     async fn fs_read_with_offset_limit() {
         let dir = TempDir::new().unwrap();
-        let content = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         let input = json!({"path": "big.txt", "offset": 5, "limit": 3});
@@ -739,7 +778,10 @@ mod tests {
     #[tokio::test]
     async fn fs_read_oversized_with_range_succeeds() {
         let dir = TempDir::new().unwrap();
-        let content = (1..=1000).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=1000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         let input = json!({"path": "big.txt", "offset": 1, "limit": 5});
@@ -766,22 +808,26 @@ mod tests {
         fs::write(
             dir.path().join("src/main.rs"),
             "fn main() {\n    println!(\"hello\");\n    let x = 42;\n    println!(\"world\");\n}\n",
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(
             dir.path().join("src/lib.rs"),
             "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(
             dir.path().join("readme.txt"),
             "This is a readme.\nIt has println in it.\n",
-        ).unwrap();
+        )
+        .unwrap();
         // Create a .gitignore to test filtering
         fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
         fs::create_dir_all(dir.path().join("ignored")).unwrap();
         fs::write(
             dir.path().join("ignored/secret.rs"),
             "fn secret() { println!(\"secret\"); }\n",
-        ).unwrap();
+        )
+        .unwrap();
         dir
     }
 

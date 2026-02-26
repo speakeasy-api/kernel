@@ -66,7 +66,9 @@ pub fn apply_override(
 
     let output = RouterOutput {
         mode: override_mode.to_string(),
-        model: override_model.map(|m| m.to_string()).or(original.model.clone()),
+        model: override_model
+            .map(|m| m.to_string())
+            .or(original.model.clone()),
         confidence: 1.0,
     };
 

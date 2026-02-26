@@ -56,10 +56,17 @@ impl<C: LlmClient> SemanticCompactor<C> {
         messages: &[Message],
         preservation_rules: &PreservationRules,
     ) -> Result<CompactedContext, CompactionError> {
-        info!(message_count = messages.len(), "starting semantic compaction");
+        info!(
+            message_count = messages.len(),
+            "starting semantic compaction"
+        );
         let preserved_facts = preservation_rules.extract_preserved_facts(messages);
         let target_tokens = self.budget.target_token_count();
-        debug!(target_tokens, preserved_facts = preserved_facts.len(), "compaction parameters");
+        debug!(
+            target_tokens,
+            preserved_facts = preserved_facts.len(),
+            "compaction parameters"
+        );
 
         let (system_prompt, user_prompt) =
             build_compaction_prompt(messages, target_tokens, &preserved_facts);
@@ -81,7 +88,11 @@ impl<C: LlmClient> SemanticCompactor<C> {
         let token_count = estimate_message_tokens(&compacted_messages);
 
         if token_count > target_tokens {
-            error!(actual = token_count, target = target_tokens, "compacted output still over budget");
+            error!(
+                actual = token_count,
+                target = target_tokens,
+                "compacted output still over budget"
+            );
             return Err(CompactionError::StillOverBudget {
                 actual: token_count,
                 target: target_tokens,

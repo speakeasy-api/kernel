@@ -83,7 +83,10 @@ impl BranchManager {
 
     /// Create a new branch session from config and prompt.
     pub fn create_session(config: BranchConfig, prompt: String) -> BranchSession {
-        info!(parallel_count = config.parallel_count, "creating branch session");
+        info!(
+            parallel_count = config.parallel_count,
+            "creating branch session"
+        );
         assert!(
             config.parallel_count >= 2,
             "branching mode requires parallel_count >= 2"
@@ -154,7 +157,11 @@ impl BranchManager {
 
     /// Return ranked results (rank if available, otherwise cost efficiency).
     pub fn ranked_results(session: &BranchSession) -> Vec<&BranchResult> {
-        debug!(result_count = session.results.len(), auto_rank = session.config.auto_rank, "ranking branch results");
+        debug!(
+            result_count = session.results.len(),
+            auto_rank = session.config.auto_rank,
+            "ranking branch results"
+        );
         let mut ordered: Vec<&BranchResult> = session.results.iter().collect();
 
         if session.config.auto_rank && session.results.iter().any(|result| result.rank.is_some()) {
@@ -187,7 +194,12 @@ impl BranchManager {
             .fold(TokenMetrics::default(), |acc, result| {
                 acc + result.token_usage.clone()
             });
-        debug!(input = totals.input, output = totals.output, cost_usd = totals.cost_usd, "branch total tokens");
+        debug!(
+            input = totals.input,
+            output = totals.output,
+            cost_usd = totals.cost_usd,
+            "branch total tokens"
+        );
         totals
     }
 }

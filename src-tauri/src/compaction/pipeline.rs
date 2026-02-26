@@ -76,14 +76,20 @@ impl<C: LlmClient> CompactionPipeline<C> {
         system_prompt: &str,
         messages: &[Message],
     ) -> Result<CompactedContext, CompactionError> {
-        info!(message_count = messages.len(), "starting compaction pipeline");
+        info!(
+            message_count = messages.len(),
+            "starting compaction pipeline"
+        );
         let mut working_messages = messages.to_vec();
 
         // Step 1: Light compaction.
         if self.light_every_turn {
             debug!("applying light compaction (structural filters)");
             working_messages = StructuralFilter::apply(&working_messages);
-            debug!(after_light = working_messages.len(), "light compaction done");
+            debug!(
+                after_light = working_messages.len(),
+                "light compaction done"
+            );
         }
 
         // Step 2: Deep-compaction budget check.
@@ -106,7 +112,10 @@ impl<C: LlmClient> CompactionPipeline<C> {
                 .await
             {
                 Ok(compacted) => {
-                    debug!(compacted_messages = compacted.messages.len(), "deep compaction succeeded");
+                    debug!(
+                        compacted_messages = compacted.messages.len(),
+                        "deep compaction succeeded"
+                    );
                     working_messages = compacted.messages;
                 }
                 Err(e) => {

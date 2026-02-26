@@ -111,7 +111,9 @@ mod tests {
         let event = emit(&pool, &session.id, None, data).await.unwrap();
 
         // Verify event exists in DB
-        let db_events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let db_events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(db_events.len(), 1);
         assert_eq!(db_events[0].id, event.metadata.id.to_string());
     }
@@ -128,7 +130,9 @@ mod tests {
         assert_eq!(event.data.kind(), "PromptSubmitted");
 
         // Verify kind column in DB matches
-        let db_events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let db_events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(db_events[0].kind, "PromptSubmitted");
     }
 
@@ -142,7 +146,9 @@ mod tests {
         };
         emit(&pool, &session.id, None, data).await.unwrap();
 
-        let db_events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let db_events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         let stored: serde_json::Value = serde_json::from_str(&db_events[0].data).unwrap();
 
         // Should contain only the variant fields, not the kind tag
@@ -189,7 +195,9 @@ mod tests {
             tool: "read_file".into(),
             args_summary: "path=/foo".into(),
         };
-        let event = emit(&pool, &session.id, Some(&agent_id), data).await.unwrap();
+        let event = emit(&pool, &session.id, Some(&agent_id), data)
+            .await
+            .unwrap();
 
         assert_eq!(
             event.metadata.agent_id,
@@ -227,7 +235,9 @@ mod tests {
         let event = emit(&pool, &session.id, None, data).await.unwrap();
 
         // Verify the data column has correct nested structure
-        let db_events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let db_events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         let stored: serde_json::Value = serde_json::from_str(&db_events[0].data).unwrap();
         assert_eq!(stored["task_id"], task_id.to_string());
         assert_eq!(stored["summary"], "All tests pass");
@@ -254,7 +264,9 @@ mod tests {
             .await
             .unwrap();
 
-        let db_events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let db_events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         let stored: serde_json::Value = serde_json::from_str(&db_events[0].data).unwrap();
         assert_eq!(stored["role"], "implementation");
         assert_eq!(stored["model"], "claude-sonnet-4-20250514");
@@ -279,7 +291,9 @@ mod tests {
         };
         emit(&pool, &session.id, None, data).await.unwrap();
 
-        let db_events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let db_events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         let stored: serde_json::Value = serde_json::from_str(&db_events[0].data).unwrap();
         assert_eq!(stored["token_usage"]["input"], 5000);
         assert_eq!(stored["token_usage"]["output"], 1200);
@@ -309,7 +323,9 @@ mod tests {
             emit(&pool, &session.id, None, data).await.unwrap();
         }
 
-        let db_events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let db_events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(db_events.len(), 3);
         assert_eq!(db_events[0].kind, "PromptSubmitted");
         assert_eq!(db_events[1].kind, "PromptClassified");

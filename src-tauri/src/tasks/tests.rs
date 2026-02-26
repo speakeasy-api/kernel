@@ -172,7 +172,9 @@ mod db_tests {
         in_progress.status = TaskStatus::InProgress;
         db::insert_task(&pool, &in_progress).await.unwrap();
 
-        let filtered = db::list_tasks(&pool, session_id, Some(TaskStatus::Pending)).await.unwrap();
+        let filtered = db::list_tasks(&pool, session_id, Some(TaskStatus::Pending))
+            .await
+            .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, pending.id);
         assert_eq!(filtered[0].status, TaskStatus::Pending);
@@ -186,7 +188,9 @@ mod db_tests {
         db::insert_task(&pool, &task).await.unwrap();
 
         let outcome = success_outcome();
-        db::update_task_status(&pool, task.id, TaskStatus::Done, Some(&outcome)).await.unwrap();
+        db::update_task_status(&pool, task.id, TaskStatus::Done, Some(&outcome))
+            .await
+            .unwrap();
 
         let loaded = db::get_task(&pool, task.id).await.unwrap().unwrap();
         assert_eq!(loaded.status, TaskStatus::Done);
@@ -213,7 +217,9 @@ mod db_tests {
         assert_eq!(initial[0].id, dependency.id);
 
         let outcome = success_outcome();
-        db::update_task_status(&pool, dependency.id, TaskStatus::Done, Some(&outcome)).await.unwrap();
+        db::update_task_status(&pool, dependency.id, TaskStatus::Done, Some(&outcome))
+            .await
+            .unwrap();
 
         let after = db::next_unblocked(&pool, session_id).await.unwrap();
         assert_eq!(after.len(), 1);
@@ -295,9 +301,8 @@ mod lifecycle_tests {
 
     #[test]
     fn done_requires_outcome() {
-        let err =
-            lifecycle::validate_transition(TaskStatus::InProgress, TaskStatus::Done, None)
-                .unwrap_err();
+        let err = lifecycle::validate_transition(TaskStatus::InProgress, TaskStatus::Done, None)
+            .unwrap_err();
         assert!(matches!(err, LifecycleError::MissingOutcome));
     }
 
@@ -333,7 +338,9 @@ mod lifecycle_tests {
         blocked.depends_on = vec![completed.id];
         db::insert_task(&pool, &blocked).await.unwrap();
 
-        let unblocked = lifecycle::cascade_unblock(&pool, completed.id).await.unwrap();
+        let unblocked = lifecycle::cascade_unblock(&pool, completed.id)
+            .await
+            .unwrap();
         assert_eq!(unblocked, vec![blocked.id]);
 
         let loaded = db::get_task(&pool, blocked.id).await.unwrap().unwrap();
@@ -358,7 +365,9 @@ mod lifecycle_tests {
         blocked.depends_on = vec![dep_done.id, dep_pending.id];
         db::insert_task(&pool, &blocked).await.unwrap();
 
-        let unblocked = lifecycle::cascade_unblock(&pool, dep_done.id).await.unwrap();
+        let unblocked = lifecycle::cascade_unblock(&pool, dep_done.id)
+            .await
+            .unwrap();
         assert!(unblocked.is_empty());
 
         let loaded = db::get_task(&pool, blocked.id).await.unwrap().unwrap();
@@ -585,7 +594,9 @@ mod decomposition_tests {
             ],
         };
 
-        let tasks = decomposition::persist_decomposition(&pool, &request, &result).await.unwrap();
+        let tasks = decomposition::persist_decomposition(&pool, &request, &result)
+            .await
+            .unwrap();
         assert_eq!(tasks.len(), 2);
 
         let a = tasks.iter().find(|task| task.title == "A").unwrap();
@@ -708,7 +719,9 @@ mod cost_tests {
 
         costs::record_task_cost(&pool, task.id, 6.0).await.unwrap();
         let thresholds = CostThresholds::default();
-        let result = costs::check_cost(&pool, task.id, session_id, &thresholds).await.unwrap();
+        let result = costs::check_cost(&pool, task.id, session_id, &thresholds)
+            .await
+            .unwrap();
 
         assert!(matches!(
             result,
@@ -738,7 +751,9 @@ mod cost_tests {
             warn_at_session_usd: 5.0,
             hard_limit_session_usd: 100.0,
         };
-        let result = costs::check_cost(&pool, task.id, session_id, &thresholds).await.unwrap();
+        let result = costs::check_cost(&pool, task.id, session_id, &thresholds)
+            .await
+            .unwrap();
 
         assert!(matches!(
             result,

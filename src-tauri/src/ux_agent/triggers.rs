@@ -14,11 +14,22 @@ pub const OVERRIDE_PATTERN_THRESHOLD: usize = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TriggerReason {
-    RejectionsAccumulated { count: usize },
+    RejectionsAccumulated {
+        count: usize,
+    },
     NewSession,
-    CostSpike { current_rate_usd: f64, baseline_rate_usd: f64 },
-    FailurePattern { tool: String, failure_count: usize },
-    OverridePattern { override_type: String, count: usize },
+    CostSpike {
+        current_rate_usd: f64,
+        baseline_rate_usd: f64,
+    },
+    FailurePattern {
+        tool: String,
+        failure_count: usize,
+    },
+    OverridePattern {
+        override_type: String,
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,7 +166,10 @@ mod tests {
             ..Default::default()
         };
         let triggers = evaluate_triggers(&summary);
-        assert_eq!(triggers, vec![TriggerReason::RejectionsAccumulated { count: 3 }]);
+        assert_eq!(
+            triggers,
+            vec![TriggerReason::RejectionsAccumulated { count: 3 }]
+        );
     }
 
     #[test]
@@ -222,10 +236,7 @@ mod tests {
     #[test]
     fn failure_pattern_trigger() {
         let summary = EventSummary {
-            tool_failures: vec![
-                ("code_edit".to_string(), 3),
-                ("file_read".to_string(), 1),
-            ],
+            tool_failures: vec![("code_edit".to_string(), 3), ("file_read".to_string(), 1)],
             has_new_events: true,
             ..Default::default()
         };
@@ -269,7 +280,10 @@ mod tests {
         };
         let triggers = evaluate_triggers(&summary);
         assert_eq!(triggers.len(), 5);
-        assert_eq!(triggers[0], TriggerReason::RejectionsAccumulated { count: 5 });
+        assert_eq!(
+            triggers[0],
+            TriggerReason::RejectionsAccumulated { count: 5 }
+        );
         assert_eq!(triggers[1], TriggerReason::NewSession);
         assert_eq!(
             triggers[2],

@@ -10,21 +10,13 @@ use super::types::{Recommendation, RecommendationAction, RecommendationStatus, U
 type RuntimeError = Box<dyn std::error::Error + Send + Sync>;
 
 pub trait ModelInvoker: Send + Sync {
-    fn invoke(
-        &self,
-        system_prompt: &str,
-        user_message: &str,
-    ) -> Result<String, RuntimeError>;
+    fn invoke(&self, system_prompt: &str, user_message: &str) -> Result<String, RuntimeError>;
 }
 
 pub struct StubModelInvoker;
 
 impl ModelInvoker for StubModelInvoker {
-    fn invoke(
-        &self,
-        _system_prompt: &str,
-        _user_message: &str,
-    ) -> Result<String, RuntimeError> {
+    fn invoke(&self, _system_prompt: &str, _user_message: &str) -> Result<String, RuntimeError> {
         Ok(serde_json::to_string(&serde_json::json!({
             "recommendations": []
         }))?)
@@ -102,7 +94,9 @@ impl UxAgentRuntime {
 
         // 4. Invoke model
         debug!(model = %self.model, "invoking model");
-        let response_text = self.invoker.invoke(UX_AGENT_SYSTEM_PROMPT, &user_message)
+        let response_text = self
+            .invoker
+            .invoke(UX_AGENT_SYSTEM_PROMPT, &user_message)
             .map_err(|e| {
                 error!(model = %self.model, error = %e, "model invocation failed");
                 e
@@ -110,14 +104,16 @@ impl UxAgentRuntime {
 
         // 5. Parse response
         debug!("parsing model response");
-        let parsed: ModelResponse = serde_json::from_str(&response_text)
-            .map_err(|e| {
-                error!(error = %e, "failed to parse model response as JSON");
-                e
-            })?;
+        let parsed: ModelResponse = serde_json::from_str(&response_text).map_err(|e| {
+            error!(error = %e, "failed to parse model response as JSON");
+            e
+        })?;
 
         // 6. Persist recommendations
-        debug!(count = parsed.recommendations.len(), "persisting recommendations");
+        debug!(
+            count = parsed.recommendations.len(),
+            "persisting recommendations"
+        );
         let mut recommendations = Vec::with_capacity(parsed.recommendations.len());
         for raw in parsed.recommendations {
             let rec = Recommendation {
@@ -209,7 +205,10 @@ mod tests {
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(StubModelInvoker));
         let triggers = vec![TriggerReason::RejectionsAccumulated { count: 3 }];
 
-        let recs = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await.unwrap();
+        let recs = rt
+            .run(&pool, &triggers, &default_summary(), "{}", "[]")
+            .await
+            .unwrap();
         assert!(recs.is_empty());
     }
 
@@ -236,7 +235,10 @@ mod tests {
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(invoker));
         let triggers = vec![TriggerReason::RejectionsAccumulated { count: 3 }];
 
-        let recs = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await.unwrap();
+        let recs = rt
+            .run(&pool, &triggers, &default_summary(), "{}", "[]")
+            .await
+            .unwrap();
 
         assert_eq!(recs.len(), 1);
         assert_ne!(recs[0].id, 0);
@@ -260,9 +262,14 @@ mod tests {
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(FailingInvoker));
         let triggers = vec![TriggerReason::NewSession];
 
-        let result = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await;
+        let result = rt
+            .run(&pool, &triggers, &default_summary(), "{}", "[]")
+            .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("model unavailable"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("model unavailable"));
     }
 
     #[tokio::test]
@@ -274,7 +281,9 @@ mod tests {
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(invoker));
         let triggers = vec![TriggerReason::NewSession];
 
-        let result = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await;
+        let result = rt
+            .run(&pool, &triggers, &default_summary(), "{}", "[]")
+            .await;
         assert!(result.is_err());
     }
 
@@ -313,7 +322,10 @@ mod tests {
         let rt = UxAgentRuntime::new("test-model".into(), Box::new(invoker));
         let triggers = vec![TriggerReason::RejectionsAccumulated { count: 5 }];
 
-        let recs = rt.run(&pool, &triggers, &default_summary(), "{}", "[]").await.unwrap();
+        let recs = rt
+            .run(&pool, &triggers, &default_summary(), "{}", "[]")
+            .await
+            .unwrap();
         assert_eq!(recs.len(), 2);
 
         let store = RecommendationStore::new(pool.clone());

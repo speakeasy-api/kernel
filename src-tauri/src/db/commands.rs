@@ -14,7 +14,10 @@ pub async fn create_session(
     info!(project_path, "cmd: create_session");
     queries::create_session(&pool, &project_path)
         .await
-        .map_err(|e| { error!(error = %e, "create_session failed"); e.to_string() })
+        .map_err(|e| {
+            error!(error = %e, "create_session failed");
+            e.to_string()
+        })
 }
 
 #[tauri::command]
@@ -24,39 +27,40 @@ pub async fn get_session(
     id: String,
 ) -> Result<Option<Session>, String> {
     debug!(id, "cmd: get_session");
-    queries::get_session(&pool, &id)
-        .await
-        .map_err(|e| { error!(error = %e, "get_session failed"); e.to_string() })
+    queries::get_session(&pool, &id).await.map_err(|e| {
+        error!(error = %e, "get_session failed");
+        e.to_string()
+    })
 }
 
 #[tauri::command]
 #[instrument(skip(pool))]
 pub async fn list_sessions(pool: State<'_, SqlitePool>) -> Result<Vec<Session>, String> {
     debug!("cmd: list_sessions");
-    queries::list_sessions(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "list_sessions failed"); e.to_string() })
+    queries::list_sessions(&pool).await.map_err(|e| {
+        error!(error = %e, "list_sessions failed");
+        e.to_string()
+    })
 }
 
 #[tauri::command]
 #[instrument(skip(pool))]
-pub async fn delete_session(
-    pool: State<'_, SqlitePool>,
-    id: String,
-) -> Result<(), String> {
+pub async fn delete_session(pool: State<'_, SqlitePool>, id: String) -> Result<(), String> {
     info!(id, "cmd: delete_session");
-    queries::delete_session(&pool, &id)
-        .await
-        .map_err(|e| { error!(error = %e, "delete_session failed"); e.to_string() })
+    queries::delete_session(&pool, &id).await.map_err(|e| {
+        error!(error = %e, "delete_session failed");
+        e.to_string()
+    })
 }
 
 #[tauri::command]
 #[instrument(skip(pool))]
 pub async fn list_db_modes(pool: State<'_, SqlitePool>) -> Result<Vec<Mode>, String> {
     debug!("cmd: list_db_modes");
-    queries::list_modes(&pool)
-        .await
-        .map_err(|e| { error!(error = %e, "list_db_modes failed"); e.to_string() })
+    queries::list_modes(&pool).await.map_err(|e| {
+        error!(error = %e, "list_db_modes failed");
+        e.to_string()
+    })
 }
 
 #[tauri::command]
@@ -66,9 +70,10 @@ pub async fn get_db_mode(
     name: String,
 ) -> Result<Option<Mode>, String> {
     debug!(name, "cmd: get_db_mode");
-    queries::get_mode(&pool, &name)
-        .await
-        .map_err(|e| { error!(error = %e, "get_db_mode failed"); e.to_string() })
+    queries::get_mode(&pool, &name).await.map_err(|e| {
+        error!(error = %e, "get_db_mode failed");
+        e.to_string()
+    })
 }
 
 #[tauri::command]
@@ -83,7 +88,10 @@ pub async fn insert_event(
     debug!(kind, session_id, "cmd: insert_event");
     queries::insert_event(&pool, &session_id, agent_id.as_deref(), &kind, &data)
         .await
-        .map_err(|e| { error!(error = %e, "insert_event failed"); e.to_string() })
+        .map_err(|e| {
+            error!(error = %e, "insert_event failed");
+            e.to_string()
+        })
 }
 
 #[tauri::command]
@@ -96,5 +104,8 @@ pub async fn events_since(
     debug!(session_id, since, "cmd: events_since");
     queries::events_since(&pool, &session_id, &since)
         .await
-        .map_err(|e| { error!(error = %e, "events_since failed"); e.to_string() })
+        .map_err(|e| {
+            error!(error = %e, "events_since failed");
+            e.to_string()
+        })
 }

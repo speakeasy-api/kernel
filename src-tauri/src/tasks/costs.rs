@@ -190,16 +190,14 @@ mod tests {
     use crate::db::test_pool;
 
     async fn insert_task(pool: &SqlitePool, task_id: Uuid, session_id: Uuid, cost_usd: f64) {
-        sqlx::query(
-            "INSERT INTO tasks (id, session_id, title, cost_usd) VALUES (?1, ?2, ?3, ?4)",
-        )
-        .bind(task_id.to_string())
-        .bind(session_id.to_string())
-        .bind(format!("task-{task_id}"))
-        .bind(cost_usd)
-        .execute(pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO tasks (id, session_id, title, cost_usd) VALUES (?1, ?2, ?3, ?4)")
+            .bind(task_id.to_string())
+            .bind(session_id.to_string())
+            .bind(format!("task-{task_id}"))
+            .bind(cost_usd)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     #[test]

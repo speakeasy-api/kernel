@@ -79,7 +79,10 @@ pub fn garbage_collect_worktrees(
     project_root: &Path,
     active_task_ids: &[String],
 ) -> Result<Vec<String>, WorktreeError> {
-    info!(active_tasks = active_task_ids.len(), "starting worktree garbage collection");
+    info!(
+        active_tasks = active_task_ids.len(),
+        "starting worktree garbage collection"
+    );
     let worktrees = list_worktrees(project_root)?;
     let mut removed = Vec::new();
 

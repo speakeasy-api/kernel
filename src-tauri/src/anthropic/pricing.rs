@@ -13,9 +13,7 @@ pub struct ModelPricing {
 /// Strip provider prefixes, date suffixes, and map aliases to canonical names.
 pub fn normalize_model_name(model: &str) -> String {
     // Strip provider prefix (e.g. "anthropic/")
-    let name = model
-        .strip_prefix("anthropic/")
-        .unwrap_or(model);
+    let name = model.strip_prefix("anthropic/").unwrap_or(model);
 
     // Strip date suffix (e.g. "-20250514")
     let name = strip_date_suffix(name);

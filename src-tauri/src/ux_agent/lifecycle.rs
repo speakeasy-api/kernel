@@ -97,13 +97,10 @@ impl LifecycleManager {
         info!(recommendation_id, "applying recommendation");
         let store = RecommendationStore::new(pool.clone());
 
-        let rec = store
-            .get(recommendation_id)
-            .await?
-            .ok_or_else(|| {
-                error!(recommendation_id, "recommendation not found");
-                lifecycle_error(&format!("recommendation {recommendation_id} not found"))
-            })?;
+        let rec = store.get(recommendation_id).await?.ok_or_else(|| {
+            error!(recommendation_id, "recommendation not found");
+            lifecycle_error(&format!("recommendation {recommendation_id} not found"))
+        })?;
 
         if rec.status != RecommendationStatus::Pending {
             error!(
@@ -123,8 +120,12 @@ impl LifecycleManager {
         let versions = store.get_versions(recommendation_id).await?;
         let next_version = versions.last().map_or(1, |v| v.version + 1);
 
-        store.insert_version(recommendation_id, next_version, &snapshot).await?;
-        store.update_status(recommendation_id, RecommendationStatus::Applied).await?;
+        store
+            .insert_version(recommendation_id, next_version, &snapshot)
+            .await?;
+        store
+            .update_status(recommendation_id, RecommendationStatus::Applied)
+            .await?;
 
         info!(
             recommendation_id,
@@ -143,13 +144,10 @@ impl LifecycleManager {
         info!(recommendation_id, "dismissing recommendation");
         let store = RecommendationStore::new(pool.clone());
 
-        let rec = store
-            .get(recommendation_id)
-            .await?
-            .ok_or_else(|| {
-                error!(recommendation_id, "recommendation not found");
-                lifecycle_error(&format!("recommendation {recommendation_id} not found"))
-            })?;
+        let rec = store.get(recommendation_id).await?.ok_or_else(|| {
+            error!(recommendation_id, "recommendation not found");
+            lifecycle_error(&format!("recommendation {recommendation_id} not found"))
+        })?;
 
         if rec.status != RecommendationStatus::Pending {
             error!(
@@ -163,7 +161,9 @@ impl LifecycleManager {
             )));
         }
 
-        store.update_status(recommendation_id, RecommendationStatus::Dismissed).await?;
+        store
+            .update_status(recommendation_id, RecommendationStatus::Dismissed)
+            .await?;
 
         info!(recommendation_id, "recommendation dismissed");
         Ok(())
@@ -186,13 +186,10 @@ impl LifecycleManager {
         info!(recommendation_id, "reverting recommendation");
         let store = RecommendationStore::new(pool.clone());
 
-        let rec = store
-            .get(recommendation_id)
-            .await?
-            .ok_or_else(|| {
-                error!(recommendation_id, "recommendation not found");
-                lifecycle_error(&format!("recommendation {recommendation_id} not found"))
-            })?;
+        let rec = store.get(recommendation_id).await?.ok_or_else(|| {
+            error!(recommendation_id, "recommendation not found");
+            lifecycle_error(&format!("recommendation {recommendation_id} not found"))
+        })?;
 
         if rec.status != RecommendationStatus::Applied {
             error!(
@@ -207,16 +204,19 @@ impl LifecycleManager {
         }
 
         let versions = store.get_versions(recommendation_id).await?;
-        let latest = versions
-            .last()
-            .ok_or_else(|| {
-                error!(recommendation_id, "no version records found for applied recommendation");
-                lifecycle_error("no version records found for applied recommendation")
-            })?;
+        let latest = versions.last().ok_or_else(|| {
+            error!(
+                recommendation_id,
+                "no version records found for applied recommendation"
+            );
+            lifecycle_error("no version records found for applied recommendation")
+        })?;
 
         restore_snapshot(&rec.action, &latest.snapshot, mode_ops, config_ops)?;
         store.mark_version_reverted(latest.id).await?;
-        store.update_status(recommendation_id, RecommendationStatus::Reverted).await?;
+        store
+            .update_status(recommendation_id, RecommendationStatus::Reverted)
+            .await?;
 
         info!(
             recommendation_id,
@@ -235,15 +235,13 @@ fn capture_snapshot(
 ) -> LifecycleResult<String> {
     debug!(?action, "capturing snapshot before action");
     let snapshot = match action {
-        RecommendationAction::ModeCreate { .. } => {
-            json!({"existed": false}).to_string()
-        }
+        RecommendationAction::ModeCreate { .. } => json!({"existed": false}).to_string(),
         RecommendationAction::ModeEdit { mode_name, .. } => {
             mode_ops.get_mode_snapshot(mode_name)?
         }
-        RecommendationAction::ModelChange { role, from_model, .. } => {
-            json!({"role": role, "model": from_model}).to_string()
-        }
+        RecommendationAction::ModelChange {
+            role, from_model, ..
+        } => json!({"role": role, "model": from_model}).to_string(),
         RecommendationAction::ConfigChange { key, old_value, .. } => {
             json!({"key": key, "value": old_value}).to_string()
         }
@@ -251,9 +249,7 @@ fn capture_snapshot(
             mode_name,
             old_fragment,
             ..
-        } => {
-            json!({"mode_name": mode_name, "fragment": old_fragment}).to_string()
-        }
+        } => json!({"mode_name": mode_name, "fragment": old_fragment}).to_string(),
     };
     Ok(snapshot)
 }
@@ -273,7 +269,13 @@ fn execute_action(
             default_model,
             allowed_tools,
         } => {
-            mode_ops.create_mode(name, description, system_prompt, default_model.as_deref(), allowed_tools)?;
+            mode_ops.create_mode(
+                name,
+                description,
+                system_prompt,
+                default_model.as_deref(),
+                allowed_tools,
+            )?;
         }
         RecommendationAction::ModeEdit { mode_name, changes } => {
             mode_ops.update_mode(mode_name, changes)?;
@@ -390,7 +392,9 @@ mod tests {
         let pool = test_pool().await;
         let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
 
         let store = RecommendationStore::new(pool.clone());
         let rec = store.get(id).await.unwrap().unwrap();
@@ -402,7 +406,9 @@ mod tests {
         let pool = test_pool().await;
         let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
 
         let store = RecommendationStore::new(pool.clone());
         let versions = store.get_versions(id).await.unwrap();
@@ -421,9 +427,13 @@ mod tests {
         let pool = test_pool().await;
         let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
 
-        let err = LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
+        let err = LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("expected Pending"));
     }
 
@@ -444,7 +454,9 @@ mod tests {
         let pool = test_pool().await;
         let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
 
         let err = LifecycleManager::dismiss(&pool, id).await.unwrap_err();
         assert!(err.to_string().contains("expected Pending"));
@@ -455,8 +467,12 @@ mod tests {
         let pool = test_pool().await;
         let id = insert_pending(&pool, model_change_action()).await;
 
-        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
-        LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
+        LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
 
         let store = RecommendationStore::new(pool.clone());
         let rec = store.get(id).await.unwrap().unwrap();
@@ -472,7 +488,9 @@ mod tests {
         let pool = test_pool().await;
         let id = insert_pending(&pool, model_change_action()).await;
 
-        let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
+        let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("expected Applied"));
     }
 
@@ -483,14 +501,18 @@ mod tests {
 
         LifecycleManager::dismiss(&pool, id).await.unwrap();
 
-        let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
+        let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("expected Applied"));
     }
 
     #[tokio::test]
     async fn apply_not_found() {
         let pool = test_pool().await;
-        let err = LifecycleManager::apply(&pool, 999, &StubModeOps, &StubConfigOps).await.unwrap_err();
+        let err = LifecycleManager::apply(&pool, 999, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -508,7 +530,9 @@ mod tests {
         )
         .await;
         // One applied, one dismissed
-        LifecycleManager::apply(&pool, id1, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id1, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
         LifecycleManager::dismiss(&pool, id2).await.unwrap();
 
         let store = RecommendationStore::new(pool.clone());
@@ -532,7 +556,9 @@ mod tests {
         )
         .await;
 
-        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
 
         let store = RecommendationStore::new(pool.clone());
         let versions = store.get_versions(id).await.unwrap();
@@ -553,7 +579,9 @@ mod tests {
         )
         .await;
 
-        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
 
         let store = RecommendationStore::new(pool.clone());
         let versions = store.get_versions(id).await.unwrap();
@@ -575,7 +603,9 @@ mod tests {
         )
         .await;
 
-        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+        LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+            .await
+            .unwrap();
 
         let store = RecommendationStore::new(pool.clone());
         let versions = store.get_versions(id).await.unwrap();

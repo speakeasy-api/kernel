@@ -170,7 +170,12 @@ pub async fn rejection_rate(
     .await?;
 
     let rate = rejected.0 as f32 / total.0 as f32;
-    debug!(rate = rate, total_reviews = total.0, rejected = rejected.0, "rejection rate computed");
+    debug!(
+        rate = rate,
+        total_reviews = total.0,
+        rejected = rejected.0,
+        "rejection rate computed"
+    );
     Ok(rate)
 }
 
@@ -243,12 +248,10 @@ pub async fn rollup_metrics(
     debug!(session_id = %session_id, window_seconds = window_seconds, "rolling up metrics");
     let window_param = format!("-{window_seconds} seconds");
 
-    let row: (String, String) = sqlx::query_as(
-        "SELECT datetime('now', ?1), datetime('now')",
-    )
-    .bind(&window_param)
-    .fetch_one(pool)
-    .await?;
+    let row: (String, String) = sqlx::query_as("SELECT datetime('now', ?1), datetime('now')")
+        .bind(&window_param)
+        .fetch_one(pool)
+        .await?;
     let (period_start, period_end) = row;
 
     // Counts per variant
@@ -355,7 +358,9 @@ mod tests {
         .await
         .unwrap();
 
-        let events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].data, EventData::PromptSubmitted { .. }));
     }
@@ -376,7 +381,9 @@ mod tests {
         .await
         .unwrap();
 
-        let events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(events[0].metadata.id, emitted.metadata.id);
         assert_eq!(events[0].metadata.session_id, emitted.metadata.session_id);
     }
@@ -404,7 +411,9 @@ mod tests {
         .await
         .unwrap();
 
-        let events = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let events = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         match &events[0].data {
             EventData::TaskCompleted {
                 task_id: tid,

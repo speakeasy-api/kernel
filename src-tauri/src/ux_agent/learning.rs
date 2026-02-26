@@ -76,13 +76,19 @@ pub struct ExtractedConvention {
 /// and produces convention statements with confidence scores.
 #[instrument(skip(corrections), fields(correction_count = corrections.len()))]
 pub fn extract_conventions(corrections: &[Correction]) -> Vec<ExtractedConvention> {
-    debug!(correction_count = corrections.len(), "analyzing corrections for convention extraction");
+    debug!(
+        correction_count = corrections.len(),
+        "analyzing corrections for convention extraction"
+    );
     let mut extracted = Vec::new();
 
     // Group corrections by type.
     let mut by_type: HashMap<&str, Vec<&Correction>> = HashMap::new();
     for c in corrections {
-        by_type.entry(c.correction_type.as_str()).or_default().push(c);
+        by_type
+            .entry(c.correction_type.as_str())
+            .or_default()
+            .push(c);
     }
 
     // Mode overrides: look for repeated from->to patterns.
@@ -124,7 +130,10 @@ pub fn extract_conventions(corrections: &[Correction]) -> Vec<ExtractedConventio
 
 #[instrument(skip(overrides), fields(override_count = overrides.len()))]
 fn extract_mode_override_conventions(overrides: &[&Correction]) -> Vec<ExtractedConvention> {
-    debug!(override_count = overrides.len(), "extracting mode override conventions");
+    debug!(
+        override_count = overrides.len(),
+        "extracting mode override conventions"
+    );
     // Group by (original_value, corrected_value) pair.
     let mut pattern_groups: HashMap<(String, String), Vec<u64>> = HashMap::new();
     for c in overrides {
@@ -154,7 +163,10 @@ fn extract_rejection_conventions(
     rejections: &[&Correction],
     rejection_type: &str,
 ) -> Vec<ExtractedConvention> {
-    debug!(rejection_count = rejections.len(), rejection_type, "extracting rejection conventions");
+    debug!(
+        rejection_count = rejections.len(),
+        rejection_type, "extracting rejection conventions"
+    );
     // Group by corrected_value (user feedback) using exact match for v1.
     let mut feedback_groups: HashMap<String, Vec<u64>> = HashMap::new();
     for c in rejections {
@@ -195,7 +207,10 @@ fn extract_rejection_conventions(
 
 #[instrument(skip(steerings), fields(steering_count = steerings.len()))]
 fn extract_steering_conventions(steerings: &[&Correction]) -> Vec<ExtractedConvention> {
-    debug!(steering_count = steerings.len(), "extracting steering conventions");
+    debug!(
+        steering_count = steerings.len(),
+        "extracting steering conventions"
+    );
     // Group by corrected_value (the steering instruction).
     let mut instruction_groups: HashMap<String, Vec<u64>> = HashMap::new();
     for c in steerings {
@@ -245,7 +260,11 @@ pub async fn build_learning_context(
         "learning context assembled"
     );
 
-    Ok(format_learning_context(&corrections, &conventions, &proposed))
+    Ok(format_learning_context(
+        &corrections,
+        &conventions,
+        &proposed,
+    ))
 }
 
 #[instrument(skip(corrections, extracted, proposed), fields(
@@ -400,7 +419,11 @@ mod tests {
     async fn insert_and_retrieve_correction() {
         let pool = setup().await;
         let store = RecommendationStore::new(pool.clone());
-        let c = make_correction(CorrectionType::ModeOverride, Some("General"), Some("Implement"));
+        let c = make_correction(
+            CorrectionType::ModeOverride,
+            Some("General"),
+            Some("Implement"),
+        );
 
         let id = store.insert_correction(&c).await.unwrap();
         assert!(id > 0);
@@ -436,11 +459,17 @@ mod tests {
             .await
             .unwrap();
 
-        let overrides = store.get_corrections_by_type("mode_override").await.unwrap();
+        let overrides = store
+            .get_corrections_by_type("mode_override")
+            .await
+            .unwrap();
         assert_eq!(overrides.len(), 1);
         assert_eq!(overrides[0].correction_type, CorrectionType::ModeOverride);
 
-        let rejections = store.get_corrections_by_type("plan_rejection").await.unwrap();
+        let rejections = store
+            .get_corrections_by_type("plan_rejection")
+            .await
+            .unwrap();
         assert_eq!(rejections.len(), 1);
     }
 
@@ -508,7 +537,10 @@ mod tests {
             .insert_convention("never alter tables directly", &[4], None)
             .await
             .unwrap();
-        store.update_convention_status(id2, "dismissed").await.unwrap();
+        store
+            .update_convention_status(id2, "dismissed")
+            .await
+            .unwrap();
         let proposed_final = store.get_proposed_conventions().await.unwrap();
         assert!(proposed_final.is_empty());
     }

@@ -73,7 +73,10 @@ impl PreservationRules {
                 indices.push(i);
             }
         }
-        debug!(protected_count = indices.len(), "identified protected messages");
+        debug!(
+            protected_count = indices.len(),
+            "identified protected messages"
+        );
         indices
     }
 }

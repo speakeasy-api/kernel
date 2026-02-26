@@ -14,14 +14,34 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
-    Delta { text: String },
-    ToolUseStart { index: u64, id: String, name: String },
-    ToolInputDelta { index: u64, partial_json: String },
-    ContentBlockStop { index: u64 },
-    MessageUsage { usage: Usage },
-    Done { stop_reason: String },
-    DoneWithUsage { stop_reason: String, usage: Usage },
-    Error { message: String },
+    Delta {
+        text: String,
+    },
+    ToolUseStart {
+        index: u64,
+        id: String,
+        name: String,
+    },
+    ToolInputDelta {
+        index: u64,
+        partial_json: String,
+    },
+    ContentBlockStop {
+        index: u64,
+    },
+    MessageUsage {
+        usage: Usage,
+    },
+    Done {
+        stop_reason: String,
+    },
+    DoneWithUsage {
+        stop_reason: String,
+        usage: Usage,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Auth style determines how the API key is sent.
@@ -84,12 +104,9 @@ impl LlmClient2 {
     /// Build from a single `ProviderConfig` entry.
     fn from_provider_config(name: &str, pc: &ProviderConfig) -> Result<Self, String> {
         debug!(name = %name, "building client from provider config");
-        let env_var = pc
-            .api_key_env
-            .as_deref()
-            .unwrap_or(default_env_var(name));
-        let api_key = std::env::var(env_var)
-            .map_err(|_| format!("{env_var} not set (provider: {name})"))?;
+        let env_var = pc.api_key_env.as_deref().unwrap_or(default_env_var(name));
+        let api_key =
+            std::env::var(env_var).map_err(|_| format!("{env_var} not set (provider: {name})"))?;
 
         let (base_url, auth_style) = match pc.base_url.as_deref() {
             Some(url) => (url.to_string(), infer_auth_style(url)),
@@ -156,7 +173,11 @@ impl LlmClient2 {
             model.to_string()
         } else {
             // OpenRouter / Bearer providers need `anthropic/` prefix
-            if model.contains('/') { model.to_string() } else { format!("anthropic/{model}") }
+            if model.contains('/') {
+                model.to_string()
+            } else {
+                format!("anthropic/{model}")
+            }
         };
         debug!(input = %model, output = %result, "normalizing model");
         result
@@ -296,7 +317,7 @@ impl LlmClient2 {
         );
         let model = self.normalize_model(req.model);
 
-        let messages_json: Vec<Value> = req
+        let mut messages_json: Vec<Value> = req
             .messages
             .iter()
             .map(|m| {
@@ -312,20 +333,42 @@ impl LlmClient2 {
             })
             .collect();
 
+        // Inject cache_control breakpoint on the last user message so the
+        // entire conversation prefix is cached between agentic turns.
+        inject_message_cache_breakpoints(&mut messages_json);
+
+        // System prompt as a structured content block with cache_control so it
+        // is cached across every turn of the agentic loop.
+        let system_with_cache = serde_json::json!([{
+            "type": "text",
+            "text": req.system,
+            "cache_control": {"type": "ephemeral"}
+        }]);
+
         let mut body = serde_json::json!({
             "model": model,
             "max_tokens": req.max_tokens,
             "stream": true,
-            "system": req.system,
+            "system": system_with_cache,
             "messages": messages_json,
         });
 
         if !req.tools.is_empty() {
-            let tools_json: Vec<Value> = req
+            let mut tools_json: Vec<Value> = req
                 .tools
                 .iter()
                 .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
                 .collect();
+            // Tag the last tool definition with cache_control so the full
+            // system + tools prefix is cached (tools are stable across turns).
+            if let Some(last_tool) = tools_json.last_mut() {
+                if let Some(obj) = last_tool.as_object_mut() {
+                    obj.insert(
+                        "cache_control".into(),
+                        serde_json::json!({"type": "ephemeral"}),
+                    );
+                }
+            }
             body.as_object_mut()
                 .unwrap()
                 .insert("tools".into(), Value::Array(tools_json));
@@ -342,10 +385,7 @@ impl LlmClient2 {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown error".into());
+            let text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
             let err = format_api_error(status, &text);
             error!(status = %status, error = %err, "stream request failed");
             return Err(err);
@@ -473,19 +513,16 @@ fn parse_sse_event(json: &Value) -> Option<StreamChunk> {
             Some(StreamChunk::ContentBlockStop { index })
         }
         "message_delta" => {
-            let stop = json["delta"]["stop_reason"]
-                .as_str()
-                .map(|r| r.to_string());
+            let stop = json["delta"]["stop_reason"].as_str().map(|r| r.to_string());
             let usage = json
                 .get("usage")
                 .and_then(|v| serde_json::from_value::<Usage>(v.clone()).ok());
 
             // Return both as a combined variant so no data is lost
             match (stop, usage) {
-                (Some(stop_reason), Some(usage)) => Some(StreamChunk::DoneWithUsage {
-                    stop_reason,
-                    usage,
-                }),
+                (Some(stop_reason), Some(usage)) => {
+                    Some(StreamChunk::DoneWithUsage { stop_reason, usage })
+                }
                 (Some(stop_reason), None) => Some(StreamChunk::Done { stop_reason }),
                 (None, Some(usage)) => Some(StreamChunk::MessageUsage { usage }),
                 (None, None) => None,
@@ -495,14 +532,37 @@ fn parse_sse_event(json: &Value) -> Option<StreamChunk> {
             stop_reason: "end_turn".to_string(),
         }),
         "error" => {
-            let msg = json["error"]["message"]
-                .as_str()
-                .unwrap_or("unknown error");
+            let msg = json["error"]["message"].as_str().unwrap_or("unknown error");
             Some(StreamChunk::Error {
                 message: msg.to_string(),
             })
         }
         _ => None,
+    }
+}
+
+/// Inject `cache_control` breakpoints into the serialised message array for
+/// Anthropic prompt caching.
+///
+/// Adds `cache_control: {"type": "ephemeral"}` to the last content block of
+/// the last user message so the entire conversation prefix is cached between
+/// agentic turns.  This means on turn N+1 the API only processes the new
+/// assistant + tool-result messages while reusing the cached prefix from turn N.
+fn inject_message_cache_breakpoints(messages: &mut [Value]) {
+    for msg in messages.iter_mut().rev() {
+        if msg["role"].as_str() == Some("user") {
+            if let Some(content) = msg["content"].as_array_mut() {
+                if let Some(last_block) = content.last_mut() {
+                    if let Some(obj) = last_block.as_object_mut() {
+                        obj.insert(
+                            "cache_control".into(),
+                            serde_json::json!({"type": "ephemeral"}),
+                        );
+                    }
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -598,7 +658,10 @@ mod tests {
         )
         .unwrap();
         match parse_sse_event(&json) {
-            Some(StreamChunk::ToolInputDelta { index, partial_json }) => {
+            Some(StreamChunk::ToolInputDelta {
+                index,
+                partial_json,
+            }) => {
                 assert_eq!(index, 1);
                 assert_eq!(partial_json, r#"{"path""#);
             }
@@ -648,10 +711,9 @@ mod tests {
 
     #[test]
     fn parse_message_delta_done_without_usage() {
-        let json: Value = serde_json::from_str(
-            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
-        )
-        .unwrap();
+        let json: Value =
+            serde_json::from_str(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#)
+                .unwrap();
         match parse_sse_event(&json) {
             Some(StreamChunk::Done { stop_reason }) => assert_eq!(stop_reason, "end_turn"),
             other => panic!("Expected Done, got {:?}", other),
@@ -669,10 +731,8 @@ mod tests {
 
     #[test]
     fn parse_error() {
-        let json: Value = serde_json::from_str(
-            r#"{"type":"error","error":{"message":"rate limited"}}"#,
-        )
-        .unwrap();
+        let json: Value =
+            serde_json::from_str(r#"{"type":"error","error":{"message":"rate limited"}}"#).unwrap();
         match parse_sse_event(&json) {
             Some(StreamChunk::Error { message }) => assert_eq!(message, "rate limited"),
             other => panic!("Expected Error, got {:?}", other),
@@ -692,5 +752,81 @@ mod tests {
         )
         .unwrap();
         assert!(parse_sse_event(&json).is_none());
+    }
+
+    // ---- Cache breakpoint injection tests ----
+
+    #[test]
+    fn cache_breakpoints_marks_last_user_message() {
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}]
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "r1"},
+                    {"type": "tool_result", "tool_use_id": "tu_2", "content": "r2"}
+                ]
+            }),
+        ];
+        inject_message_cache_breakpoints(&mut messages);
+
+        // First user message should NOT have cache_control
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+
+        // Last user message: only the last content block gets cache_control
+        assert!(messages[2]["content"][0].get("cache_control").is_none());
+        assert_eq!(
+            messages[2]["content"][1]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_single_user_message() {
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}]
+        })];
+        inject_message_cache_breakpoints(&mut messages);
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_empty_messages_no_panic() {
+        let mut messages: Vec<Value> = vec![];
+        inject_message_cache_breakpoints(&mut messages);
+    }
+
+    #[test]
+    fn cache_breakpoints_skips_trailing_assistant() {
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}]
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "bye"}]
+            }),
+        ];
+        inject_message_cache_breakpoints(&mut messages);
+
+        // The user message should get the breakpoint (it's the last *user* msg)
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        // Assistant message should NOT have cache_control
+        assert!(messages[1]["content"][0].get("cache_control").is_none());
     }
 }
