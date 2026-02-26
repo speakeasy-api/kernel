@@ -49,13 +49,13 @@ pub fn run() {
                 crate::prompt_router::commands::CancellationFlags::new(),
             ));
 
-            // Spawn background task: initial refresh + 24h interval
+            // Spawn background task: warm cache eagerly + 24h periodic refresh
             tauri::async_runtime::spawn(async move {
-                registry.refresh().await;
+                registry.ensure_warm().await;
 
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
-                // The first tick completes immediately — skip it since we just refreshed
+                // The first tick completes immediately — skip it since we just warmed
                 interval.tick().await;
 
                 loop {

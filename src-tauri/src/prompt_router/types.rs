@@ -54,6 +54,7 @@ pub struct RouterInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterOutput {
     pub mode: String,
-    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub confidence: f32,
 }

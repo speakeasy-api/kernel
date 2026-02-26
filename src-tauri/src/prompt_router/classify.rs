@@ -43,8 +43,12 @@ pub fn build_classification_prompt(input: &RouterInput, available_models: &[Mode
     let frameworks = list_or_none(&input.project_context.frameworks);
     let file_structure = list_or_none(&input.project_context.file_structure_hints);
 
-    let model_section = if available_models.is_empty() {
-        "Use \"anthropic/claude-sonnet-4-6\" as the model.".to_string()
+    let (task_desc, model_section, response_format) = if available_models.is_empty() {
+        (
+            "select the best mode",
+            String::new(),
+            r#"{"mode": "<mode_name>", "confidence": <0.0-1.0>}"#,
+        )
     } else {
         let list = available_models
             .iter()
@@ -58,33 +62,38 @@ pub fn build_classification_prompt(input: &RouterInput, available_models: &[Mode
             })
             .collect::<Vec<_>>()
             .join("\n");
-        format!(
-            "Available models (you MUST pick one of these IDs exactly):\n{}\n\n\
-             If unsure, default to \"anthropic/claude-sonnet-4-6\".",
-            list
+        (
+            "select the best mode and model",
+            format!(
+                "Available models (you MUST pick one of these IDs exactly):\n{}\n\n",
+                list
+            ),
+            r#"{"mode": "<mode_name>", "model": "<model_id_from_list>", "confidence": <0.0-1.0>}"#,
         )
     };
 
     format!(
-        "You are a prompt router. Given the user's prompt and project context, select the best mode and model.\n\n\
+        "You are a prompt router. Given the user's prompt and project context, {task_desc}.\n\n\
 Available modes:\n\
-{}\n\n\
-{}\n\n\
+{modes}\n\n\
+{model_section}\
 Project context:\n\
-Languages: [{}]\n\
-Frameworks: [{}]\n\
-File structure: [{}]\n\n\
-Conversation so far: {}\n\n\
-User prompt: {}\n\n\
+Languages: [{languages}]\n\
+Frameworks: [{frameworks}]\n\
+File structure: [{file_structure}]\n\n\
+Conversation so far: {summary}\n\n\
+User prompt: {prompt}\n\n\
 Respond with ONLY a JSON object:\n\
-{{\"mode\": \"<mode_name>\", \"model\": \"<model_id_from_list>\", \"confidence\": <0.0-1.0>}}",
-        modes,
-        model_section,
-        languages,
-        frameworks,
-        file_structure,
-        input.conversation_history.messages_summary,
-        input.prompt
+{response_format}",
+        task_desc = task_desc,
+        modes = modes,
+        model_section = model_section,
+        languages = languages,
+        frameworks = frameworks,
+        file_structure = file_structure,
+        summary = input.conversation_history.messages_summary,
+        prompt = input.prompt,
+        response_format = response_format,
     )
 }
 
@@ -106,7 +115,7 @@ pub fn classify(
     let result = parse_classification_response(&response, &input.available_modes)?;
     debug!(
         mode = %result.mode,
-        model = %result.model,
+        model = ?result.model,
         confidence = result.confidence,
         "classification result"
     );
@@ -249,10 +258,12 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_empty_models_uses_fallback_text() {
+    fn build_prompt_empty_models_omits_model_section() {
         let input = sample_input();
         let prompt = build_classification_prompt(&input, &[]);
-        assert!(prompt.contains("Use \"anthropic/claude-sonnet-4-6\" as the model."));
+        assert!(prompt.contains("select the best mode."));
+        assert!(!prompt.contains("model"));
+        assert!(!prompt.contains("anthropic/claude-sonnet-4-6"));
     }
 
     #[test]
@@ -273,6 +284,7 @@ mod tests {
             },
         ];
         let prompt = build_classification_prompt(&input, &models);
+        assert!(prompt.contains("select the best mode and model."));
         assert!(prompt.contains("Available models (you MUST pick one of these IDs exactly):"));
         assert!(prompt.contains("- anthropic/claude-sonnet-4-6: Claude Sonnet 4.6 (200k context)"));
         assert!(prompt.contains("- google/gemini-2.5-pro: Gemini 2.5 Pro (1000k context)"));
@@ -293,7 +305,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.mode, "Plan");
-        assert_eq!(result.model, "claude-sonnet");
+        assert_eq!(result.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(result.confidence, 0.75);
     }
 
@@ -311,8 +323,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.mode, "Implement");
-        assert_eq!(result.model, "gpt-4.1");
+        assert_eq!(result.model.as_deref(), Some("gpt-4.1"));
         assert_eq!(result.confidence, 0.8);
+    }
+
+    #[test]
+    fn parse_json_without_model_field() {
+        let modes = vec![ModeInfo {
+            name: "Plan".to_string(),
+            description: "Structured decomposition".to_string(),
+        }];
+
+        let result = parse_classification_response(
+            r#"{"mode":"Plan","confidence":0.9}"#,
+            &modes,
+        )
+        .unwrap();
+
+        assert_eq!(result.mode, "Plan");
+        assert_eq!(result.model, None);
+        assert_eq!(result.confidence, 0.9);
     }
 
     #[test]
@@ -367,7 +397,7 @@ mod tests {
 
         let result = classify(&input, &llm, "router-model", &[]).unwrap();
         assert_eq!(result.mode, "Plan");
-        assert_eq!(result.model, "claude-3-7-sonnet");
+        assert_eq!(result.model.as_deref(), Some("claude-3-7-sonnet"));
         assert_eq!(result.confidence, 0.6);
     }
 }

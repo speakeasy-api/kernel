@@ -2,9 +2,11 @@ use super::classify::{self, build_classification_prompt, classify, LlmClient};
 use super::dispatch::{
     dispatch, dispatch_reclassification, DispatchError, LoadedMode, ModeLoader, RouterEventSink,
 };
+use super::model_registry::FALLBACK_MODEL;
 use super::reclassify::{self, ReclassificationTrigger};
 use super::types::*;
 use super::user_override::{self, apply_override, ModeOverriddenEvent};
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -175,13 +177,13 @@ fn test_project_context_default() {
 fn test_router_output_serialization() {
     let output = RouterOutput {
         mode: "Plan".into(),
-        model: "claude-sonnet".into(),
+        model: Some("claude-sonnet".into()),
         confidence: 0.85,
     };
     let json = serde_json::to_string(&output).unwrap();
     let round_tripped: RouterOutput = serde_json::from_str(&json).unwrap();
     assert_eq!(round_tripped.mode, "Plan");
-    assert_eq!(round_tripped.model, "claude-sonnet");
+    assert_eq!(round_tripped.model.as_deref(), Some("claude-sonnet"));
     assert_eq!(round_tripped.confidence, 0.85);
 }
 
@@ -197,7 +199,7 @@ fn test_classify_clean_json() {
     );
     let result = classify(&input, &llm, "router-model", &[]).unwrap();
     assert_eq!(result.mode, "Implement");
-    assert_eq!(result.model, "claude-3");
+    assert_eq!(result.model.as_deref(), Some("claude-3"));
     assert_eq!(result.confidence, 0.9);
 }
 
@@ -209,7 +211,7 @@ fn test_classify_json_with_surrounding_text() {
     );
     let result = classify(&input, &llm, "router-model", &[]).unwrap();
     assert_eq!(result.mode, "Plan");
-    assert_eq!(result.model, "claude-3");
+    assert_eq!(result.model.as_deref(), Some("claude-3"));
     assert_eq!(result.confidence, 0.85);
 }
 
@@ -296,7 +298,7 @@ fn test_build_classification_prompt_contains_project_context() {
 fn test_apply_override_valid_mode() {
     let original = RouterOutput {
         mode: "Implement".into(),
-        model: "claude-sonnet".into(),
+        model: Some("claude-sonnet".into()),
         confidence: 0.7,
     };
     let (output, _event) =
@@ -309,7 +311,7 @@ fn test_apply_override_valid_mode() {
 fn test_apply_override_invalid_mode() {
     let original = RouterOutput {
         mode: "Implement".into(),
-        model: "claude-sonnet".into(),
+        model: Some("claude-sonnet".into()),
         confidence: 0.7,
     };
     let result = apply_override(&original, "Nonexistent", None, &test_modes());
@@ -320,30 +322,30 @@ fn test_apply_override_invalid_mode() {
 fn test_apply_override_preserves_model_when_none() {
     let original = RouterOutput {
         mode: "Implement".into(),
-        model: "claude-sonnet".into(),
+        model: Some("claude-sonnet".into()),
         confidence: 0.7,
     };
     let (output, _) = apply_override(&original, "Plan", None, &test_modes()).unwrap();
-    assert_eq!(output.model, "claude-sonnet");
+    assert_eq!(output.model.as_deref(), Some("claude-sonnet"));
 }
 
 #[test]
 fn test_apply_override_uses_override_model() {
     let original = RouterOutput {
         mode: "Implement".into(),
-        model: "claude-sonnet".into(),
+        model: Some("claude-sonnet".into()),
         confidence: 0.7,
     };
     let (output, _) =
         apply_override(&original, "Plan", Some("gpt-4"), &test_modes()).unwrap();
-    assert_eq!(output.model, "gpt-4");
+    assert_eq!(output.model.as_deref(), Some("gpt-4"));
 }
 
 #[test]
 fn test_apply_override_event_data() {
     let original = RouterOutput {
         mode: "Implement".into(),
-        model: "claude-sonnet".into(),
+        model: Some("claude-sonnet".into()),
         confidence: 0.7,
     };
     let (_, event) = apply_override(&original, "Plan", None, &test_modes()).unwrap();
@@ -424,9 +426,11 @@ fn test_reclassify_llm_error() {
 fn test_dispatch_classification_path() {
     let input = test_input();
     let llm = MockLlmClient::new(
-        r#"{"mode":"Plan","model":"claude-sonnet","confidence":0.8}"#,
+        r#"{"mode":"Plan","model":"anthropic/claude-sonnet-4-6","confidence":0.8}"#,
     );
     let sink = MockEventSink::new();
+    let known: HashSet<String> =
+        ["anthropic/claude-sonnet-4-6".to_string()].into_iter().collect();
 
     let handoff = dispatch(
         &input,
@@ -437,12 +441,13 @@ fn test_dispatch_classification_path() {
         &sink,
         "sess-1",
         &[],
+        &known,
     )
     .unwrap();
 
     assert_eq!(handoff.mode_name, "Plan");
     assert_eq!(handoff.system_prompt, "You are in Plan mode.");
-    assert_eq!(handoff.model, "claude-sonnet");
+    assert_eq!(handoff.model, "anthropic/claude-sonnet-4-6");
     assert_eq!(handoff.confidence, 0.8);
     assert_eq!(sink.classified_events.lock().unwrap().len(), 1);
     assert_eq!(sink.override_events.lock().unwrap().len(), 0);
@@ -463,10 +468,12 @@ fn test_dispatch_override_path() {
         &sink,
         "sess-1",
         &[],
+        &HashSet::new(),
     )
     .unwrap();
 
     assert_eq!(handoff.mode_name, "Implement");
+    assert_eq!(handoff.model, FALLBACK_MODEL);
     assert_eq!(handoff.confidence, 1.0);
     assert_eq!(sink.classified_events.lock().unwrap().len(), 0);
     assert_eq!(sink.override_events.lock().unwrap().len(), 1);
@@ -493,6 +500,7 @@ fn test_dispatch_mode_not_found() {
         &sink,
         "sess-1",
         &[],
+        &HashSet::new(),
     )
     .unwrap_err();
 
@@ -514,6 +522,7 @@ fn test_dispatch_classification_error() {
         &sink,
         "sess-1",
         &[],
+        &HashSet::new(),
     )
     .unwrap_err();
 
@@ -527,6 +536,7 @@ fn test_dispatch_reclassification_mode_changed() {
         r#"{"mode":"Implement","model":"code-model","confidence":0.85}"#,
     );
     let sink = MockEventSink::new();
+    let known: HashSet<String> = ["code-model".to_string()].into_iter().collect();
 
     let result = dispatch_reclassification(
         &request,
@@ -536,6 +546,7 @@ fn test_dispatch_reclassification_mode_changed() {
         &sink,
         "sess-1",
         &[],
+        &known,
     )
     .unwrap();
 
@@ -562,6 +573,7 @@ fn test_dispatch_reclassification_no_change() {
         &sink,
         "sess-1",
         &[],
+        &HashSet::new(),
     )
     .unwrap();
 
@@ -575,6 +587,7 @@ fn test_dispatch_handoff_fields() {
         r#"{"mode":"Review","model":"review-model","confidence":0.92}"#,
     );
     let sink = MockEventSink::new();
+    let known: HashSet<String> = ["review-model".to_string()].into_iter().collect();
 
     let handoff = dispatch(
         &input,
@@ -585,6 +598,7 @@ fn test_dispatch_handoff_fields() {
         &sink,
         "sess-1",
         &[],
+        &known,
     )
     .unwrap();
 

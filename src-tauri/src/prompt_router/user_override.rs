@@ -66,7 +66,7 @@ pub fn apply_override(
 
     let output = RouterOutput {
         mode: override_mode.to_string(),
-        model: override_model.unwrap_or(&original.model).to_string(),
+        model: override_model.map(|m| m.to_string()).or(original.model.clone()),
         confidence: 1.0,
     };
 
@@ -75,7 +75,7 @@ pub fn apply_override(
         to_mode: override_mode.to_string(),
     };
 
-    debug!(mode = %output.mode, model = %output.model, "override applied");
+    debug!(mode = %output.mode, model = ?output.model, "override applied");
     Ok((output, event))
 }
 
@@ -99,7 +99,7 @@ mod tests {
     fn original_output() -> RouterOutput {
         RouterOutput {
             mode: "code".to_string(),
-            model: "gpt-4.1".to_string(),
+            model: Some("gpt-4.1".to_string()),
             confidence: 0.73,
         }
     }
@@ -129,7 +129,7 @@ mod tests {
         let (overridden, _) =
             apply_override(&original, "research", None, &modes()).expect("valid override");
 
-        assert_eq!(overridden.model, "gpt-4.1");
+        assert_eq!(overridden.model.as_deref(), Some("gpt-4.1"));
     }
 
     #[test]
@@ -139,7 +139,7 @@ mod tests {
         let (overridden, _) = apply_override(&original, "research", Some("gpt-4.1-mini"), &modes())
             .expect("valid override");
 
-        assert_eq!(overridden.model, "gpt-4.1-mini");
+        assert_eq!(overridden.model.as_deref(), Some("gpt-4.1-mini"));
     }
 
     #[test]

@@ -580,8 +580,10 @@ pub async fn submit_prompt(
         project_context: ProjectContext::default(),
     };
 
-    // 3. Gather available models from registry
-    let all_models = registry.models_for_mode("general");
+    // 3. Ensure model registry is warm, then gather available models
+    registry.ensure_warm().await;
+    let all_models = registry.models_for_mode("general").await;
+    let known_ids = registry.catalog_ids().await;
 
     // 4. Create LLM client from config → env fallback
     let client = resolve_client(&session.project_path)?;
@@ -604,6 +606,7 @@ pub async fn submit_prompt(
                 &NoopEventSink,
                 &session_id,
                 &models,
+                &known_ids,
             )
         })
         .await

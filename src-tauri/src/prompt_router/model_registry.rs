@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
@@ -182,37 +182,55 @@ impl ModelRegistry {
         guard.get(model_id).map(|m| m.context_length)
     }
 
-    /// Return deduplicated models relevant to a mode. Uses `try_read()` so
-    /// callers in `spawn_blocking` never block on a concurrent refresh.
-    /// Returns an empty vec on lock contention or cold cache.
+    /// Ensure the registry has been populated at least once. Call this before
+    /// routing so the classifier has a model list to work with.
+    pub async fn ensure_warm(&self) {
+        let is_cold = {
+            let cat = self.catalog.read().await;
+            cat.is_empty()
+        };
+        if is_cold {
+            self.refresh().await;
+        }
+    }
+
+    /// Return deduplicated models relevant to a mode.
     #[instrument(skip(self))]
-    pub fn models_for_mode(&self, mode: &str) -> Vec<ModelInfo> {
-        let cat_guard = match self.categories.try_read() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-        let catalog_guard = match self.catalog.try_read() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-
+    pub async fn models_for_mode(&self, mode: &str) -> Vec<ModelInfo> {
         let cats = categories_for_mode(mode);
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
 
-        for cat in cats {
-            if let Some(ids) = cat_guard.get(*cat) {
-                for id in ids {
-                    if seen.insert(id.clone()) {
-                        if let Some(info) = catalog_guard.get(id) {
-                            out.push(info.clone());
+        // Collect category IDs first, release lock before next await
+        let all_ids: Vec<String> = {
+            let cat_guard = self.categories.read().await;
+            let mut seen = HashSet::new();
+            let mut ids = Vec::new();
+            for cat in cats {
+                if let Some(cat_ids) = cat_guard.get(*cat) {
+                    for id in cat_ids {
+                        if seen.insert(id.clone()) {
+                            ids.push(id.clone());
                         }
                     }
                 }
             }
-        }
+            ids
+        };
+
+        // Look up full info from catalog
+        let catalog_guard = self.catalog.read().await;
+        let out: Vec<ModelInfo> = all_ids
+            .iter()
+            .filter_map(|id| catalog_guard.get(id).cloned())
+            .collect();
+
         debug!(mode, model_count = out.len(), "resolved models for mode");
         out
+    }
+
+    /// Return all model IDs from the full catalog (for validation).
+    pub async fn catalog_ids(&self) -> HashSet<String> {
+        let catalog = self.catalog.read().await;
+        catalog.keys().cloned().collect()
     }
 
     /// Check if any cached category contains the given model ID.
@@ -259,10 +277,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn models_for_mode_empty_on_cold_cache() {
+    #[tokio::test]
+    async fn models_for_mode_empty_on_cold_cache() {
         let registry = ModelRegistry::new();
-        let models = registry.models_for_mode("plan");
+        let models = registry.models_for_mode("plan").await;
         assert!(models.is_empty());
     }
 
@@ -328,9 +346,42 @@ mod tests {
         }
 
         // "plan" merges programming + technology — should deduplicate
-        let models = registry.models_for_mode("plan");
+        let models = registry.models_for_mode("plan").await;
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "openai/gpt-4");
+    }
+
+    #[tokio::test]
+    async fn catalog_ids_returns_all_ids() {
+        let registry = ModelRegistry::new();
+        assert!(registry.catalog_ids().await.is_empty());
+
+        {
+            let mut catalog = registry.catalog.write().await;
+            catalog.insert(
+                "anthropic/claude-sonnet-4-6".into(),
+                ModelInfo {
+                    id: "anthropic/claude-sonnet-4-6".into(),
+                    name: "Claude Sonnet".into(),
+                    description: "".into(),
+                    context_length: 200_000,
+                },
+            );
+            catalog.insert(
+                "openai/gpt-4".into(),
+                ModelInfo {
+                    id: "openai/gpt-4".into(),
+                    name: "GPT-4".into(),
+                    description: "".into(),
+                    context_length: 128_000,
+                },
+            );
+        }
+
+        let ids = registry.catalog_ids().await;
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("anthropic/claude-sonnet-4-6"));
+        assert!(ids.contains("openai/gpt-4"));
     }
 
     #[tokio::test]
