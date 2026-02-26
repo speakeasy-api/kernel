@@ -15,6 +15,10 @@ interface ContextRingProps {
   items: ChatItem[];
   /** Session ID to fetch raw context from the backend. */
   sessionId: string;
+  /** Total USD spent in this session, null while loading. */
+  sessionCost: number | null;
+  /** Cost thresholds from kernel config for color coding. */
+  costThresholds: { warn_at_usd: number; hard_limit_usd: number } | null;
 }
 
 const SIZE = 32;
@@ -24,7 +28,7 @@ const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
 
 type Tab = "summary" | "context";
 
-export function ContextRing({ used, total, items, sessionId }: ContextRingProps) {
+export function ContextRing({ used, total, items, sessionId, sessionCost, costThresholds }: ContextRingProps) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<Tab>("summary");
   const [rawContext, setRawContext] = useState<ContextMessage[] | null>(null);
@@ -42,6 +46,15 @@ export function ContextRing({ used, total, items, sessionId }: ContextRingProps)
       : ratio < 0.85
         ? "hsl(38 90% 60%)"
         : "hsl(4 80% 60%)";
+
+  const costColor =
+    sessionCost === null || costThresholds === null
+      ? "var(--color-text-ghost)"
+      : sessionCost < costThresholds.warn_at_usd
+        ? "var(--color-text-secondary)"
+        : sessionCost < costThresholds.hard_limit_usd
+          ? "hsl(38 90% 60%)"
+          : "hsl(4 80% 60%)";
 
   const pct = Math.round(ratio * 100);
 
@@ -151,6 +164,16 @@ export function ContextRing({ used, total, items, sessionId }: ContextRingProps)
                 style={{ width: `${pct}%`, backgroundColor: arcColor }}
               />
             </div>
+            {/* Session Cost */}
+            <div className="mt-2 flex items-center justify-between">
+              <span className="text-[11px] text-text-ghost">Session cost</span>
+              <span
+                className="text-[11px] font-mono tabular-nums"
+                style={{ color: costColor }}
+              >
+                {sessionCost === null ? "\u2014" : formatCost(sessionCost)}
+              </span>
+            </div>
             {/* Tabs */}
             <div className="mt-3 flex gap-1">
               <TabButton active={tab === "summary"} onClick={() => setTab("summary")}>
@@ -190,11 +213,10 @@ function TabButton({
   return (
     <button
       onClick={onClick}
-      className={`px-2.5 py-1 rounded-md text-[10px] font-medium tracking-wide transition-colors ${
-        active
-          ? "bg-white/[0.08] text-text-primary"
-          : "text-text-ghost hover:text-text-secondary hover:bg-white/[0.04]"
-      }`}
+      className={`px-2.5 py-1 rounded-md text-[10px] font-medium tracking-wide transition-colors ${active
+        ? "bg-white/8 text-text-primary"
+        : "text-text-ghost hover:text-text-secondary hover:bg-white/4"
+        }`}
     >
       {children}
     </button>
@@ -259,7 +281,7 @@ function RawContextTab({
   }
 
   return (
-    <div className="divide-y divide-white/[0.04]">
+    <div className="divide-y divide-white/4">
       <div className="px-4 py-2 flex items-center justify-between">
         <span className="text-[10px] text-text-ghost">
           {messages.length} message{messages.length !== 1 ? "s" : ""} in LLM context
@@ -295,9 +317,8 @@ function RawMessageBlock({ index, message }: { index: number; message: ContextMe
           {index}
         </span>
         <span
-          className={`text-[10px] font-mono shrink-0 ${
-            message.role === "user" ? "text-blue-400" : "text-green-400"
-          }`}
+          className={`text-[10px] font-mono shrink-0 ${message.role === "user" ? "text-blue-400" : "text-green-400"
+            }`}
         >
           {message.role}
         </span>
@@ -468,6 +489,12 @@ function blockCharCount(block: ContextBlock): number {
   if (block.type === "tool_use") return JSON.stringify(block.input).length + block.name.length;
   if (block.type === "tool_result") return block.content.length;
   return 0;
+}
+
+function formatCost(usd: number): string {
+  if (usd < 0.001) return "$0.00";
+  if (usd < 0.01) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(2)}`;
 }
 
 function summarizeContext(items: ChatItem[]) {

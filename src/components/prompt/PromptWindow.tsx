@@ -77,7 +77,7 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     }),
   );
   const [prompt, setPrompt] = useState("");
-  const { items, phase, resolvedMode, error, contextUsage, submit, cancel } = useLlmStream(session.id);
+  const { items, phase, resolvedMode, error, contextUsage, sessionCost, submit, cancel } = useLlmStream(session.id);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
@@ -409,7 +409,7 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
               </span>
             )}
             {selectedMode.name !== "auto" && (
-              <ContextRing used={usedTokens} total={contextWindow} items={items} sessionId={session.id} />
+              <ContextRing used={usedTokens} total={contextWindow} items={items} sessionId={session.id} sessionCost={sessionCost} costThresholds={config?.costs ?? null} />
             )}
           </div>
         </div>
