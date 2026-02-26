@@ -126,12 +126,11 @@ async fn insert_task_rows_tx(
 #[instrument(skip(pool))]
 pub async fn get_task(pool: &SqlitePool, task_id: Uuid) -> Result<Option<Task>, sqlx::Error> {
     debug!(%task_id, "fetching task");
-    let row = sqlx::query_as::<_, TaskRow>(&format!(
-        "SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"
-    ))
-    .bind(task_id.to_string())
-    .fetch_optional(pool)
-    .await?;
+    let row =
+        sqlx::query_as::<_, TaskRow>(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))
+            .bind(task_id.to_string())
+            .fetch_optional(pool)
+            .await?;
 
     match row {
         Some(row) => {
@@ -263,10 +262,7 @@ pub async fn get_task_tree(
 }
 
 #[instrument(skip(pool))]
-pub async fn next_unblocked(
-    pool: &SqlitePool,
-    session_id: Uuid,
-) -> Result<Vec<Task>, sqlx::Error> {
+pub async fn next_unblocked(pool: &SqlitePool, session_id: Uuid) -> Result<Vec<Task>, sqlx::Error> {
     debug!(%session_id, "querying next unblocked tasks");
     let rows = sqlx::query_as::<_, TaskRow>(&format!(
         "SELECT {TASK_COLUMNS}

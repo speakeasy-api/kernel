@@ -99,7 +99,12 @@ impl ContextBudget {
     pub fn tokens_to_reclaim(&self, current_tokens: usize) -> usize {
         if self.needs_deep_compaction(current_tokens) {
             let reclaim = current_tokens.saturating_sub(self.target_token_count());
-            debug!(current_tokens, target = self.target_token_count(), reclaim, "tokens to reclaim");
+            debug!(
+                current_tokens,
+                target = self.target_token_count(),
+                reclaim,
+                "tokens to reclaim"
+            );
             reclaim
         } else {
             0

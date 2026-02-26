@@ -14,14 +14,34 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
-    Delta { text: String },
-    ToolUseStart { index: u64, id: String, name: String },
-    ToolInputDelta { index: u64, partial_json: String },
-    ContentBlockStop { index: u64 },
-    MessageUsage { usage: Usage },
-    Done { stop_reason: String },
-    DoneWithUsage { stop_reason: String, usage: Usage },
-    Error { message: String },
+    Delta {
+        text: String,
+    },
+    ToolUseStart {
+        index: u64,
+        id: String,
+        name: String,
+    },
+    ToolInputDelta {
+        index: u64,
+        partial_json: String,
+    },
+    ContentBlockStop {
+        index: u64,
+    },
+    MessageUsage {
+        usage: Usage,
+    },
+    Done {
+        stop_reason: String,
+    },
+    DoneWithUsage {
+        stop_reason: String,
+        usage: Usage,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Auth style determines how the API key is sent.
@@ -84,12 +104,9 @@ impl LlmClient2 {
     /// Build from a single `ProviderConfig` entry.
     fn from_provider_config(name: &str, pc: &ProviderConfig) -> Result<Self, String> {
         debug!(name = %name, "building client from provider config");
-        let env_var = pc
-            .api_key_env
-            .as_deref()
-            .unwrap_or(default_env_var(name));
-        let api_key = std::env::var(env_var)
-            .map_err(|_| format!("{env_var} not set (provider: {name})"))?;
+        let env_var = pc.api_key_env.as_deref().unwrap_or(default_env_var(name));
+        let api_key =
+            std::env::var(env_var).map_err(|_| format!("{env_var} not set (provider: {name})"))?;
 
         let (base_url, auth_style) = match pc.base_url.as_deref() {
             Some(url) => (url.to_string(), infer_auth_style(url)),
@@ -156,7 +173,11 @@ impl LlmClient2 {
             model.to_string()
         } else {
             // OpenRouter / Bearer providers need `anthropic/` prefix
-            if model.contains('/') { model.to_string() } else { format!("anthropic/{model}") }
+            if model.contains('/') {
+                model.to_string()
+            } else {
+                format!("anthropic/{model}")
+            }
         };
         debug!(input = %model, output = %result, "normalizing model");
         result
@@ -364,10 +385,7 @@ impl LlmClient2 {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown error".into());
+            let text = resp.text().await.unwrap_or_else(|_| "unknown error".into());
             let err = format_api_error(status, &text);
             error!(status = %status, error = %err, "stream request failed");
             return Err(err);
@@ -495,19 +513,16 @@ fn parse_sse_event(json: &Value) -> Option<StreamChunk> {
             Some(StreamChunk::ContentBlockStop { index })
         }
         "message_delta" => {
-            let stop = json["delta"]["stop_reason"]
-                .as_str()
-                .map(|r| r.to_string());
+            let stop = json["delta"]["stop_reason"].as_str().map(|r| r.to_string());
             let usage = json
                 .get("usage")
                 .and_then(|v| serde_json::from_value::<Usage>(v.clone()).ok());
 
             // Return both as a combined variant so no data is lost
             match (stop, usage) {
-                (Some(stop_reason), Some(usage)) => Some(StreamChunk::DoneWithUsage {
-                    stop_reason,
-                    usage,
-                }),
+                (Some(stop_reason), Some(usage)) => {
+                    Some(StreamChunk::DoneWithUsage { stop_reason, usage })
+                }
                 (Some(stop_reason), None) => Some(StreamChunk::Done { stop_reason }),
                 (None, Some(usage)) => Some(StreamChunk::MessageUsage { usage }),
                 (None, None) => None,
@@ -517,9 +532,7 @@ fn parse_sse_event(json: &Value) -> Option<StreamChunk> {
             stop_reason: "end_turn".to_string(),
         }),
         "error" => {
-            let msg = json["error"]["message"]
-                .as_str()
-                .unwrap_or("unknown error");
+            let msg = json["error"]["message"].as_str().unwrap_or("unknown error");
             Some(StreamChunk::Error {
                 message: msg.to_string(),
             })
@@ -645,7 +658,10 @@ mod tests {
         )
         .unwrap();
         match parse_sse_event(&json) {
-            Some(StreamChunk::ToolInputDelta { index, partial_json }) => {
+            Some(StreamChunk::ToolInputDelta {
+                index,
+                partial_json,
+            }) => {
                 assert_eq!(index, 1);
                 assert_eq!(partial_json, r#"{"path""#);
             }
@@ -695,10 +711,9 @@ mod tests {
 
     #[test]
     fn parse_message_delta_done_without_usage() {
-        let json: Value = serde_json::from_str(
-            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
-        )
-        .unwrap();
+        let json: Value =
+            serde_json::from_str(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#)
+                .unwrap();
         match parse_sse_event(&json) {
             Some(StreamChunk::Done { stop_reason }) => assert_eq!(stop_reason, "end_turn"),
             other => panic!("Expected Done, got {:?}", other),
@@ -716,10 +731,8 @@ mod tests {
 
     #[test]
     fn parse_error() {
-        let json: Value = serde_json::from_str(
-            r#"{"type":"error","error":{"message":"rate limited"}}"#,
-        )
-        .unwrap();
+        let json: Value =
+            serde_json::from_str(r#"{"type":"error","error":{"message":"rate limited"}}"#).unwrap();
         match parse_sse_event(&json) {
             Some(StreamChunk::Error { message }) => assert_eq!(message, "rate limited"),
             other => panic!("Expected Error, got {:?}", other),

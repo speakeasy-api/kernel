@@ -92,7 +92,10 @@ pub async fn run_retention(
     .bind(&cutoff)
     .execute(pool)
     .await?;
-    debug!(count = sessions_result.rows_affected(), "deleted old sessions");
+    debug!(
+        count = sessions_result.rows_affected(),
+        "deleted old sessions"
+    );
 
     info!(
         events = events_result.rows_affected(),

@@ -59,10 +59,7 @@ pub fn generate_candidates(
                 baseline_rate_usd,
             } => {
                 candidates.push(DecisionCandidate {
-                    trigger: format!(
-                        "cost_spike:{:.1}x",
-                        current_rate_usd / baseline_rate_usd
-                    ),
+                    trigger: format!("cost_spike:{:.1}x", current_rate_usd / baseline_rate_usd),
                     suggested_action_type: "model_change".to_string(),
                     evidence: format!(
                         "Cost rate ${:.4}/run vs baseline ${:.4}/run ({:.1}x increase)",

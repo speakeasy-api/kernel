@@ -23,7 +23,12 @@ pub fn needs_gate_check(engagement: EngagementLevel, task_status: TaskStatus) ->
             matches!(task_status, TaskStatus::InProgress | TaskStatus::Review)
         }
     };
-    debug!(?engagement, ?task_status, needs_gate, "gate check evaluated");
+    debug!(
+        ?engagement,
+        ?task_status,
+        needs_gate,
+        "gate check evaluated"
+    );
     needs_gate
 }
 
@@ -87,7 +92,10 @@ pub fn effective_max_concurrent(engagement: EngagementLevel, configured_max: usi
         EngagementLevel::Collaborative => 1,
         _ => configured_max,
     };
-    debug!(?engagement, configured_max, effective, "effective max concurrent calculated");
+    debug!(
+        ?engagement,
+        configured_max, effective, "effective max concurrent calculated"
+    );
     effective
 }
 

@@ -25,12 +25,8 @@ struct ModeRow {
 }
 
 fn row_to_mode(row: ModeRow) -> Mode {
-    let allowed_tools: Vec<String> =
-        serde_json::from_str(&row.allowed_tools).unwrap_or_default();
-    let created_by = row
-        .origin
-        .parse::<ModeOrigin>()
-        .unwrap_or(ModeOrigin::User);
+    let allowed_tools: Vec<String> = serde_json::from_str(&row.allowed_tools).unwrap_or_default();
+    let created_by = row.origin.parse::<ModeOrigin>().unwrap_or(ModeOrigin::User);
     Mode {
         name: row.name,
         description: row.description,
@@ -92,11 +88,7 @@ pub async fn create_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Err
 }
 
 #[instrument(skip(pool, mode), fields(name))]
-pub async fn update_mode(
-    pool: &SqlitePool,
-    name: &str,
-    mode: &Mode,
-) -> Result<(), ModeError> {
+pub async fn update_mode(pool: &SqlitePool, name: &str, mode: &Mode) -> Result<(), ModeError> {
     info!(name, "updating mode");
     let tools_json = serde_json::to_string(&mode.allowed_tools).unwrap();
     let result = sqlx::query(
@@ -123,11 +115,10 @@ pub async fn update_mode(
 
 #[instrument(skip(pool))]
 pub async fn delete_mode(pool: &SqlitePool, name: &str) -> Result<bool, ModeError> {
-    let origin: Option<(String,)> =
-        sqlx::query_as("SELECT origin FROM modes WHERE name = ?1")
-            .bind(name)
-            .fetch_optional(pool)
-            .await?;
+    let origin: Option<(String,)> = sqlx::query_as("SELECT origin FROM modes WHERE name = ?1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
 
     match origin {
         None => {
@@ -217,9 +208,15 @@ mod tests {
     #[tokio::test]
     async fn list_modes_returns_all() {
         let pool = test_pool().await;
-        create_mode(&pool, &test_mode("a", ModeOrigin::BuiltIn)).await.unwrap();
-        create_mode(&pool, &test_mode("b", ModeOrigin::User)).await.unwrap();
-        create_mode(&pool, &test_mode("c", ModeOrigin::UxAgent)).await.unwrap();
+        create_mode(&pool, &test_mode("a", ModeOrigin::BuiltIn))
+            .await
+            .unwrap();
+        create_mode(&pool, &test_mode("b", ModeOrigin::User))
+            .await
+            .unwrap();
+        create_mode(&pool, &test_mode("c", ModeOrigin::UxAgent))
+            .await
+            .unwrap();
 
         let modes = list_modes(&pool).await.unwrap();
         assert_eq!(modes.len(), 3);
@@ -251,7 +248,9 @@ mod tests {
     #[tokio::test]
     async fn delete_builtin_mode_fails() {
         let pool = test_pool().await;
-        create_mode(&pool, &test_mode("plan", ModeOrigin::BuiltIn)).await.unwrap();
+        create_mode(&pool, &test_mode("plan", ModeOrigin::BuiltIn))
+            .await
+            .unwrap();
 
         let err = delete_mode(&pool, "plan").await.unwrap_err();
         assert!(matches!(err, ModeError::CannotDeleteBuiltin(_)));
@@ -263,7 +262,9 @@ mod tests {
     #[tokio::test]
     async fn delete_user_mode_succeeds() {
         let pool = test_pool().await;
-        create_mode(&pool, &test_mode("custom", ModeOrigin::User)).await.unwrap();
+        create_mode(&pool, &test_mode("custom", ModeOrigin::User))
+            .await
+            .unwrap();
 
         assert!(delete_mode(&pool, "custom").await.unwrap());
         assert!(get_mode(&pool, "custom").await.unwrap().is_none());

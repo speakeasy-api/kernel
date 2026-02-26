@@ -54,12 +54,10 @@ pub async fn create_task(
         updated_at: now,
     };
     info!(task_id = %task.id, "creating task");
-    super::db::insert_task(&pool, &task)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "create_task failed");
-            e.to_string()
-        })?;
+    super::db::insert_task(&pool, &task).await.map_err(|e| {
+        error!(error = %e, "create_task failed");
+        e.to_string()
+    })?;
     Ok(task)
 }
 
@@ -97,17 +95,12 @@ pub async fn list_tasks(
 
 #[tauri::command]
 #[instrument(skip(pool))]
-pub async fn get_task(
-    pool: State<'_, SqlitePool>,
-    task_id: Uuid,
-) -> Result<Option<Task>, String> {
+pub async fn get_task(pool: State<'_, SqlitePool>, task_id: Uuid) -> Result<Option<Task>, String> {
     debug!(%task_id, "getting task");
-    super::db::get_task(&pool, task_id)
-        .await
-        .map_err(|e| {
-            error!(error = %e, "get_task failed");
-            e.to_string()
-        })
+    super::db::get_task(&pool, task_id).await.map_err(|e| {
+        error!(error = %e, "get_task failed");
+        e.to_string()
+    })
 }
 
 #[tauri::command]
@@ -185,10 +178,7 @@ pub async fn set_task_engagement(
 
 #[tauri::command]
 #[instrument(skip(pool))]
-pub async fn get_task_cost(
-    pool: State<'_, SqlitePool>,
-    task_id: Uuid,
-) -> Result<f64, String> {
+pub async fn get_task_cost(pool: State<'_, SqlitePool>, task_id: Uuid) -> Result<f64, String> {
     debug!(%task_id, "getting task cost");
     let row: (f64,) = sqlx::query_as("SELECT cost_usd FROM tasks WHERE id = ?1")
         .bind(task_id.to_string())

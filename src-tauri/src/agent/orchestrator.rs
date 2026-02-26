@@ -140,7 +140,8 @@ impl Orchestrator {
     }
 
     pub fn completed_reports(&self, parent_id: &Uuid) -> Vec<&SubAgent> {
-        let reports: Vec<&SubAgent> = self.tree
+        let reports: Vec<&SubAgent> = self
+            .tree
             .children_of(parent_id)
             .into_iter()
             .filter(|agent| matches!(agent.status, AgentStatus::Complete | AgentStatus::Failed))
@@ -150,7 +151,8 @@ impl Orchestrator {
     }
 
     pub fn all_children_done(&self, parent_id: &Uuid) -> bool {
-        let done = self.tree
+        let done = self
+            .tree
             .children_of(parent_id)
             .into_iter()
             .all(|child| matches!(child.status, AgentStatus::Complete | AgentStatus::Failed));
@@ -163,13 +165,19 @@ impl Orchestrator {
     }
 
     pub fn total_tokens(&self) -> TokenMetrics {
-        let totals = self.tree
+        let totals = self
+            .tree
             .all_agents()
             .into_iter()
             .fold(TokenMetrics::default(), |acc, agent| {
                 acc + agent.token_usage.clone()
             });
-        debug!(input = totals.input, output = totals.output, cost_usd = totals.cost_usd, "total tokens");
+        debug!(
+            input = totals.input,
+            output = totals.output,
+            cost_usd = totals.cost_usd,
+            "total tokens"
+        );
         totals
     }
 

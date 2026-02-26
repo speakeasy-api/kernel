@@ -34,10 +34,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let pool = tauri::async_runtime::block_on(async {
-                db::open_pool().await
-            })
-            .expect("failed to create database pool");
+            let pool = tauri::async_runtime::block_on(async { db::open_pool().await })
+                .expect("failed to create database pool");
             app.manage(pool);
 
             // Model registry: cached OpenRouter model lists

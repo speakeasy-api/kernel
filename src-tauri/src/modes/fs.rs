@@ -519,7 +519,10 @@ system_prompt = "You sync."
         let count = sync_modes_to_db(&pool, dir.path()).await.unwrap();
         assert_eq!(count, 1);
 
-        let mode = crate::modes::db::get_mode(&pool, "sync").await.unwrap().unwrap();
+        let mode = crate::modes::db::get_mode(&pool, "sync")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(mode.description, "Sync mode");
         assert_eq!(mode.allowed_tools, vec!["fs_read", "grep"]);
     }
@@ -542,7 +545,9 @@ system_prompt = "You sync."
             created_by: ModeOrigin::User,
             version: 1,
         };
-        crate::modes::db::create_mode(&pool, &existing).await.unwrap();
+        crate::modes::db::create_mode(&pool, &existing)
+            .await
+            .unwrap();
 
         // Now create a file that should overwrite it
         fs::write(

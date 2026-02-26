@@ -34,12 +34,10 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<Session>, sqlx::Erro
 #[instrument(skip(pool))]
 pub async fn get_session(pool: &SqlitePool, id: &str) -> Result<Option<Session>, sqlx::Error> {
     debug!(id, "getting session");
-    sqlx::query_as::<_, Session>(
-        "SELECT id, project_path, created_at FROM sessions WHERE id = ?1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
+    sqlx::query_as::<_, Session>("SELECT id, project_path, created_at FROM sessions WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 #[instrument(skip(pool))]
@@ -95,6 +93,27 @@ pub async fn insert_event(
     .await
 }
 
+/// Return the most recent event of a given kind for a session, if any.
+#[instrument(skip(pool))]
+pub async fn last_event_by_kind(
+    pool: &SqlitePool,
+    session_id: &str,
+    kind: &str,
+) -> Result<Option<Event>, sqlx::Error> {
+    debug!(session_id, kind, "fetching last event by kind");
+    sqlx::query_as::<_, Event>(
+        "SELECT id, kind, session_id, agent_id, data, created_at
+         FROM events
+         WHERE session_id = ?1 AND kind = ?2
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(kind)
+    .fetch_optional(pool)
+    .await
+}
+
 #[instrument(skip(pool))]
 pub async fn events_since(
     pool: &SqlitePool,
@@ -141,7 +160,14 @@ const TASK_COLUMNS: &str = "id, session_id, title, description, status, priority
      cost_usd, created_at, updated_at";
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(pool, description, parent_task, base_ref, base_commit, merge_target_ref))]
+#[instrument(skip(
+    pool,
+    description,
+    parent_task,
+    base_ref,
+    base_commit,
+    merge_target_ref
+))]
 pub async fn create_task(
     pool: &SqlitePool,
     session_id: &str,
@@ -275,10 +301,7 @@ pub async fn get_task_deps(pool: &SqlitePool, task_id: &str) -> Result<Vec<Strin
 }
 
 #[instrument(skip(pool))]
-pub async fn next_unblocked(
-    pool: &SqlitePool,
-    session_id: &str,
-) -> Result<Vec<Task>, sqlx::Error> {
+pub async fn next_unblocked(pool: &SqlitePool, session_id: &str) -> Result<Vec<Task>, sqlx::Error> {
     debug!(session_id, "finding next unblocked tasks");
     sqlx::query_as::<_, Task>(&format!(
         "SELECT {TASK_COLUMNS}
@@ -328,23 +351,19 @@ pub async fn create_agent(
     .bind(mode)
     .execute(pool)
     .await?;
-    sqlx::query_as::<_, Agent>(&format!(
-        "SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"
-    ))
-    .bind(&id)
-    .fetch_one(pool)
-    .await
+    sqlx::query_as::<_, Agent>(&format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"))
+        .bind(&id)
+        .fetch_one(pool)
+        .await
 }
 
 #[instrument(skip(pool))]
 pub async fn get_agent(pool: &SqlitePool, id: &str) -> Result<Option<Agent>, sqlx::Error> {
     debug!(id, "getting agent");
-    sqlx::query_as::<_, Agent>(&format!(
-        "SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await
+    sqlx::query_as::<_, Agent>(&format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 #[instrument(skip(pool))]
@@ -417,12 +436,10 @@ pub async fn insert_mode(pool: &SqlitePool, mode: &Mode) -> Result<(), sqlx::Err
 #[instrument(skip(pool))]
 pub async fn get_mode(pool: &SqlitePool, name: &str) -> Result<Option<Mode>, sqlx::Error> {
     debug!(name, "getting mode");
-    sqlx::query_as::<_, Mode>(&format!(
-        "SELECT {MODE_COLUMNS} FROM modes WHERE name = ?1"
-    ))
-    .bind(name)
-    .fetch_optional(pool)
-    .await
+    sqlx::query_as::<_, Mode>(&format!("SELECT {MODE_COLUMNS} FROM modes WHERE name = ?1"))
+        .bind(name)
+        .fetch_optional(pool)
+        .await
 }
 
 #[instrument(skip(pool))]
@@ -644,7 +661,10 @@ pub async fn get_conversation_messages_since(
     session_id: &str,
     after_ordinal: i64,
 ) -> Result<Vec<ConversationRow>, sqlx::Error> {
-    debug!(session_id, after_ordinal, "getting conversation messages since ordinal");
+    debug!(
+        session_id,
+        after_ordinal, "getting conversation messages since ordinal"
+    );
     sqlx::query_as::<_, ConversationRow>(
         "SELECT ordinal, role, content FROM conversation_messages
          WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal ASC",
@@ -701,12 +721,11 @@ pub async fn get_max_ordinal(
     session_id: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
     debug!(session_id, "getting max ordinal");
-    let row: Option<(Option<i64>,)> = sqlx::query_as(
-        "SELECT MAX(ordinal) FROM conversation_messages WHERE session_id = ?1",
-    )
-    .bind(session_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT MAX(ordinal) FROM conversation_messages WHERE session_id = ?1")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.and_then(|r| r.0))
 }
 
@@ -767,7 +786,9 @@ mod tests {
         .unwrap();
         assert_eq!(e2.agent_id.as_deref(), Some("agent-1"));
 
-        let since = events_since(&pool, &session.id, "2000-01-01").await.unwrap();
+        let since = events_since(&pool, &session.id, "2000-01-01")
+            .await
+            .unwrap();
         assert_eq!(since.len(), 2);
     }
 
@@ -1016,12 +1037,16 @@ mod tests {
         .unwrap();
         assert!(agent.finished_at.is_none());
 
-        update_agent_status(&pool, &agent.id, "running").await.unwrap();
+        update_agent_status(&pool, &agent.id, "running")
+            .await
+            .unwrap();
         let a = get_agent(&pool, &agent.id).await.unwrap().unwrap();
         assert_eq!(a.status, "running");
         assert!(a.finished_at.is_none());
 
-        update_agent_status(&pool, &agent.id, "complete").await.unwrap();
+        update_agent_status(&pool, &agent.id, "complete")
+            .await
+            .unwrap();
         let a = get_agent(&pool, &agent.id).await.unwrap().unwrap();
         assert_eq!(a.status, "complete");
         assert!(a.finished_at.is_some());
@@ -1043,12 +1068,16 @@ mod tests {
         .await
         .unwrap();
 
-        update_agent_tokens(&pool, &agent.id, 1000, 500).await.unwrap();
+        update_agent_tokens(&pool, &agent.id, 1000, 500)
+            .await
+            .unwrap();
         let a = get_agent(&pool, &agent.id).await.unwrap().unwrap();
         assert_eq!(a.token_input, 1000);
         assert_eq!(a.token_output, 500);
 
-        update_agent_tokens(&pool, &agent.id, 200, 100).await.unwrap();
+        update_agent_tokens(&pool, &agent.id, 200, 100)
+            .await
+            .unwrap();
         let a = get_agent(&pool, &agent.id).await.unwrap().unwrap();
         assert_eq!(a.token_input, 1200);
         assert_eq!(a.token_output, 600);

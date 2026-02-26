@@ -117,15 +117,13 @@ fn load_toml_value(path: &Path) -> Result<toml::Value, ConfigError> {
             source: e,
         }
     })?;
-    contents
-        .parse::<toml::Value>()
-        .map_err(|e| {
-            error!(path = %path.display(), error = %e, "failed to parse config file");
-            ConfigError::Parse {
-                path: path.display().to_string(),
-                source: e,
-            }
-        })
+    contents.parse::<toml::Value>().map_err(|e| {
+        error!(path = %path.display(), error = %e, "failed to parse config file");
+        ConfigError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        }
+    })
 }
 
 /// Recursively merge `overlay` into `base`. For tables, merge field-by-field.

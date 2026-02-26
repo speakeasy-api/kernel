@@ -166,11 +166,7 @@ mod tests {
     fn reclassify_propagates_llm_error() {
         struct FailingClient;
         impl LlmClient for FailingClient {
-            fn complete(
-                &self,
-                _prompt: &str,
-                _model: &str,
-            ) -> Result<String, ClassificationError> {
+            fn complete(&self, _prompt: &str, _model: &str) -> Result<String, ClassificationError> {
                 Err(ClassificationError {
                     message: "LLM unavailable".to_string(),
                 })

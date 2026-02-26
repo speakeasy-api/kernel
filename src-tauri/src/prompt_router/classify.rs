@@ -334,11 +334,8 @@ mod tests {
             description: "Structured decomposition".to_string(),
         }];
 
-        let result = parse_classification_response(
-            r#"{"mode":"Plan","confidence":0.9}"#,
-            &modes,
-        )
-        .unwrap();
+        let result =
+            parse_classification_response(r#"{"mode":"Plan","confidence":0.9}"#, &modes).unwrap();
 
         assert_eq!(result.mode, "Plan");
         assert_eq!(result.model, None);

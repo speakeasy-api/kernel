@@ -15,7 +15,6 @@ use crate::anthropic::client::StreamRequest;
 use crate::anthropic::pricing::calculate_cost;
 use crate::anthropic::types::{ContentBlock, Message, Role, Usage};
 use crate::anthropic::{LlmClient2, StreamChunk};
-use crate::tools::{execute_tool, tool_definitions};
 use crate::compaction;
 use crate::config::{load_config, KernelConfig};
 use crate::events::emit::emit;
@@ -28,6 +27,7 @@ use crate::prompt_router::dispatch::{
 use crate::prompt_router::model_registry::{ModelRegistry, FALLBACK_MODEL};
 use crate::prompt_router::types::*;
 use crate::prompt_router::user_override::ModeOverriddenEvent;
+use crate::tools::{execute_tool, tool_definitions};
 
 use std::collections::HashMap;
 
@@ -94,10 +94,9 @@ impl Drop for CancellationGuard {
 /// Falls back to all messages if no snapshot exists.
 #[instrument(skip(pool))]
 async fn load_agent_context(pool: &SqlitePool, session_id: &str) -> Result<Vec<Message>, String> {
-    let mut rows = if let Some(snapshot) =
-        crate::db::queries::get_latest_snapshot(pool, session_id)
-            .await
-            .map_err(|e| e.to_string())?
+    let mut rows = if let Some(snapshot) = crate::db::queries::get_latest_snapshot(pool, session_id)
+        .await
+        .map_err(|e| e.to_string())?
     {
         // Deserialize snapshot summary messages
         let mut messages: Vec<Message> = serde_json::from_str(&snapshot.summary_messages)
@@ -423,8 +422,7 @@ async fn build_conversation_history(
             interrupt_idx += 1;
         }
 
-        let content: Vec<ContentBlock> =
-            serde_json::from_str(&row.content).unwrap_or_default();
+        let content: Vec<ContentBlock> = serde_json::from_str(&row.content).unwrap_or_default();
         entries.push(HistoryEntry::Message {
             role: row.role.clone(),
             content,
@@ -486,7 +484,9 @@ pub async fn revert_file(
             "reason": reason,
         })
         .to_string();
-        let _ = crate::db::queries::insert_event(&*pool, &session_id, None, "FileRevert", &revert_data).await;
+        let _ =
+            crate::db::queries::insert_event(&*pool, &session_id, None, "FileRevert", &revert_data)
+                .await;
 
         // Append revert info to conversation so LLM is aware
         let revert_msg = if reason.is_empty() {
@@ -501,11 +501,14 @@ pub async fn revert_file(
         let _ = append_message(&*pool, &session_id, &revert_message).await;
 
         // Emit event for live frontend
-        let _ = app.emit("file-reverted", FileRevertedEvent {
-            tool_use_id,
-            path,
-            reason,
-        });
+        let _ = app.emit(
+            "file-reverted",
+            FileRevertedEvent {
+                tool_use_id,
+                path,
+                reason,
+            },
+        );
     }
 
     Ok(result)
@@ -523,7 +526,10 @@ pub async fn cancel_prompt(
 }
 
 #[tauri::command]
-#[instrument(skip(app, pool, registry, cancel_flags, prompt), fields(session_id, mode_override))]
+#[instrument(
+    skip(app, pool, registry, cancel_flags, prompt),
+    fields(session_id, mode_override)
+)]
 pub async fn submit_prompt(
     session_id: String,
     prompt: String,
@@ -557,88 +563,143 @@ pub async fn submit_prompt(
         .await
         .map_err(|e| e.to_string())?;
 
-    // 2. Build RouterInput
-    let modes = builtin_modes();
-    let available_modes: Vec<ModeInfo> = modes
-        .iter()
-        .map(|m| ModeInfo {
-            name: m.name.clone(),
-            description: m.description.clone(),
-        })
-        .collect();
-
-    let router_input = RouterInput {
-        source: PromptSource::User,
-        prompt: prompt.clone(),
-        available_modes,
-        conversation_history: CompactedContext {
-            messages_summary: String::new(),
-            learnings: Vec::new(),
-            preserved_facts: Vec::new(),
-            token_count: 0,
-        },
-        project_context: ProjectContext::default(),
-    };
-
-    // 3. Ensure model registry is warm, then gather available models
-    registry.ensure_warm().await;
-    let all_models = registry.models_for_mode("general").await;
-    let known_ids = registry.catalog_ids().await;
-
-    // 4. Create LLM client from config → env fallback
-    let client = resolve_client(&session.project_path)?;
-    let router_model = config.models.prompt_router.clone();
-
-    // 5. Classify mode (in spawn_blocking since dispatch is sync + calls LlmClient::complete)
-    let user_override = mode_override.clone();
-    let handoff: AgentHandoff = {
-        let input = router_input.clone();
-        let rm = router_model;
-        let uo = user_override;
-        let models = all_models.clone();
-        tokio::task::spawn_blocking(move || {
-            dispatch(
-                &input,
-                uo.as_deref(),
-                &client as &dyn LlmClient,
-                &rm,
-                &BuiltinModeLoader,
-                &NoopEventSink,
-                &session_id,
-                &models,
-                &known_ids,
-            )
-        })
+    // 2. Resolve mode + model: reuse previous classification unless the user
+    //    explicitly overrides the mode.  Only the first message in a session
+    //    (or an explicit mode switch) triggers the LLM classifier.
+    let previous = crate::db::queries::last_event_by_kind(&*pool, &session.id, "PromptClassified")
         .await
-        .map_err(|e| format!("spawn_blocking failed: {e}"))?
-        .map_err(|e| e.to_string())?
-    };
+        .ok()
+        .flatten()
+        .and_then(|ev| serde_json::from_str::<serde_json::Value>(&ev.data).ok());
 
-    // 6. Persist classification + emit mode-resolved to frontend
-    let classify_data = serde_json::json!({
-        "mode": handoff.mode_name,
-        "model": handoff.model,
-        "confidence": handoff.confidence,
-    })
-    .to_string();
-    let _ = crate::db::queries::insert_event(&*pool, &session.id, None, "PromptClassified", &classify_data).await;
+    let handoff: AgentHandoff = if mode_override.is_none() && previous.is_some() {
+        // Reuse previous classification — no LLM call needed
+        let prev = previous.unwrap();
+        let mode_name = prev["mode"].as_str().unwrap_or("General").to_string();
+        let model = prev["model"]
+            .as_str()
+            .unwrap_or(&config.models.default)
+            .to_string();
+        let confidence = prev["confidence"].as_f64().unwrap_or(1.0) as f32;
 
-    let _ = app.emit(
-        "llm-mode-resolved",
-        LlmModeResolved {
-            mode: handoff.mode_name.clone(),
-            model: handoff.model.clone(),
-            confidence: handoff.confidence,
-        },
-    );
+        let loaded = BuiltinModeLoader
+            .load_mode(&mode_name)
+            .map_err(|e| e.to_string())?;
 
-    // 7. Stream the response — use config default model if router left it empty
-    let stream_client = resolve_client(&session.project_path)?;
-    let model = if handoff.model.is_empty() {
-        config.models.default.clone()
+        debug!(mode = %mode_name, model = %model, "reusing previous session classification");
+
+        let _ = app.emit(
+            "llm-mode-resolved",
+            LlmModeResolved {
+                mode: mode_name.clone(),
+                model: model.clone(),
+                confidence,
+            },
+        );
+
+        AgentHandoff {
+            mode_name,
+            system_prompt: loaded.system_prompt,
+            model,
+            context: CompactedContext {
+                messages_summary: String::new(),
+                learnings: Vec::new(),
+                preserved_facts: Vec::new(),
+                token_count: 0,
+            },
+            allowed_tools: loaded.allowed_tools,
+            prompt: prompt.clone(),
+            confidence,
+        }
     } else {
-        handoff.model.clone()
+        // First message or explicit mode override — run the classifier
+        let modes = builtin_modes();
+        let available_modes: Vec<ModeInfo> = modes
+            .iter()
+            .map(|m| ModeInfo {
+                name: m.name.clone(),
+                description: m.description.clone(),
+            })
+            .collect();
+
+        let router_input = RouterInput {
+            source: PromptSource::User,
+            prompt: prompt.clone(),
+            available_modes,
+            conversation_history: CompactedContext {
+                messages_summary: String::new(),
+                learnings: Vec::new(),
+                preserved_facts: Vec::new(),
+                token_count: 0,
+            },
+            project_context: ProjectContext::default(),
+        };
+
+        registry.ensure_warm().await;
+        let all_models = registry.models_for_mode("general").await;
+        let known_ids = registry.catalog_ids().await;
+
+        let client = resolve_client(&session.project_path)?;
+        let router_model = config.models.prompt_router.clone();
+        let user_override = mode_override.clone();
+        let config_default = config.models.default.clone();
+
+        let h: AgentHandoff = {
+            let input = router_input.clone();
+            let rm = router_model;
+            let uo = user_override;
+            let models = all_models.clone();
+            let cd = config_default;
+            tokio::task::spawn_blocking(move || {
+                dispatch(
+                    &input,
+                    uo.as_deref(),
+                    &client as &dyn LlmClient,
+                    &rm,
+                    &BuiltinModeLoader,
+                    &NoopEventSink,
+                    &session_id,
+                    &models,
+                    &known_ids,
+                    Some(cd.as_str()),
+                )
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking failed: {e}"))?
+            .map_err(|e| e.to_string())?
+        };
+
+        // Persist classification for subsequent turns
+        let classify_data = serde_json::json!({
+            "mode": h.mode_name,
+            "model": h.model,
+            "confidence": h.confidence,
+        })
+        .to_string();
+        let _ = crate::db::queries::insert_event(
+            &*pool,
+            &session.id,
+            None,
+            "PromptClassified",
+            &classify_data,
+        )
+        .await;
+
+        let _ = app.emit(
+            "llm-mode-resolved",
+            LlmModeResolved {
+                mode: h.mode_name.clone(),
+                model: h.model.clone(),
+                confidence: h.confidence,
+            },
+        );
+
+        h
     };
+
+    // 7. Stream the response
+    let stream_client = resolve_client(&session.project_path)?;
+    let model = handoff.model.clone();
 
     // Load conversation history from DB and append user message
     let mut history = load_agent_context(&*pool, &session.id).await?;
@@ -699,7 +760,14 @@ pub async fn submit_prompt(
                     "after_messages": compacted.len(),
                 })
                 .to_string();
-                let _ = crate::db::queries::insert_event(&*pool, &session.id, None, "ContextCompacted", &compact_data).await;
+                let _ = crate::db::queries::insert_event(
+                    &*pool,
+                    &session.id,
+                    None,
+                    "ContextCompacted",
+                    &compact_data,
+                )
+                .await;
 
                 // Save the compacted messages as a snapshot
                 if let Ok(Some(max_ord)) =
@@ -776,7 +844,14 @@ pub async fn submit_prompt(
                     "after_messages": compacted.len(),
                 })
                 .to_string();
-                let _ = crate::db::queries::insert_event(&*pool, &session.id, None, "ContextCompacted", &compact_data).await;
+                let _ = crate::db::queries::insert_event(
+                    &*pool,
+                    &session.id,
+                    None,
+                    "ContextCompacted",
+                    &compact_data,
+                )
+                .await;
 
                 if let Ok(Some(max_ord)) =
                     crate::db::queries::get_max_ordinal(&*pool, &session.id).await
@@ -807,7 +882,14 @@ pub async fn submit_prompt(
             "after_ordinal": after_ordinal,
         })
         .to_string();
-        let _ = crate::db::queries::insert_event(&*pool, &session.id, None, "Interrupted", &interrupt_data).await;
+        let _ = crate::db::queries::insert_event(
+            &*pool,
+            &session.id,
+            None,
+            "Interrupted",
+            &interrupt_data,
+        )
+        .await;
     }
 
     let sid = session.id.clone();
@@ -899,7 +981,12 @@ async fn run_agent_loop(
     config: &KernelConfig,
     context_window: usize,
 ) -> Result<(String, Usage), String> {
-    info!(model, context_window, tools = allowed_tools.len(), "starting agent loop");
+    info!(
+        model,
+        context_window,
+        tools = allowed_tools.len(),
+        "starting agent loop"
+    );
     let tool_defs = tool_definitions(allowed_tools);
     let project = Path::new(project_path);
 
@@ -974,7 +1061,10 @@ async fn run_agent_loop(
                         },
                     );
                 }
-                StreamChunk::ToolInputDelta { index, partial_json } => {
+                StreamChunk::ToolInputDelta {
+                    index,
+                    partial_json,
+                } => {
                     if let Some(tc) = tool_calls.get_mut(&index) {
                         tc.input_json.push_str(&partial_json);
                     }
@@ -987,11 +1077,18 @@ async fn run_agent_loop(
                         stop_reason = sr;
                     }
                 }
-                StreamChunk::DoneWithUsage { stop_reason: sr, usage } => {
+                StreamChunk::DoneWithUsage {
+                    stop_reason: sr,
+                    usage,
+                } => {
                     if stop_reason.is_empty() {
                         stop_reason = sr;
                     }
-                    turn_input_tokens = usage.input_tokens;
+                    // With prompt caching, input_tokens only counts non-cached
+                    // tokens. The real context usage is the sum of all three.
+                    turn_input_tokens = usage.input_tokens
+                        + usage.cache_read_input_tokens
+                        + usage.cache_creation_input_tokens;
                     accumulated_usage.merge(&usage);
                 }
                 StreamChunk::Error { message } => {
@@ -1002,7 +1099,9 @@ async fn run_agent_loop(
                     return Ok((full_text, accumulated_usage));
                 }
                 StreamChunk::MessageUsage { usage } => {
-                    turn_input_tokens = usage.input_tokens;
+                    turn_input_tokens = usage.input_tokens
+                        + usage.cache_read_input_tokens
+                        + usage.cache_creation_input_tokens;
                     accumulated_usage.merge(&usage);
                 }
             }
@@ -1016,8 +1115,7 @@ async fn run_agent_loop(
 
         let mut finalized: Vec<(String, String, Value)> = Vec::new();
         for tc in tool_calls.into_values() {
-            let input: Value =
-                serde_json::from_str(&tc.input_json).unwrap_or(Value::Null);
+            let input: Value = serde_json::from_str(&tc.input_json).unwrap_or(Value::Null);
             assistant_content.push(ContentBlock::ToolUse {
                 id: tc.id.clone(),
                 name: tc.name.clone(),
@@ -1060,8 +1158,11 @@ async fn run_agent_loop(
                 }
 
                 // Persist tool call event (for audit)
-                let tc_data = serde_json::json!({"id": id, "name": name, "input": input}).to_string();
-                let _ = crate::db::queries::insert_event(pool, session_id, None, "ToolCall", &tc_data).await;
+                let tc_data =
+                    serde_json::json!({"id": id, "name": name, "input": input}).to_string();
+                let _ =
+                    crate::db::queries::insert_event(pool, session_id, None, "ToolCall", &tc_data)
+                        .await;
 
                 let _ = app.emit(
                     "llm-tool-call",
@@ -1086,8 +1187,17 @@ async fn run_agent_loop(
                 };
 
                 // Persist tool result event (for audit)
-                let tr_data = serde_json::json!({"id": id, "content": content, "is_error": is_error}).to_string();
-                let _ = crate::db::queries::insert_event(pool, session_id, None, "ToolResult", &tr_data).await;
+                let tr_data =
+                    serde_json::json!({"id": id, "content": content, "is_error": is_error})
+                        .to_string();
+                let _ = crate::db::queries::insert_event(
+                    pool,
+                    session_id,
+                    None,
+                    "ToolResult",
+                    &tr_data,
+                )
+                .await;
 
                 let _ = app.emit(
                     "llm-tool-result",
@@ -1104,17 +1214,26 @@ async fn run_agent_loop(
                         crate::tools::FileChangeStatus::Created => "created",
                         crate::tools::FileChangeStatus::Modified => "modified",
                     };
-                    let hunks_payload: Vec<HunkPayload> = fc.hunks.iter().map(|h| HunkPayload {
-                        header: h.header.clone(),
-                        lines: h.lines.iter().map(|l| DiffLinePayload {
-                            kind: match l.kind {
-                                crate::git::diff::LineKind::Context => "context",
-                                crate::git::diff::LineKind::Add => "add",
-                                crate::git::diff::LineKind::Remove => "remove",
-                            }.into(),
-                            content: l.content.clone(),
-                        }).collect(),
-                    }).collect();
+                    let hunks_payload: Vec<HunkPayload> = fc
+                        .hunks
+                        .iter()
+                        .map(|h| HunkPayload {
+                            header: h.header.clone(),
+                            lines: h
+                                .lines
+                                .iter()
+                                .map(|l| DiffLinePayload {
+                                    kind: match l.kind {
+                                        crate::git::diff::LineKind::Context => "context",
+                                        crate::git::diff::LineKind::Add => "add",
+                                        crate::git::diff::LineKind::Remove => "remove",
+                                    }
+                                    .into(),
+                                    content: l.content.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect();
 
                     let fc_event = FileChangeEvent {
                         tool_use_id: id.clone(),
@@ -1128,7 +1247,14 @@ async fn run_agent_loop(
 
                     // Persist as DB event
                     let fc_data = serde_json::to_string(&fc_event).unwrap_or_default();
-                    let _ = crate::db::queries::insert_event(pool, session_id, None, "FileChange", &fc_data).await;
+                    let _ = crate::db::queries::insert_event(
+                        pool,
+                        session_id,
+                        None,
+                        "FileChange",
+                        &fc_data,
+                    )
+                    .await;
 
                     let _ = app.emit("file-change", fc_event);
                 }
@@ -1164,7 +1290,8 @@ async fn run_agent_loop(
             );
 
             // Mid-loop deep compaction when real input_tokens exceed the trigger
-            let trigger = (context_window as f64 * config.compaction.deep_trigger_pct as f64 / 100.0) as u64;
+            let trigger =
+                (context_window as f64 * config.compaction.deep_trigger_pct as f64 / 100.0) as u64;
             if turn_input_tokens >= trigger {
                 tracing::info!(
                     turn_input_tokens,
@@ -1226,9 +1353,8 @@ fn light_compact(messages: &mut [Message]) {
                 if char_count > 2000 {
                     let head: String = content.chars().take(500).collect();
                     let tail: String = content.chars().skip(char_count - 200).collect();
-                    *content = format!(
-                        "{head}\n... [truncated, {char_count} chars total] ...\n{tail}"
-                    );
+                    *content =
+                        format!("{head}\n... [truncated, {char_count} chars total] ...\n{tail}");
                 }
             }
         }
@@ -1358,8 +1484,7 @@ async fn maybe_compact_for_storage(
         + compaction::estimate_tokens(system_prompt);
 
     // Only trigger deep compaction when over budget
-    let trigger =
-        (context_window as f32 * config.compaction.deep_trigger_pct / 100.0) as usize;
+    let trigger = (context_window as f32 * config.compaction.deep_trigger_pct / 100.0) as usize;
 
     if token_estimate < trigger {
         return messages;

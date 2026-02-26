@@ -191,7 +191,10 @@ pub fn validate_dag(tasks: &[Task], edges: &[(Uuid, Uuid)]) -> Result<Vec<Uuid>,
             .filter(|task| in_degree.get(&task.id).copied().unwrap_or(0) > 0)
             .map(|task| task.id)
             .collect();
-        warn!(cycle_node_count = cycle_nodes.len(), "dependency cycle detected in task DAG");
+        warn!(
+            cycle_node_count = cycle_nodes.len(),
+            "dependency cycle detected in task DAG"
+        );
         return Err(SchedulerError::CycleDetected(cycle_nodes));
     }
 

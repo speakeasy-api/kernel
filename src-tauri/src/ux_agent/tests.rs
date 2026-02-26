@@ -6,9 +6,7 @@ use super::decisions::{
     build_config_change_action, build_mode_create_action, build_mode_edit_action,
     build_model_change_action, build_prompt_edit_action, generate_candidates, DecisionContext,
 };
-use super::learning::{
-    build_learning_context, extract_conventions, Correction, CorrectionType,
-};
+use super::learning::{build_learning_context, extract_conventions, Correction, CorrectionType};
 use super::lifecycle::{LifecycleManager, StubConfigOps, StubModeOps};
 use super::prompt::build_user_message;
 use super::runtime::{StubModelInvoker, UxAgentRuntime};
@@ -229,9 +227,18 @@ async fn store_list_pending_filters_correctly() {
         status,
     };
 
-    let id1 = store.insert(&make(RecommendationStatus::Pending)).await.unwrap();
-    let id2 = store.insert(&make(RecommendationStatus::Pending)).await.unwrap();
-    let id3 = store.insert(&make(RecommendationStatus::Pending)).await.unwrap();
+    let id1 = store
+        .insert(&make(RecommendationStatus::Pending))
+        .await
+        .unwrap();
+    let id2 = store
+        .insert(&make(RecommendationStatus::Pending))
+        .await
+        .unwrap();
+    let id3 = store
+        .insert(&make(RecommendationStatus::Pending))
+        .await
+        .unwrap();
 
     store
         .update_status(id3, RecommendationStatus::Applied)
@@ -296,7 +303,10 @@ async fn store_version_tracking() {
     };
     let rec_id = store.insert(&rec).await.unwrap();
 
-    store.insert_version(rec_id, 1, r#"{"key":"k","value":"a"}"#).await.unwrap();
+    store
+        .insert_version(rec_id, 1, r#"{"key":"k","value":"a"}"#)
+        .await
+        .unwrap();
 
     let versions = store.get_versions(rec_id).await.unwrap();
     assert_eq!(versions.len(), 1);
@@ -396,10 +406,7 @@ fn cost_spike_trigger() {
     };
     let triggers = evaluate_triggers(&summary);
     assert_eq!(triggers.len(), 1);
-    assert!(matches!(
-        triggers[0],
-        TriggerReason::CostSpike { .. }
-    ));
+    assert!(matches!(triggers[0], TriggerReason::CostSpike { .. }));
 }
 
 #[test]
@@ -477,7 +484,11 @@ fn test_decision_context() -> DecisionContext {
 #[test]
 fn generate_candidates_for_rejections() {
     let triggers = vec![TriggerReason::RejectionsAccumulated { count: 5 }];
-    let candidates = generate_candidates(&triggers, &EventSummary::default(), &test_decision_context());
+    let candidates = generate_candidates(
+        &triggers,
+        &EventSummary::default(),
+        &test_decision_context(),
+    );
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].suggested_action_type, "mode_edit");
 }
@@ -498,7 +509,13 @@ fn generate_candidates_filters_dismissed() {
 
 #[test]
 fn action_builder_mode_create() {
-    let action = build_mode_create_action("db", "DB work", "You are a DB expert", Some("gpt-4"), &["sql"]);
+    let action = build_mode_create_action(
+        "db",
+        "DB work",
+        "You are a DB expert",
+        Some("gpt-4"),
+        &["sql"],
+    );
     assert!(matches!(
         action,
         RecommendationAction::ModeCreate { ref name, ref default_model, .. }
@@ -594,7 +611,9 @@ async fn apply_pending_recommendation() {
     let pool = test_db().await;
     let id = insert_pending(&pool, model_change_action()).await;
 
-    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+        .await
+        .unwrap();
 
     let store = RecommendationStore::new(pool.clone());
     let rec = store.get(id).await.unwrap().unwrap();
@@ -610,9 +629,13 @@ async fn apply_non_pending_fails() {
     let pool = test_db().await;
     let id = insert_pending(&pool, model_change_action()).await;
 
-    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+        .await
+        .unwrap();
 
-    let err = LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
+    let err = LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("expected Pending"));
 }
 
@@ -633,8 +656,12 @@ async fn revert_applied_recommendation() {
     let pool = test_db().await;
     let id = insert_pending(&pool, model_change_action()).await;
 
-    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
-    LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap();
+    LifecycleManager::apply(&pool, id, &StubModeOps, &StubConfigOps)
+        .await
+        .unwrap();
+    LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps)
+        .await
+        .unwrap();
 
     let store = RecommendationStore::new(pool.clone());
     let rec = store.get(id).await.unwrap().unwrap();
@@ -649,7 +676,9 @@ async fn revert_non_applied_fails() {
     let pool = test_db().await;
     let id = insert_pending(&pool, model_change_action()).await;
 
-    let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps).await.unwrap_err();
+    let err = LifecycleManager::revert(&pool, id, &StubModeOps, &StubConfigOps)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("expected Applied"));
 }
 
@@ -692,15 +721,27 @@ async fn insert_and_retrieve_corrections() {
     let store = RecommendationStore::new(pool.clone());
 
     store
-        .insert_correction(&make_correction(CorrectionType::ModeOverride, Some("A"), Some("B")))
+        .insert_correction(&make_correction(
+            CorrectionType::ModeOverride,
+            Some("A"),
+            Some("B"),
+        ))
         .await
         .unwrap();
     store
-        .insert_correction(&make_correction(CorrectionType::PlanRejection, None, Some("verbose")))
+        .insert_correction(&make_correction(
+            CorrectionType::PlanRejection,
+            None,
+            Some("verbose"),
+        ))
         .await
         .unwrap();
     store
-        .insert_correction(&make_correction(CorrectionType::AgentSteering, None, Some("use tests")))
+        .insert_correction(&make_correction(
+            CorrectionType::AgentSteering,
+            None,
+            Some("use tests"),
+        ))
         .await
         .unwrap();
 
@@ -714,19 +755,34 @@ async fn mark_corrections_incorporated() {
     let store = RecommendationStore::new(pool.clone());
 
     let id1 = store
-        .insert_correction(&make_correction(CorrectionType::ModeOverride, Some("A"), Some("B")))
+        .insert_correction(&make_correction(
+            CorrectionType::ModeOverride,
+            Some("A"),
+            Some("B"),
+        ))
         .await
         .unwrap();
     let id2 = store
-        .insert_correction(&make_correction(CorrectionType::DiffRejection, None, Some("bad")))
+        .insert_correction(&make_correction(
+            CorrectionType::DiffRejection,
+            None,
+            Some("bad"),
+        ))
         .await
         .unwrap();
     let id3 = store
-        .insert_correction(&make_correction(CorrectionType::AgentSteering, None, Some("tests")))
+        .insert_correction(&make_correction(
+            CorrectionType::AgentSteering,
+            None,
+            Some("tests"),
+        ))
         .await
         .unwrap();
 
-    store.mark_corrections_incorporated(&[id1, id2]).await.unwrap();
+    store
+        .mark_corrections_incorporated(&[id1, id2])
+        .await
+        .unwrap();
 
     let remaining = store.get_unincorporated_corrections().await.unwrap();
     assert_eq!(remaining.len(), 1);
@@ -841,7 +897,10 @@ async fn runtime_run_with_stub_model() {
         ..Default::default()
     };
 
-    let recs = rt.run(&pool, &triggers, &summary, "{}", "[]").await.unwrap();
+    let recs = rt
+        .run(&pool, &triggers, &summary, "{}", "[]")
+        .await
+        .unwrap();
     assert!(recs.is_empty());
 
     // Cursor should be updated even with no recommendations
@@ -890,7 +949,10 @@ async fn runtime_persists_recommendations() {
         ..Default::default()
     };
 
-    let recs = rt.run(&pool, &triggers, &summary, "{}", "[]").await.unwrap();
+    let recs = rt
+        .run(&pool, &triggers, &summary, "{}", "[]")
+        .await
+        .unwrap();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].status, RecommendationStatus::Pending);
 
@@ -959,18 +1021,25 @@ async fn full_pipeline_trigger_to_apply_to_revert() {
         response: serde_json::to_string(&response).unwrap(),
     };
     let rt = UxAgentRuntime::new("ux-model".into(), Box::new(invoker));
-    let recs = rt.run(&pool, &triggers, &summary, "{}", "[]").await.unwrap();
+    let recs = rt
+        .run(&pool, &triggers, &summary, "{}", "[]")
+        .await
+        .unwrap();
     assert_eq!(recs.len(), 1);
     let rec_id = recs[0].id;
 
     // 3. Apply the recommendation
-    LifecycleManager::apply(&pool, rec_id, &StubModeOps, &StubConfigOps).await.unwrap();
+    LifecycleManager::apply(&pool, rec_id, &StubModeOps, &StubConfigOps)
+        .await
+        .unwrap();
     let store = RecommendationStore::new(pool.clone());
     let rec = store.get(rec_id).await.unwrap().unwrap();
     assert_eq!(rec.status, RecommendationStatus::Applied);
 
     // 4. Revert the recommendation
-    LifecycleManager::revert(&pool, rec_id, &StubModeOps, &StubConfigOps).await.unwrap();
+    LifecycleManager::revert(&pool, rec_id, &StubModeOps, &StubConfigOps)
+        .await
+        .unwrap();
     let rec = store.get(rec_id).await.unwrap().unwrap();
     assert_eq!(rec.status, RecommendationStatus::Reverted);
 }
@@ -1006,7 +1075,10 @@ async fn full_pipeline_trigger_to_dismiss_affects_future_candidates() {
         ..Default::default()
     };
     let triggers = evaluate_triggers(&summary);
-    let recs = rt.run(&pool, &triggers, &summary, "{}", "[]").await.unwrap();
+    let recs = rt
+        .run(&pool, &triggers, &summary, "{}", "[]")
+        .await
+        .unwrap();
     let rec_id = recs[0].id;
 
     LifecycleManager::dismiss(&pool, rec_id).await.unwrap();
@@ -1026,7 +1098,9 @@ async fn full_pipeline_trigger_to_dismiss_affects_future_candidates() {
     let candidates = generate_candidates(&triggers, &summary, &ctx);
     // The rejections_accumulated candidate should be filtered
     assert!(
-        candidates.iter().all(|c| !c.trigger.contains("rejections_accumulated")),
+        candidates
+            .iter()
+            .all(|c| !c.trigger.contains("rejections_accumulated")),
         "dismissed pattern should be filtered from candidates"
     );
 }
@@ -1065,7 +1139,9 @@ async fn learning_corrections_feed_into_context() {
     let corrections = store.get_unincorporated_corrections().await.unwrap();
     let conventions = extract_conventions(&corrections);
     assert!(!conventions.is_empty());
-    assert!(conventions.iter().any(|c| c.convention.contains("Implement")));
+    assert!(conventions
+        .iter()
+        .any(|c| c.convention.contains("Implement")));
 
     // Mark corrections as incorporated
     let ids: Vec<u64> = corrections.iter().map(|c| c.id).collect();
