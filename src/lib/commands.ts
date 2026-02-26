@@ -106,6 +106,12 @@ export function cancelPrompt(sessionId: string) {
   return invoke<void>("cancel_prompt", { sessionId });
 }
 
+// -- Session Cost --
+
+export function getSessionCost(sessionId: string): Promise<number> {
+  return invoke<number>("get_session_cost", { sessionId });
+}
+
 // -- File Revert --
 
 export type RevertResult =

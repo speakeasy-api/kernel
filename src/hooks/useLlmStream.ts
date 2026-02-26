@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { submitPrompt, cancelPrompt, getConversationHistory, eventsSince } from "../lib/commands";
+import { submitPrompt, cancelPrompt, getConversationHistory, getSessionCost, eventsSince } from "../lib/commands";
 import type { ContextBlock } from "../lib/commands";
 
 export interface DiffHunk {
@@ -68,6 +68,13 @@ interface FileRevertedPayload {
   tool_use_id: string;
   path: string;
   reason: string;
+}
+
+interface LlmUsageEvent {
+  session_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
 }
 
 interface ContextUsageEvent {
@@ -190,6 +197,7 @@ export function useLlmStream(sessionId: string) {
   const [resolvedMode, setResolvedMode] = useState<ModeResolved | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+  const [sessionCost, setSessionCost] = useState<number | null>(null);
   const activeSessionRef = useRef(sessionId);
 
   // Bootstrap from DB history on mount / session change
@@ -200,6 +208,7 @@ export function useLlmStream(sessionId: string) {
     setResolvedMode(null);
     setError(null);
     setContextUsage(null);
+    setSessionCost(null);
 
     let stale = false;
     loadHistoryItems(sessionId).then((result) => {
@@ -209,6 +218,9 @@ export function useLlmStream(sessionId: string) {
         setResolvedMode(result.lastMode);
       }
     });
+    getSessionCost(sessionId)
+      .then((c) => { if (!stale) setSessionCost(c); })
+      .catch(() => { if (!stale) setSessionCost(0); });
     return () => { stale = true; };
   }, [sessionId]);
 
@@ -310,6 +322,13 @@ export function useLlmStream(sessionId: string) {
       if (cancelled) { u_fr(); return; }
       unlistens.push(u_fr);
 
+      const u8 = await listen<LlmUsageEvent>("llm-usage", (e) => {
+        if (e.payload.session_id !== sessionId) return;
+        setSessionCost((prev) => (prev ?? 0) + e.payload.cost_usd);
+      });
+      if (cancelled) { u8(); return; }
+      unlistens.push(u8);
+
       const u7 = await listen<ContextUsageEvent>("context-usage", (e) => {
         if (e.payload.session_id === sessionId) {
           setContextUsage({
@@ -351,5 +370,5 @@ export function useLlmStream(sessionId: string) {
     // Phase transitions to idle when the backend emits llm-done with stop_reason "cancelled"
   }, [sessionId]);
 
-  return { items, phase, resolvedMode, error, contextUsage, submit, cancel };
+  return { items, phase, resolvedMode, error, contextUsage, sessionCost, submit, cancel };
 }

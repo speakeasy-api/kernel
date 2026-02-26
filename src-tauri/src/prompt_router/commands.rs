@@ -220,6 +220,7 @@ struct LlmError {
 
 #[derive(Clone, Serialize)]
 struct LlmUsage {
+    session_id: String,
     input_tokens: u64,
     output_tokens: u64,
     cost_usd: f64,
@@ -931,6 +932,7 @@ pub async fn submit_prompt(
     let _ = app.emit(
         "llm-usage",
         LlmUsage {
+            session_id: sid.to_string(),
             input_tokens: accumulated_usage.input_tokens,
             output_tokens: accumulated_usage.output_tokens,
             cost_usd,
