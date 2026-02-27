@@ -9,7 +9,7 @@ export interface DiffHunk {
 }
 
 export type ChatItem =
-  | { kind: "text"; role: "user" | "assistant"; content: string }
+  | { kind: "text"; role: "user" | "assistant"; content: string; pinned?: boolean }
   | { kind: "tool_call"; id: string; name: string; input: Record<string, unknown> }
   | { kind: "tool_result"; id: string; content: string; isError: boolean }
   | { kind: "file_change"; toolUseId: string; path: string; status: "created" | "modified"; hunks: DiffHunk[]; bytesWritten: number; beforeContent: string | null; afterContent: string }
@@ -95,11 +95,11 @@ interface HistoryResult {
   lastMode: ModeResolved | null;
 }
 
-function contextBlocksToChatItems(role: "user" | "assistant", content: ContextBlock[]): ChatItem[] {
+function contextBlocksToChatItems(role: "user" | "assistant", content: ContextBlock[], pinned?: boolean): ChatItem[] {
   const items: ChatItem[] = [];
   for (const block of content) {
     if (block.type === "text") {
-      items.push({ kind: "text", role, content: block.text });
+      items.push({ kind: "text", role, content: block.text, ...(pinned ? { pinned } : {}) });
     } else if (block.type === "tool_use") {
       items.push({ kind: "tool_call", id: block.id, name: block.name, input: block.input });
     } else if (block.type === "tool_result") {
@@ -149,7 +149,7 @@ async function loadHistoryItems(sessionId: string): Promise<HistoryResult> {
     // Convert conversation history entries
     const items: ChatItem[] = history.entries.flatMap((entry) => {
       if (entry.type === "message" && entry.role && entry.content) {
-        const chatItems = contextBlocksToChatItems(entry.role, entry.content);
+        const chatItems = contextBlocksToChatItems(entry.role, entry.content, entry.pinned);
         // After each tool_result for fs_write, insert the corresponding file_change
         const enriched: ChatItem[] = [];
         for (const item of chatItems) {
@@ -350,13 +350,13 @@ export function useLlmStream(sessionId: string) {
   }, [sessionId]);
 
   const submit = useCallback(
-    async (prompt: string, modeOverride: string | null) => {
+    async (prompt: string, modeOverride: string | null, pinned: boolean = false) => {
       setError(null);
       setPhase("classifying");
       // Optimistically add the user message immediately
-      setItems((prev) => [...prev, { kind: "text", role: "user", content: prompt }]);
+      setItems((prev) => [...prev, { kind: "text", role: "user", content: prompt, ...(pinned ? { pinned } : {}) }]);
       try {
-        await submitPrompt(sessionId, prompt, modeOverride);
+        await submitPrompt(sessionId, prompt, modeOverride, pinned);
       } catch (e) {
         setError(String(e));
         setPhase("idle");

@@ -80,6 +80,7 @@ export interface HistoryEntry {
   // message fields (when type === "message"):
   role?: "user" | "assistant";
   content?: ContextBlock[];
+  pinned?: boolean;
   // compaction fields (when type === "compaction"):
   before_messages?: number;
   after_messages?: number;
@@ -98,8 +99,9 @@ export function submitPrompt(
   sessionId: string,
   prompt: string,
   modeOverride: string | null,
+  pinned: boolean = false,
 ) {
-  return invoke<void>("submit_prompt", { sessionId, prompt, modeOverride });
+  return invoke<void>("submit_prompt", { sessionId, prompt, modeOverride, pinned: pinned || undefined });
 }
 
 export function cancelPrompt(sessionId: string) {

@@ -7,9 +7,11 @@ interface PromptInputProps {
   onSubmit: () => void;
   busy?: boolean;
   onCancel?: () => void;
+  pinned: boolean;
+  onPinToggle: () => void;
 }
 
-export function PromptInput({ value, onChange, onSubmit, busy, onCancel }: PromptInputProps) {
+export function PromptInput({ value, onChange, onSubmit, busy, onCancel, pinned, onPinToggle }: PromptInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [focused, setFocused] = useState(false);
 
@@ -58,6 +60,34 @@ export function PromptInput({ value, onChange, onSubmit, busy, onCancel }: Promp
         } : {}),
       }}
     >
+      {/* Pin toggle */}
+      <div className="absolute left-3 bottom-3">
+        <button
+          type="button"
+          onClick={onPinToggle}
+          disabled={busy}
+          className={cn(
+            "flex h-7 w-7 items-center justify-center rounded-lg transition-all duration-150 cursor-pointer",
+            pinned
+              ? "text-amber-400 bg-amber-400/10"
+              : "text-text-ghost hover:text-text-secondary",
+            busy && "opacity-40 cursor-not-allowed",
+          )}
+          title={pinned ? "Unpin message" : "Pin message (survives compaction)"}
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path
+              d="M9.828 1.172a1 1 0 0 1 1.414 0l3.586 3.586a1 1 0 0 1 0 1.414l-2.293 2.293-.707.707-1.414-1.414-2.828 2.828L7 14l-1-1-3.586-3.586L1.5 8.5l3.414.414 2.828-2.828-1.414-1.414.707-.707z"
+              stroke="currentColor"
+              strokeWidth="1.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              fill={pinned ? "currentColor" : "none"}
+            />
+          </svg>
+        </button>
+      </div>
+
       <textarea
         ref={textareaRef}
         value={value}
@@ -72,7 +102,7 @@ export function PromptInput({ value, onChange, onSubmit, busy, onCancel }: Promp
         autoComplete="off"
         spellCheck={false}
         className={cn(
-          "w-full resize-none bg-transparent pl-5 pr-14 pt-4 pb-3",
+          "w-full resize-none bg-transparent pl-11 pr-14 pt-4 pb-3",
           "text-[15px] leading-6 text-text-primary",
           "placeholder:text-text-ghost placeholder:font-light",
           "focus:outline-none",

@@ -92,6 +92,7 @@ impl Drop for CancellationGuard {
 
 /// Load the agent's working context: latest snapshot + messages after it.
 /// Falls back to all messages if no snapshot exists.
+/// Pinned messages that were compacted away are re-injected after the snapshot summary.
 #[instrument(skip(pool))]
 async fn load_agent_context(pool: &SqlitePool, session_id: &str) -> Result<Vec<Message>, String> {
     let mut rows = if let Some(snapshot) = crate::db::queries::get_latest_snapshot(pool, session_id)
@@ -101,6 +102,40 @@ async fn load_agent_context(pool: &SqlitePool, session_id: &str) -> Result<Vec<M
         // Deserialize snapshot summary messages
         let mut messages: Vec<Message> = serde_json::from_str(&snapshot.summary_messages)
             .map_err(|e| format!("failed to deserialize snapshot: {e}"))?;
+
+        // Load pinned messages from before the snapshot that were compacted away
+        let pinned = crate::db::queries::get_pinned_messages(pool, session_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        for row in &pinned {
+            if row.ordinal <= snapshot.up_to_ordinal {
+                let content: Vec<ContentBlock> = serde_json::from_str(&row.content)
+                    .map_err(|e| format!("failed to deserialize pinned message: {e}"))?;
+                let role = if row.role == "assistant" {
+                    Role::Assistant
+                } else {
+                    Role::User
+                };
+
+                // Prepend context snippet if available
+                let content = if let Some(ref snippet) = row.context_snippet {
+                    if !snippet.is_empty() {
+                        let mut enriched = vec![ContentBlock::Text {
+                            text: format!("[Pinned context: {snippet}]"),
+                        }];
+                        enriched.extend(content);
+                        enriched
+                    } else {
+                        content
+                    }
+                } else {
+                    content
+                };
+
+                messages.push(Message { role, content });
+            }
+        }
 
         // Load messages after the snapshot
         let tail = crate::db::queries::get_conversation_messages_since(
@@ -154,13 +189,23 @@ async fn append_message(
     session_id: &str,
     message: &Message,
 ) -> Result<i64, String> {
+    append_message_pinned(pool, session_id, message, false).await
+}
+
+/// Append a Message to the conversation log with a pin flag and return its ordinal.
+async fn append_message_pinned(
+    pool: &SqlitePool,
+    session_id: &str,
+    message: &Message,
+    pinned: bool,
+) -> Result<i64, String> {
     let role_str = match message.role {
         Role::User => "user",
         Role::Assistant => "assistant",
     };
     let content_json =
         serde_json::to_string(&message.content).map_err(|e| format!("serialize failed: {e}"))?;
-    crate::db::queries::append_conversation_message(pool, session_id, role_str, &content_json)
+    crate::db::queries::append_conversation_message(pool, session_id, role_str, &content_json, pinned)
         .await
         .map_err(|e| e.to_string())
 }
@@ -349,6 +394,8 @@ pub enum HistoryEntry {
     Message {
         role: String,
         content: Vec<ContentBlock>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        pinned: bool,
     },
     #[serde(rename = "interrupted")]
     Interrupted,
@@ -427,6 +474,7 @@ async fn build_conversation_history(
         entries.push(HistoryEntry::Message {
             role: row.role.clone(),
             content,
+            pinned: row.pinned,
         });
     }
 
@@ -535,12 +583,14 @@ pub async fn submit_prompt(
     session_id: String,
     prompt: String,
     mode_override: Option<String>,
+    pinned: Option<bool>,
     app: tauri::AppHandle,
     pool: State<'_, SqlitePool>,
     registry: State<'_, Arc<ModelRegistry>>,
     cancel_flags: State<'_, Arc<CancellationFlags>>,
 ) -> Result<(), String> {
-    info!(session_id, mode_override = ?mode_override, "submit_prompt called");
+    let is_pinned = pinned.unwrap_or(false);
+    info!(session_id, mode_override = ?mode_override, pinned = is_pinned, "submit_prompt called");
 
     // 0. Look up session to get project_path
     let session = crate::db::queries::get_session(&*pool, &session_id)
@@ -557,6 +607,7 @@ pub async fn submit_prompt(
     let event_data = serde_json::json!({
         "prompt": prompt,
         "mode": mode_override.as_deref().unwrap_or("auto"),
+        "pinned": is_pinned,
     })
     .to_string();
 
@@ -710,7 +761,7 @@ pub async fn submit_prompt(
             text: prompt.clone(),
         }],
     };
-    append_message(&*pool, &session.id, &user_msg).await?;
+    append_message_pinned(&*pool, &session.id, &user_msg, is_pinned).await?;
     history.push(user_msg);
 
     let cancelled = cancel_flags.create(&session.id).await?;
@@ -742,23 +793,29 @@ pub async fn submit_prompt(
     )
     .await;
 
+    // Build pinned data map from DB for compaction awareness
+    let pinned_data = build_pinned_data(&*pool, &session.id).await;
+
     // 7b. Fallback retry on model-unsupported errors
     let (full_text, accumulated_usage, model) = match stream_result {
         Ok((text, usage)) => {
             let pre_compact_len = working.len();
-            let compacted = maybe_compact_for_storage(
+            let compact_result = maybe_compact_for_storage(
                 working,
                 &handoff.system_prompt,
                 &session.project_path,
                 &config,
                 context_window,
+                &pinned_data,
             )
             .await;
+            // Write any pinned snippets back to DB
+            write_pinned_snippets(&*pool, &session.id, &compact_result.pinned_snippets).await;
             // If compacted, save a context snapshot instead of modifying messages
-            if compacted.len() < pre_compact_len {
+            if compact_result.messages.len() < pre_compact_len {
                 let compact_data = serde_json::json!({
                     "before_messages": pre_compact_len,
-                    "after_messages": compacted.len(),
+                    "after_messages": compact_result.messages.len(),
                 })
                 .to_string();
                 let _ = crate::db::queries::insert_event(
@@ -774,7 +831,7 @@ pub async fn submit_prompt(
                 if let Ok(Some(max_ord)) =
                     crate::db::queries::get_max_ordinal(&*pool, &session.id).await
                 {
-                    let summary_json = serde_json::to_string(&compacted).unwrap_or_default();
+                    let summary_json = serde_json::to_string(&compact_result.messages).unwrap_or_default();
                     let _ = crate::db::queries::save_context_snapshot(
                         &*pool,
                         &session.id,
@@ -831,18 +888,20 @@ pub async fn submit_prompt(
             .await?;
 
             let pre_compact_len = fallback_working.len();
-            let compacted = maybe_compact_for_storage(
+            let compact_result = maybe_compact_for_storage(
                 fallback_working,
                 &handoff.system_prompt,
                 &session.project_path,
                 &config,
                 fallback_context_window,
+                &pinned_data,
             )
             .await;
-            if compacted.len() < pre_compact_len {
+            write_pinned_snippets(&*pool, &session.id, &compact_result.pinned_snippets).await;
+            if compact_result.messages.len() < pre_compact_len {
                 let compact_data = serde_json::json!({
                     "before_messages": pre_compact_len,
-                    "after_messages": compacted.len(),
+                    "after_messages": compact_result.messages.len(),
                 })
                 .to_string();
                 let _ = crate::db::queries::insert_event(
@@ -857,7 +916,7 @@ pub async fn submit_prompt(
                 if let Ok(Some(max_ord)) =
                     crate::db::queries::get_max_ordinal(&*pool, &session.id).await
                 {
-                    let summary_json = serde_json::to_string(&compacted).unwrap_or_default();
+                    let summary_json = serde_json::to_string(&compact_result.messages).unwrap_or_default();
                     let _ = crate::db::queries::save_context_snapshot(
                         &*pool,
                         &session.id,
@@ -1321,15 +1380,19 @@ async fn run_agent_loop(
                     context_window,
                     "mid-loop compaction triggered"
                 );
+                let mid_pinned_data = build_pinned_data(pool, session_id).await;
                 let owned = std::mem::take(messages);
-                *messages = maybe_compact_for_storage(
+                let compact_result = maybe_compact_for_storage(
                     owned,
                     system_prompt,
                     project_path,
                     config,
                     context_window,
+                    &mid_pinned_data,
                 )
                 .await;
+                write_pinned_snippets(pool, session_id, &compact_result.pinned_snippets).await;
+                *messages = compact_result.messages;
             }
             // Continue loop for next turn
         } else {
@@ -1448,10 +1511,15 @@ impl compaction::LlmClient for CompactionClientAdapter {
 }
 
 /// Convert anthropic messages to the compaction module's simple message format.
-fn to_compaction_messages(messages: &[Message]) -> Vec<compaction::Message> {
+/// Accepts optional pinned data: maps message index -> (pinned, context_snippet).
+fn to_compaction_messages(
+    messages: &[Message],
+    pinned_data: &HashMap<usize, Option<String>>,
+) -> Vec<compaction::Message> {
     messages
         .iter()
-        .map(|msg| {
+        .enumerate()
+        .map(|(i, msg)| {
             let has_tool_results = msg
                 .content
                 .iter()
@@ -1490,7 +1558,18 @@ fn to_compaction_messages(messages: &[Message]) -> Vec<compaction::Message> {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            compaction::Message { role, content }
+            let (pinned, context_snippet) = if let Some(snippet) = pinned_data.get(&i) {
+                (true, snippet.clone())
+            } else {
+                (false, None)
+            };
+
+            compaction::Message {
+                role,
+                content,
+                pinned,
+                context_snippet,
+            }
         })
         .collect()
 }
@@ -1532,6 +1611,66 @@ const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 const RESERVED_SYSTEM: usize = 2_000;
 const RESERVED_RESPONSE: usize = 4_096;
 
+/// Build pinned data map from DB: maps message index to context_snippet state.
+/// This is a best-effort mapping — we match by ordinal position in the loaded messages.
+async fn build_pinned_data(pool: &SqlitePool, session_id: &str) -> HashMap<usize, Option<String>> {
+    let mut data = HashMap::new();
+    let all_msgs = match crate::db::queries::get_conversation_messages(pool, session_id).await {
+        Ok(rows) => rows,
+        Err(_) => return data,
+    };
+    for (i, row) in all_msgs.iter().enumerate() {
+        if row.pinned {
+            data.insert(i, row.context_snippet.clone());
+        }
+    }
+    data
+}
+
+/// Write pinned snippets returned from compaction back to the DB.
+async fn write_pinned_snippets(
+    pool: &SqlitePool,
+    session_id: &str,
+    snippets: &[compaction::PinnedSnippet],
+) {
+    if snippets.is_empty() {
+        return;
+    }
+    // Map position-based snippets to real ordinals by looking up unprocessed pinned messages
+    let unprocessed = match crate::db::queries::get_unprocessed_pinned(pool, session_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load unprocessed pinned messages for snippet write");
+            return;
+        }
+    };
+    for snippet in snippets {
+        let ordinal = if (snippet.ordinal as usize) < unprocessed.len() {
+            unprocessed[snippet.ordinal as usize].ordinal
+        } else {
+            tracing::warn!(
+                position = snippet.ordinal,
+                max = unprocessed.len(),
+                "snippet position out of range, skipping"
+            );
+            continue;
+        };
+        let _ = crate::db::queries::update_context_snippet(
+            pool,
+            session_id,
+            ordinal,
+            &snippet.snippet,
+        )
+        .await;
+    }
+}
+
+/// Compaction result returned to the caller so pinned snippets can be persisted.
+struct CompactionResult {
+    messages: Vec<Message>,
+    pinned_snippets: Vec<compaction::PinnedSnippet>,
+}
+
 /// Run the compaction pipeline on messages before storing them.
 /// Only triggers deep compaction when token count exceeds the budget trigger.
 /// Falls back to returning originals if compaction fails.
@@ -1542,9 +1681,10 @@ async fn maybe_compact_for_storage(
     project_path: &str,
     config: &KernelConfig,
     context_window: usize,
-) -> Vec<Message> {
+    pinned_data: &HashMap<usize, Option<String>>,
+) -> CompactionResult {
     // Estimate current token count
-    let compact_msgs = to_compaction_messages(&messages);
+    let compact_msgs = to_compaction_messages(&messages, pinned_data);
     let token_estimate = compaction::estimate_message_tokens(&compact_msgs)
         + compaction::estimate_tokens(system_prompt);
 
@@ -1552,7 +1692,10 @@ async fn maybe_compact_for_storage(
     let trigger = (context_window as f32 * config.compaction.deep_trigger_pct / 100.0) as usize;
 
     if token_estimate < trigger {
-        return messages;
+        return CompactionResult {
+            messages,
+            pinned_snippets: Vec::new(),
+        };
     }
 
     tracing::info!(
@@ -1564,7 +1707,12 @@ async fn maybe_compact_for_storage(
 
     let client = match resolve_client(project_path) {
         Ok(c) => c,
-        Err(_) => return messages,
+        Err(_) => {
+            return CompactionResult {
+                messages,
+                pinned_snippets: Vec::new(),
+            }
+        }
     };
 
     let adapter = CompactionClientAdapter {
@@ -1584,7 +1732,10 @@ async fn maybe_compact_for_storage(
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "failed to create compaction pipeline");
-            return messages;
+            return CompactionResult {
+                messages,
+                pinned_snippets: Vec::new(),
+            };
         }
     };
 
@@ -1595,17 +1746,27 @@ async fn maybe_compact_for_storage(
                 before = messages.len(),
                 after = result.len(),
                 tokens = ctx.token_count,
+                pinned_snippets = ctx.pinned_snippets.len(),
                 "deep compaction complete"
             );
             if result.is_empty() {
-                messages
+                CompactionResult {
+                    messages,
+                    pinned_snippets: ctx.pinned_snippets,
+                }
             } else {
-                result
+                CompactionResult {
+                    messages: result,
+                    pinned_snippets: ctx.pinned_snippets,
+                }
             }
         }
         Err(e) => {
             tracing::error!(error = %e, "deep compaction failed");
-            messages
+            CompactionResult {
+                messages,
+                pinned_snippets: Vec::new(),
+            }
         }
     }
 }

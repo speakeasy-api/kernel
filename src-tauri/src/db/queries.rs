@@ -625,18 +625,20 @@ pub async fn append_conversation_message(
     session_id: &str,
     role: &str,
     content_json: &str,
+    pinned: bool,
 ) -> Result<i64, sqlx::Error> {
-    debug!(session_id, role, "appending conversation message");
+    debug!(session_id, role, pinned, "appending conversation message");
     let id = Uuid::new_v4().to_string();
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO conversation_messages (id, session_id, ordinal, role, content)
-         VALUES (?1, ?2, COALESCE((SELECT MAX(ordinal) + 1 FROM conversation_messages WHERE session_id = ?2), 0), ?3, ?4)
+        "INSERT INTO conversation_messages (id, session_id, ordinal, role, content, pinned)
+         VALUES (?1, ?2, COALESCE((SELECT MAX(ordinal) + 1 FROM conversation_messages WHERE session_id = ?2), 0), ?3, ?4, ?5)
          RETURNING ordinal",
     )
     .bind(&id)
     .bind(session_id)
     .bind(role)
     .bind(content_json)
+    .bind(pinned)
     .fetch_one(pool)
     .await?;
     Ok(row.0)
@@ -650,7 +652,7 @@ pub async fn get_conversation_messages(
 ) -> Result<Vec<ConversationRow>, sqlx::Error> {
     debug!(session_id, "getting conversation messages");
     sqlx::query_as::<_, ConversationRow>(
-        "SELECT ordinal, role, content FROM conversation_messages
+        "SELECT ordinal, role, content, pinned, context_snippet FROM conversation_messages
          WHERE session_id = ?1 ORDER BY ordinal ASC",
     )
     .bind(session_id)
@@ -670,7 +672,7 @@ pub async fn get_conversation_messages_since(
         after_ordinal, "getting conversation messages since ordinal"
     );
     sqlx::query_as::<_, ConversationRow>(
-        "SELECT ordinal, role, content FROM conversation_messages
+        "SELECT ordinal, role, content, pinned, context_snippet FROM conversation_messages
          WHERE session_id = ?1 AND ordinal > ?2 ORDER BY ordinal ASC",
     )
     .bind(session_id)
@@ -731,6 +733,61 @@ pub async fn get_max_ordinal(
             .fetch_optional(pool)
             .await?;
     Ok(row.and_then(|r| r.0))
+}
+
+// ---- Pinned Messages ----
+
+/// Load all pinned messages for a session.
+#[instrument(skip(pool))]
+pub async fn get_pinned_messages(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Vec<ConversationRow>, sqlx::Error> {
+    debug!(session_id, "getting pinned messages");
+    sqlx::query_as::<_, ConversationRow>(
+        "SELECT ordinal, role, content, pinned, context_snippet FROM conversation_messages
+         WHERE session_id = ?1 AND pinned = 1 ORDER BY ordinal ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Load pinned messages that haven't had their context snippet generated yet.
+#[instrument(skip(pool))]
+pub async fn get_unprocessed_pinned(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Vec<ConversationRow>, sqlx::Error> {
+    debug!(session_id, "getting unprocessed pinned messages");
+    sqlx::query_as::<_, ConversationRow>(
+        "SELECT ordinal, role, content, pinned, context_snippet FROM conversation_messages
+         WHERE session_id = ?1 AND pinned = 1 AND context_snippet IS NULL ORDER BY ordinal ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Update the context snippet for a pinned message.
+#[instrument(skip(pool, snippet))]
+pub async fn update_context_snippet(
+    pool: &SqlitePool,
+    session_id: &str,
+    ordinal: i64,
+    snippet: &str,
+) -> Result<(), sqlx::Error> {
+    debug!(session_id, ordinal, "updating context snippet");
+    sqlx::query(
+        "UPDATE conversation_messages SET context_snippet = ?1
+         WHERE session_id = ?2 AND ordinal = ?3",
+    )
+    .bind(snippet)
+    .bind(session_id)
+    .bind(ordinal)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 // ---- Session Plans ----
@@ -1236,6 +1293,112 @@ mod tests {
         let state = get_ux_state(&pool, "global").await.unwrap().unwrap();
         assert_eq!(state.0.as_deref(), Some("evt-5"));
         assert_eq!(state.1.as_deref(), Some("2026-01-02T00:00:00"));
+    }
+
+    // ---- Pinned Messages tests ----
+
+    #[tokio::test]
+    async fn test_pinned_message_roundtrip() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test-project").await.unwrap();
+
+        // Insert a normal message
+        let _ord1 = append_conversation_message(
+            &pool,
+            &session.id,
+            "user",
+            r#"[{"type":"text","text":"hello"}]"#,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Insert a pinned message
+        let ord2 = append_conversation_message(
+            &pool,
+            &session.id,
+            "user",
+            r#"[{"type":"text","text":"remember this"}]"#,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // get_conversation_messages should return both with correct pinned flag
+        let all = get_conversation_messages(&pool, &session.id).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(!all[0].pinned);
+        assert!(all[1].pinned);
+        assert_eq!(all[1].ordinal, ord2);
+
+        // get_pinned_messages should return only the pinned one
+        let pinned = get_pinned_messages(&pool, &session.id).await.unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned[0].pinned);
+        assert_eq!(pinned[0].ordinal, ord2);
+    }
+
+    #[tokio::test]
+    async fn test_unprocessed_pinned_and_snippet_update() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test-project").await.unwrap();
+
+        let ord = append_conversation_message(
+            &pool,
+            &session.id,
+            "user",
+            r#"[{"type":"text","text":"pin me"}]"#,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Initially unprocessed (context_snippet is NULL)
+        let unprocessed = get_unprocessed_pinned(&pool, &session.id).await.unwrap();
+        assert_eq!(unprocessed.len(), 1);
+        assert!(unprocessed[0].context_snippet.is_none());
+
+        // Update context snippet
+        update_context_snippet(&pool, &session.id, ord, "the user was referring to the bun runtime")
+            .await
+            .unwrap();
+
+        // Now should not appear in unprocessed
+        let unprocessed = get_unprocessed_pinned(&pool, &session.id).await.unwrap();
+        assert_eq!(unprocessed.len(), 0);
+
+        // Should appear with snippet in get_pinned_messages
+        let pinned = get_pinned_messages(&pool, &session.id).await.unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(
+            pinned[0].context_snippet.as_deref(),
+            Some("the user was referring to the bun runtime")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_snippet_marks_as_processed() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test-project").await.unwrap();
+
+        let ord = append_conversation_message(
+            &pool,
+            &session.id,
+            "user",
+            r#"[{"type":"text","text":"always use bun"}]"#,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Update with empty snippet (self-contained, no context needed)
+        update_context_snippet(&pool, &session.id, ord, "").await.unwrap();
+
+        let unprocessed = get_unprocessed_pinned(&pool, &session.id).await.unwrap();
+        assert_eq!(unprocessed.len(), 0);
+
+        let pinned = get_pinned_messages(&pool, &session.id).await.unwrap();
+        assert_eq!(pinned[0].context_snippet.as_deref(), Some(""));
     }
 
     // ---- Session Plans tests ----

@@ -11,6 +11,8 @@ fn make_message(role: &str, content: &str) -> Message {
     Message {
         role: role.to_string(),
         content: content.to_string(),
+        pinned: false,
+        context_snippet: None,
     }
 }
 
@@ -819,4 +821,71 @@ async fn test_extract_learnings_dedup() {
     assert!(result
         .learnings
         .contains(&"LEARNING: keep retries bounded".to_string()));
+}
+
+// pinned message tests
+
+fn make_pinned_message(role: &str, content: &str) -> Message {
+    Message {
+        role: role.to_string(),
+        content: content.to_string(),
+        pinned: true,
+        context_snippet: None,
+    }
+}
+
+#[tokio::test]
+async fn test_pipeline_pinned_messages_bypass_compaction() {
+    let response = r#"{"messages":[{"role":"assistant","content":"compacted summary"}],"learnings":[],"preserved_facts":[]}"#;
+    let client = MockLlmClient::new(response);
+    let budget = ContextBudget::new(40, 0, 0, 0.6, 0.4).expect("valid budget");
+    let pipeline =
+        CompactionPipeline::new(budget, PreservationRules::default_rules(), client, true);
+
+    let messages = vec![
+        make_message("user", &"x".repeat(200)),
+        make_message("assistant", "long response here"),
+        make_pinned_message("user", "always use bun for this project"),
+    ];
+
+    let result = pipeline
+        .compact("system", &messages)
+        .await
+        .expect("pipeline ok");
+
+    // Pinned message should appear verbatim in the output
+    let pinned_found = result.messages.iter().any(|m| {
+        m.pinned && m.content == "always use bun for this project"
+    });
+    assert!(pinned_found, "pinned message should survive compaction verbatim");
+
+    // Compacted summary should also be present
+    let summary_found = result.messages.iter().any(|m| {
+        m.content == "compacted summary"
+    });
+    assert!(summary_found, "compacted summary should be present");
+}
+
+#[tokio::test]
+async fn test_pipeline_pinned_messages_preserved_when_no_deep_compaction() {
+    let client = MockLlmClient::new(r#"{"messages":[],"learnings":[],"preserved_facts":[]}"#);
+    let budget = ContextBudget::new(100_000, 5_000, 5_000, 0.95, 0.5).expect("valid budget");
+    let pipeline =
+        CompactionPipeline::new(budget, PreservationRules::default_rules(), client, false);
+
+    let messages = vec![
+        make_message("user", "hello"),
+        make_pinned_message("user", "remember: always test"),
+        make_message("assistant", "ok"),
+    ];
+
+    let result = pipeline
+        .compact("system", &messages)
+        .await
+        .expect("pipeline ok");
+
+    assert_eq!(result.messages.len(), 3);
+    let pinned = result.messages.iter().find(|m| m.pinned);
+    assert!(pinned.is_some());
+    assert_eq!(pinned.unwrap().content, "remember: always test");
 }

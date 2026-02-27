@@ -78,6 +78,7 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     }),
   );
   const [prompt, setPrompt] = useState("");
+  const [pinned, setPinned] = useState(false);
   const { items, phase, resolvedMode, error, contextUsage, sessionCost, submit, cancel } = useLlmStream(session.id);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -251,8 +252,10 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     // Switch to full view when submitting so user sees live streaming
     if (historyView === "agent") setHistoryView("full");
     const modeOverride = selectedMode.name === "auto" ? null : selectedMode.name;
+    const isPinned = pinned;
     setPrompt("");
-    await submit(trimmed, modeOverride);
+    setPinned(false);
+    await submit(trimmed, modeOverride, isPinned);
   }
 
   const hasMessages = displayItems.length > 0;
@@ -305,8 +308,22 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
                         className={cn(
                           "rounded-xl px-4 py-3 text-[14px] leading-relaxed max-w-[85%]",
                           "bg-surface-1 text-text-primary ml-4",
+                          item.pinned && "ring-1 ring-amber-400/40",
                         )}
                       >
+                        {item.pinned && (
+                          <div className="flex items-center gap-1 mb-1">
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" className="text-amber-400">
+                              <path
+                                d="M9.828 1.172a1 1 0 0 1 1.414 0l3.586 3.586a1 1 0 0 1 0 1.414l-2.293 2.293-.707.707-1.414-1.414-2.828 2.828L7 14l-1-1-3.586-3.586L1.5 8.5l3.414.414 2.828-2.828-1.414-1.414.707-.707z"
+                                stroke="currentColor"
+                                strokeWidth="1.2"
+                                fill="currentColor"
+                              />
+                            </svg>
+                            <span className="text-[10px] text-amber-400/70 font-medium tracking-wide">pinned</span>
+                          </div>
+                        )}
                         <MarkdownMessage content={item.content} role="user" />
                       </div>
                     </div>
@@ -410,6 +427,8 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
           onSubmit={handleSubmit}
           busy={busy}
           onCancel={cancel}
+          pinned={pinned}
+          onPinToggle={() => setPinned((p) => !p)}
         />
 
         {/* Controls row */}
