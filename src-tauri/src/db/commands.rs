@@ -109,3 +109,18 @@ pub async fn events_since(
             e.to_string()
         })
 }
+
+#[tauri::command]
+#[instrument(skip(pool))]
+pub async fn get_attached_plan(
+    pool: State<'_, SqlitePool>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    debug!(session_id, "cmd: get_attached_plan");
+    queries::get_attached_plan(&pool, &session_id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "get_attached_plan failed");
+            e.to_string()
+        })
+}

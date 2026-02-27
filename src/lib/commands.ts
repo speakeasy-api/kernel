@@ -112,6 +112,12 @@ export function getSessionCost(sessionId: string): Promise<number> {
   return invoke<number>("get_session_cost", { sessionId });
 }
 
+// -- Attached Plan --
+
+export function getAttachedPlan(sessionId: string): Promise<string | null> {
+  return invoke<string | null>("get_attached_plan", { sessionId });
+}
+
 // -- File Revert --
 
 export type RevertResult =

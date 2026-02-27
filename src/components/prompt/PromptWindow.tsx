@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import type { Session, Mode, KernelConfig } from "../../lib/types";
 import { getModeTint } from "../../lib/modeTint";
-import { getConversationContext, type ContextMessage } from "../../lib/commands";
+import { getConversationContext, getAttachedPlan, type ContextMessage } from "../../lib/commands";
 import { SessionBar } from "./SessionBar";
 import { ModeSelector } from "./ModeSelector";
 import { ModelBadge } from "./ModelBadge";
@@ -91,6 +91,8 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
   const [agentContext, setAgentContext] = useState<ChatItem[] | null>(null);
   const [agentContextLoading, setAgentContextLoading] = useState(false);
 
+  const [attachedPlan, setAttachedPlan] = useState<string | null>(null);
+
   const busy = phase !== "idle";
 
   // Global Escape key listener (works even when textarea isn't focused)
@@ -105,6 +107,17 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [busy, cancel]);
+
+  // Fetch attached plan on mount and when agent turn completes
+  useEffect(() => {
+    getAttachedPlan(session.id).then(setAttachedPlan).catch(() => {});
+  }, [session.id]);
+
+  useEffect(() => {
+    if (phase === "idle") {
+      getAttachedPlan(session.id).then(setAttachedPlan).catch(() => {});
+    }
+  }, [phase, session.id]);
 
   // When the router resolves a mode, update the selector
   useEffect(() => {
@@ -394,6 +407,12 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
               selected={selectedMode}
               onSelect={setSelectedMode}
             />
+            {attachedPlan && (
+              <>
+                <span className="text-text-ghost mx-1">&middot;</span>
+                <PlanBadge filename={attachedPlan} />
+              </>
+            )}
             <span className="text-text-ghost mx-1">&middot;</span>
             <ModelBadge model={resolveModel(selectedMode, config)} />
           </div>
@@ -464,6 +483,14 @@ function ViewToggle({ view, onChange }: ViewToggleProps) {
         </button>
       ))}
     </div>
+  );
+}
+
+function PlanBadge({ filename }: { filename: string }) {
+  return (
+    <span className="text-[11px] font-mono text-text-ghost tracking-tight truncate max-w-[180px]">
+      {filename}
+    </span>
   );
 }
 

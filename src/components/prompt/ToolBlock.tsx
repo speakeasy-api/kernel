@@ -64,6 +64,12 @@ function summarizeArgs(name: string, input: Record<string, unknown>): string {
       return String(input.command ?? "");
     case "git":
       return String(input.args ?? "");
+    case "plan_create":
+      return String(input.title ?? "");
+    case "plan_search":
+      return String(input.query ?? "");
+    case "read_plan":
+      return "";
     default:
       return JSON.stringify(input).slice(0, 60);
   }
