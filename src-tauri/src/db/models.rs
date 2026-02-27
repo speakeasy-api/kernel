@@ -171,6 +171,8 @@ pub struct ConversationRow {
     pub ordinal: i64,
     pub role: String,
     pub content: String,
+    pub pinned: bool,
+    pub context_snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

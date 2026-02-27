@@ -116,6 +116,10 @@ impl ContextBudget {
 pub struct Message {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_snippet: Option<String>,
 }
 
 /// Estimates token count for a string using a simple heuristic.

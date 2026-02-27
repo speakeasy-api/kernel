@@ -89,6 +89,8 @@ impl StructuralFilter {
                 Message {
                     role: msg.role.clone(),
                     content,
+                    pinned: msg.pinned,
+                    context_snippet: msg.context_snippet.clone(),
                 }
             })
             .collect()

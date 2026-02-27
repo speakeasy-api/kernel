@@ -17,6 +17,14 @@ pub struct CompactedContext {
     pub learnings: Vec<String>,
     pub preserved_facts: Vec<String>,
     pub token_count: usize,
+    #[serde(default)]
+    pub pinned_snippets: Vec<PinnedSnippet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinnedSnippet {
+    pub ordinal: i64,
+    pub snippet: String,
 }
 
 pub struct CompactionPipeline<C: LlmClient> {
@@ -92,10 +100,33 @@ impl<C: LlmClient> CompactionPipeline<C> {
             );
         }
 
-        // Step 2: Deep-compaction budget check.
+        // Step 1b: Partition pinned vs unpinned messages.
+        let (pinned, unpinned): (Vec<Message>, Vec<Message>) =
+            working_messages.into_iter().partition(|m| m.pinned);
+
+        // Separate newly pinned (context_snippet is None) from already-processed
+        let newly_pinned: Vec<(usize, &Message)> = pinned
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.context_snippet.is_none())
+            .map(|(i, m)| (i, m))
+            .collect();
+
+        debug!(
+            pinned_count = pinned.len(),
+            newly_pinned_count = newly_pinned.len(),
+            unpinned_count = unpinned.len(),
+            "partitioned pinned/unpinned messages"
+        );
+
+        working_messages = unpinned;
+
+        // Step 2: Deep-compaction budget check (only on unpinned).
         let current_tokens =
             estimate_message_tokens(&working_messages) + estimate_tokens(system_prompt);
         debug!(current_tokens, "checking deep compaction budget");
+
+        let mut pinned_snippets = Vec::new();
 
         if self.budget.needs_deep_compaction(current_tokens) {
             // Step 3: Extract preservation facts before deep compaction.
@@ -108,7 +139,7 @@ impl<C: LlmClient> CompactionPipeline<C> {
             debug!("running semantic deep compaction");
             match self
                 .semantic_compactor
-                .compact(&working_messages, &self.preservation_rules)
+                .compact_with_pinned(&working_messages, &self.preservation_rules, &newly_pinned)
                 .await
             {
                 Ok(compacted) => {
@@ -117,6 +148,7 @@ impl<C: LlmClient> CompactionPipeline<C> {
                         "deep compaction succeeded"
                     );
                     working_messages = compacted.messages;
+                    pinned_snippets = compacted.pinned_snippets;
                 }
                 Err(e) => {
                     warn!(error = %e, "deep compaction failed, using light compaction only");
@@ -126,7 +158,10 @@ impl<C: LlmClient> CompactionPipeline<C> {
             debug!(current_tokens, "below deep compaction trigger, skipping");
         }
 
-        // Step 5: Build output from final state.
+        // Step 5: Append pinned messages back after compacted summary.
+        working_messages.extend(pinned);
+
+        // Step 6: Build output from final state.
         debug!("building compaction output");
         let preserved_facts = self
             .preservation_rules
@@ -150,6 +185,7 @@ impl<C: LlmClient> CompactionPipeline<C> {
             learnings,
             preserved_facts,
             token_count,
+            pinned_snippets,
         })
     }
 

@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use serde::Deserialize;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::budget::{estimate_message_tokens, ContextBudget, Message};
+use super::pipeline::PinnedSnippet;
 use super::preservation::PreservationRules;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +36,14 @@ struct CompactorResponse {
     messages: Vec<CompactorMessage>,
     learnings: Vec<String>,
     preserved_facts: Vec<String>,
+    #[serde(default)]
+    pinned_snippets: Option<Vec<RawPinnedSnippet>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPinnedSnippet {
+    position: usize,
+    snippet: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,8 +65,21 @@ impl<C: LlmClient> SemanticCompactor<C> {
         messages: &[Message],
         preservation_rules: &PreservationRules,
     ) -> Result<CompactedContext, CompactionError> {
+        self.compact_with_pinned(messages, preservation_rules, &[]).await
+    }
+
+    /// Run deep compaction with awareness of pinned messages.
+    /// Newly pinned messages are passed as reference context for snippet generation.
+    #[instrument(skip_all, fields(message_count = messages.len(), newly_pinned_count = newly_pinned.len()))]
+    pub async fn compact_with_pinned(
+        &self,
+        messages: &[Message],
+        preservation_rules: &PreservationRules,
+        newly_pinned: &[(usize, &Message)],
+    ) -> Result<CompactedContext, CompactionError> {
         info!(
             message_count = messages.len(),
+            newly_pinned = newly_pinned.len(),
             "starting semantic compaction"
         );
         let preserved_facts = preservation_rules.extract_preserved_facts(messages);
@@ -69,7 +91,7 @@ impl<C: LlmClient> SemanticCompactor<C> {
         );
 
         let (system_prompt, user_prompt) =
-            build_compaction_prompt(messages, target_tokens, &preserved_facts);
+            build_compaction_prompt(messages, target_tokens, &preserved_facts, newly_pinned);
 
         debug!("sending compaction prompt to LLM");
         let response = self.client.complete(&system_prompt, &user_prompt).await?;
@@ -82,6 +104,8 @@ impl<C: LlmClient> SemanticCompactor<C> {
             .map(|m| Message {
                 role: m.role,
                 content: m.content,
+                pinned: false,
+                context_snippet: None,
             })
             .collect();
 
@@ -99,11 +123,15 @@ impl<C: LlmClient> SemanticCompactor<C> {
             });
         }
 
+        // Extract pinned snippets, failing open on parse issues
+        let pinned_snippets = extract_pinned_snippets(&parsed.pinned_snippets, newly_pinned);
+
         info!(
             before_messages = messages.len(),
             after_messages = compacted_messages.len(),
             token_count,
             learnings = parsed.learnings.len(),
+            pinned_snippets = pinned_snippets.len(),
             "semantic compaction complete"
         );
 
@@ -112,8 +140,42 @@ impl<C: LlmClient> SemanticCompactor<C> {
             learnings: parsed.learnings,
             preserved_facts: parsed.preserved_facts,
             token_count,
+            pinned_snippets,
         })
     }
+}
+
+/// Map raw pinned snippets from the compactor response to PinnedSnippet with ordinals.
+/// Falls open on any issues — returns empty snippets rather than blocking compaction.
+fn extract_pinned_snippets(
+    raw: &Option<Vec<RawPinnedSnippet>>,
+    newly_pinned: &[(usize, &Message)],
+) -> Vec<PinnedSnippet> {
+    let raw = match raw {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
+    // We don't have ordinals in the compaction Message, so we return position-based
+    // snippets. The caller (commands.rs) maps these back to DB ordinals.
+    raw.iter()
+        .filter_map(|r| {
+            if r.position < newly_pinned.len() {
+                Some(PinnedSnippet {
+                    // Use position as a placeholder — the caller maps this to the real ordinal
+                    ordinal: r.position as i64,
+                    snippet: r.snippet.clone(),
+                })
+            } else {
+                warn!(
+                    position = r.position,
+                    max = newly_pinned.len(),
+                    "pinned snippet position out of range"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -122,13 +184,21 @@ pub struct CompactedContext {
     pub learnings: Vec<String>,
     pub preserved_facts: Vec<String>,
     pub token_count: usize,
+    pub pinned_snippets: Vec<PinnedSnippet>,
 }
 
 fn build_compaction_prompt(
     messages: &[Message],
     target_tokens: usize,
     preserved_items: &[String],
+    newly_pinned: &[(usize, &Message)],
 ) -> (String, String) {
+    let pinned_snippet_rule = if !newly_pinned.is_empty() {
+        "\n- \"pinned_snippets\": (optional) an array of objects with \"position\" (integer) and \"snippet\" (string) for each newly pinned message that needs surrounding context to be self-contained. Use empty string if the message is already self-contained.\n"
+    } else {
+        ""
+    };
+
     let system_prompt = format!(
         "You are a context compactor. Your job is to compress a conversation while preserving all critical information.\n\
         \n\
@@ -141,11 +211,11 @@ fn build_compaction_prompt(
         - Target approximately {target_tokens} tokens in your output\n\
         \n\
         Output format:\n\
-        Emit a JSON object with three fields:\n\
+        Emit a JSON object with these fields:\n\
         - \"messages\": an array of objects with \"role\" and \"content\" fields\n\
         - \"learnings\": an array of strings extracted from failed attempts\n\
-        - \"preserved_facts\": an array of strings (file paths, signatures, etc.)\n\
-        \n\
+        - \"preserved_facts\": an array of strings (file paths, signatures, etc.)\
+        {pinned_snippet_rule}\n\
         Output ONLY the JSON object, no markdown fences or other text."
     );
 
@@ -160,6 +230,23 @@ fn build_compaction_prompt(
         user_prompt.push_str("## Items that MUST be preserved\n\n");
         for item in preserved_items {
             user_prompt.push_str(&format!("- {item}\n"));
+        }
+        user_prompt.push('\n');
+    }
+
+    if !newly_pinned.is_empty() {
+        user_prompt.push_str("## Pinned messages (DO NOT include in compacted output — preserved separately)\n\n");
+        user_prompt.push_str(
+            "These messages are pinned by the user and will be kept verbatim. However, some may\n\
+             reference surrounding context (e.g., \"stop doing that\", \"remember this ^\") that will\n\
+             be lost after compaction. For each pinned message below, determine if it needs a\n\
+             context snippet to be self-contained. Output a \"pinned_snippets\" key in your response.\n\n",
+        );
+        for (i, (_, msg)) in newly_pinned.iter().enumerate() {
+            user_prompt.push_str(&format!(
+                "[{} @ position {}]: \"{}\"\n",
+                msg.role, i, msg.content
+            ));
         }
         user_prompt.push('\n');
     }
