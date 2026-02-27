@@ -144,6 +144,7 @@ mod tests {
             "modes",
             "recommendation_versions",
             "recommendations",
+            "session_plans",
             "sessions",
             "stats_rollups",
             "task_deps",

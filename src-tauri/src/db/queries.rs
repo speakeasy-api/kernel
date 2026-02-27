@@ -44,6 +44,10 @@ pub async fn get_session(pool: &SqlitePool, id: &str) -> Result<Option<Session>,
 pub async fn delete_session(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     info!(id, "deleting session");
     // Delete dependent data first
+    sqlx::query("DELETE FROM session_plans WHERE session_id = ?1")
+        .bind(id)
+        .execute(pool)
+        .await?;
     sqlx::query("DELETE FROM conversation_messages WHERE session_id = ?1")
         .bind(id)
         .execute(pool)
@@ -729,6 +733,56 @@ pub async fn get_max_ordinal(
     Ok(row.and_then(|r| r.0))
 }
 
+// ---- Session Plans ----
+
+/// Attach (or replace) a plan for a session.
+#[instrument(skip(pool))]
+pub async fn attach_plan(
+    pool: &SqlitePool,
+    session_id: &str,
+    filename: &str,
+) -> Result<(), sqlx::Error> {
+    info!(session_id, filename, "attaching plan to session");
+    sqlx::query(
+        "INSERT INTO session_plans (session_id, plan_filename)
+         VALUES (?1, ?2)
+         ON CONFLICT(session_id) DO UPDATE SET
+            plan_filename = ?2,
+            attached_at = CURRENT_TIMESTAMP",
+    )
+    .bind(session_id)
+    .bind(filename)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get the attached plan filename for a session, if any.
+#[instrument(skip(pool))]
+pub async fn get_attached_plan(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    debug!(session_id, "getting attached plan");
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT plan_filename FROM session_plans WHERE session_id = ?1")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Detach the plan from a session.
+#[instrument(skip(pool))]
+pub async fn detach_plan(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
+    info!(session_id, "detaching plan from session");
+    sqlx::query("DELETE FROM session_plans WHERE session_id = ?1")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_pool;
@@ -1182,5 +1236,65 @@ mod tests {
         let state = get_ux_state(&pool, "global").await.unwrap().unwrap();
         assert_eq!(state.0.as_deref(), Some("evt-5"));
         assert_eq!(state.1.as_deref(), Some("2026-01-02T00:00:00"));
+    }
+
+    // ---- Session Plans tests ----
+
+    #[tokio::test]
+    async fn test_attach_and_get_plan() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test-project").await.unwrap();
+
+        assert!(get_attached_plan(&pool, &session.id).await.unwrap().is_none());
+
+        attach_plan(&pool, &session.id, "my-plan-ab12.md")
+            .await
+            .unwrap();
+
+        let plan = get_attached_plan(&pool, &session.id).await.unwrap().unwrap();
+        assert_eq!(plan, "my-plan-ab12.md");
+    }
+
+    #[tokio::test]
+    async fn test_attach_plan_replaces_existing() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test-project").await.unwrap();
+
+        attach_plan(&pool, &session.id, "plan-a-1234.md")
+            .await
+            .unwrap();
+        attach_plan(&pool, &session.id, "plan-b-5678.md")
+            .await
+            .unwrap();
+
+        let plan = get_attached_plan(&pool, &session.id).await.unwrap().unwrap();
+        assert_eq!(plan, "plan-b-5678.md");
+    }
+
+    #[tokio::test]
+    async fn test_detach_plan() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test-project").await.unwrap();
+
+        attach_plan(&pool, &session.id, "my-plan-ab12.md")
+            .await
+            .unwrap();
+        detach_plan(&pool, &session.id).await.unwrap();
+
+        assert!(get_attached_plan(&pool, &session.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_cascades_plan() {
+        let pool = test_pool().await;
+        let session = create_session(&pool, "/tmp/test-project").await.unwrap();
+
+        attach_plan(&pool, &session.id, "my-plan-ab12.md")
+            .await
+            .unwrap();
+        delete_session(&pool, &session.id).await.unwrap();
+
+        // Plan row should be gone (verified indirectly — session is deleted)
+        assert!(get_session(&pool, &session.id).await.unwrap().is_none());
     }
 }

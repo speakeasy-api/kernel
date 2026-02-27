@@ -27,7 +27,7 @@ use crate::prompt_router::dispatch::{
 use crate::prompt_router::model_registry::{ModelRegistry, FALLBACK_MODEL};
 use crate::prompt_router::types::*;
 use crate::prompt_router::user_override::ModeOverriddenEvent;
-use crate::tools::{execute_tool, tool_definitions};
+use crate::tools::{execute_tool, plans, tool_definitions};
 
 use std::collections::HashMap;
 
@@ -989,7 +989,6 @@ async fn run_agent_loop(
         tools = allowed_tools.len(),
         "starting agent loop"
     );
-    let tool_defs = tool_definitions(allowed_tools);
     let project = Path::new(project_path);
 
     let mut full_text = String::new();
@@ -1007,6 +1006,11 @@ async fn run_agent_loop(
             );
             return Ok((full_text, accumulated_usage));
         }
+
+        // Build effective tool list per-turn (dynamic read_plan injection)
+        let effective_tools =
+            build_effective_tools(pool, session_id, allowed_tools).await;
+        let tool_defs = tool_definitions(&effective_tools);
 
         let req = StreamRequest {
             system: system_prompt,
@@ -1176,7 +1180,23 @@ async fn run_agent_loop(
                 );
 
                 tracing::debug!(tool = %name, "executing tool");
-                let tool_output = execute_tool(name, input, project).await;
+                let tool_output = match name.as_str() {
+                    "read_plan" => exec_read_plan(pool, session_id, project).await,
+                    _ => execute_tool(name, input, project).await,
+                };
+
+                // Auto-attach plan after successful plan_create
+                if name == "plan_create" {
+                    if let Ok(ref output) = tool_output {
+                        if let Some(filename) = plans::extract_filename_from_result(output) {
+                            let _ = crate::db::queries::attach_plan(
+                                pool, session_id, &filename,
+                            )
+                            .await;
+                        }
+                    }
+                }
+
                 let (content, is_error, file_change) = match &tool_output {
                     Ok(output) => {
                         tracing::debug!(tool = %name, bytes = output.content.len(), "tool ok");
@@ -1342,6 +1362,49 @@ async fn run_agent_loop(
         },
     );
     Ok((full_text, accumulated_usage))
+}
+
+// ---- Dynamic tool injection ----
+
+/// Build the effective tool list for a turn, injecting `read_plan` when a plan is attached.
+async fn build_effective_tools(
+    pool: &SqlitePool,
+    session_id: &str,
+    allowed_tools: &[String],
+) -> Vec<String> {
+    let mut tools: Vec<String> = allowed_tools.to_vec();
+    if let Ok(Some(_)) = crate::db::queries::get_attached_plan(pool, session_id).await {
+        if !tools.iter().any(|t| t == "read_plan") {
+            tools.push("read_plan".into());
+        }
+    }
+    tools
+}
+
+/// Execute `read_plan`: reads the attached plan file, auto-detaches if deleted.
+async fn exec_read_plan(
+    pool: &SqlitePool,
+    session_id: &str,
+    project: &Path,
+) -> Result<crate::tools::ToolOutput, String> {
+    let filename = match crate::db::queries::get_attached_plan(pool, session_id).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return Err("No plan is attached to this session.".into()),
+        Err(e) => return Err(format!("DB error: {e}")),
+    };
+
+    let path = project.join(".kernel/plans").join(&filename);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => Ok(crate::tools::ToolOutput::text(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Auto-detach
+            let _ = crate::db::queries::detach_plan(pool, session_id).await;
+            Err(format!(
+                "Attached plan '{filename}' no longer exists. It may have been removed externally."
+            ))
+        }
+        Err(e) => Err(format!("Error reading plan '{filename}': {e}")),
+    }
 }
 
 // ---- Light compaction (between agent turns) ----
