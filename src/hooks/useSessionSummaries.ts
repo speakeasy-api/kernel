@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Session } from "../lib/types";
-import { listSessions, eventsSince } from "../lib/commands";
+import { listSessions, eventsSince, getAttachedPlan } from "../lib/commands";
 
 export interface SessionSummary {
   session: Session;
   /** First user prompt text, or null if none recorded yet. */
   title: string | null;
+  /** Whether this session has an attached plan. */
+  hasPlan: boolean;
 }
 
 export interface WorkspaceGroup {
@@ -22,16 +24,19 @@ async function fetchSummaries(sessions: Session[]): Promise<SessionSummary[]> {
   return Promise.all(
     sessions.map(async (session) => {
       try {
-        const events = await eventsSince(session.id, "2000-01-01T00:00:00");
+        const [events, plan] = await Promise.all([
+          eventsSince(session.id, "2000-01-01T00:00:00"),
+          getAttachedPlan(session.id).catch(() => null),
+        ]);
         const promptEvent = events.find((e) => e.kind === "PromptSubmitted");
         let title: string | null = null;
         if (promptEvent) {
           const parsed = JSON.parse(promptEvent.data) as { prompt?: string };
           title = parsed.prompt?.trim() ?? null;
         }
-        return { session, title };
+        return { session, title, hasPlan: plan != null };
       } catch {
-        return { session, title: null };
+        return { session, title: null, hasPlan: false };
       }
     }),
   );

@@ -1,6 +1,9 @@
 use tracing::debug;
 
-use super::types::{combine_tool_sets, Mode, ModeOrigin, FULL_TOOLS, READ_ONLY_TOOLS, WEB_TOOLS};
+use super::types::{
+    combine_tool_sets, Mode, ModeOrigin, FULL_TOOLS, PLAN_READ_TOOLS, PLAN_WRITE_TOOLS,
+    READ_ONLY_TOOLS, READ_WRITE_TOOLS, WEB_TOOLS,
+};
 
 pub fn builtin_modes() -> Vec<Mode> {
     let modes = vec![
@@ -27,10 +30,10 @@ Focus on structured decomposition: break complex problems into numbered steps wi
 
 Consider edge cases and failure modes proactively. Identify assumptions that could invalidate the plan. When estimating scope, flag which parts carry the most uncertainty.
 
-You must never modify files, run shell commands, or take any action that changes project state. Your only tools are reading files, searching with glob, and grepping for context. Use these freely to ground your analysis in the actual codebase rather than guessing at structure or conventions."
+You can read project files and search with glob/grep to ground your analysis in the actual codebase. Use plan_create to create a plan file, then use fs_write to iterate on its content. Only write to files inside .kernel/plans/ — do not modify project source files, run shell commands, or take any action that changes project state."
             .into(),
         default_model: None,
-        allowed_tools: READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect(),
+        allowed_tools: combine_tool_sets(&[READ_WRITE_TOOLS, PLAN_WRITE_TOOLS]),
         created_by: ModeOrigin::BuiltIn,
         version: 1,
     }
@@ -51,7 +54,7 @@ Use tools liberally: search for related code, read tests to understand expected 
 Keep commentary minimal. A one-line summary of what you did is fine; a paragraph explaining why each line exists is not. If the user wants deeper explanation, they will ask. Prioritize shipping correct, consistent code over teaching."
             .into(),
         default_model: None,
-        allowed_tools: FULL_TOOLS.iter().map(|s| s.to_string()).collect(),
+        allowed_tools: combine_tool_sets(&[FULL_TOOLS, PLAN_READ_TOOLS]),
         created_by: ModeOrigin::BuiltIn,
         version: 1,
     }
@@ -72,7 +75,7 @@ Prioritize your findings: distinguish blocking issues (bugs, security vulnerabil
 Be concise and actionable. Say what is wrong, why it matters, and what to do about it. Skip praise for code that is simply correct — focus your attention on what needs to change. If everything looks good, say so briefly rather than inventing nitpicks."
             .into(),
         default_model: None,
-        allowed_tools: READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect(),
+        allowed_tools: combine_tool_sets(&[READ_ONLY_TOOLS, PLAN_READ_TOOLS]),
         created_by: ModeOrigin::BuiltIn,
         version: 1,
     }
@@ -93,7 +96,7 @@ Reproduce the issue before attempting a fix when possible. Use git history to id
 When you find the fix, explain the root cause clearly: what was wrong, why it happened, and why the fix is correct. Verify that the fix resolves the issue and does not introduce regressions."
             .into(),
         default_model: None,
-        allowed_tools: FULL_TOOLS.iter().map(|s| s.to_string()).collect(),
+        allowed_tools: combine_tool_sets(&[FULL_TOOLS, PLAN_READ_TOOLS]),
         created_by: ModeOrigin::BuiltIn,
         version: 1,
     }
@@ -114,7 +117,7 @@ Distinguish between established best practices (widely adopted, battle-tested) a
 Read project files thoroughly to understand existing context before searching externally. You must never modify project files — your output is information and analysis, not code changes."
             .into(),
         default_model: None,
-        allowed_tools: combine_tool_sets(&[READ_ONLY_TOOLS, WEB_TOOLS]),
+        allowed_tools: combine_tool_sets(&[READ_ONLY_TOOLS, WEB_TOOLS, PLAN_READ_TOOLS]),
         created_by: ModeOrigin::BuiltIn,
         version: 1,
     }
@@ -133,7 +136,7 @@ Use tools as needed but explain what you are doing and why. Provide context and 
 Balance thoroughness with conciseness: give enough detail to be useful without overwhelming. If a task would benefit from a more specialized mode (deep debugging, focused implementation, thorough review), suggest switching, but handle straightforward requests directly."
             .into(),
         default_model: None,
-        allowed_tools: FULL_TOOLS.iter().map(|s| s.to_string()).collect(),
+        allowed_tools: combine_tool_sets(&[FULL_TOOLS, PLAN_READ_TOOLS]),
         created_by: ModeOrigin::BuiltIn,
         version: 1,
     }
@@ -186,7 +189,7 @@ mod tests {
     fn plan_mode_tools() {
         let mode = plan_mode();
         assert_eq!(mode.name, "plan");
-        let expected: Vec<String> = READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect();
+        let expected = combine_tool_sets(&[READ_WRITE_TOOLS, PLAN_WRITE_TOOLS]);
         assert_eq!(mode.allowed_tools, expected);
     }
 
@@ -194,7 +197,7 @@ mod tests {
     fn implement_mode_tools() {
         let mode = implement_mode();
         assert_eq!(mode.name, "implement");
-        let expected: Vec<String> = FULL_TOOLS.iter().map(|s| s.to_string()).collect();
+        let expected = combine_tool_sets(&[FULL_TOOLS, PLAN_READ_TOOLS]);
         assert_eq!(mode.allowed_tools, expected);
     }
 
@@ -202,7 +205,7 @@ mod tests {
     fn review_mode_tools() {
         let mode = review_mode();
         assert_eq!(mode.name, "review");
-        let expected: Vec<String> = READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect();
+        let expected = combine_tool_sets(&[READ_ONLY_TOOLS, PLAN_READ_TOOLS]);
         assert_eq!(mode.allowed_tools, expected);
     }
 
@@ -210,7 +213,7 @@ mod tests {
     fn debug_mode_tools() {
         let mode = debug_mode();
         assert_eq!(mode.name, "debug");
-        let expected: Vec<String> = FULL_TOOLS.iter().map(|s| s.to_string()).collect();
+        let expected = combine_tool_sets(&[FULL_TOOLS, PLAN_READ_TOOLS]);
         assert_eq!(mode.allowed_tools, expected);
     }
 
@@ -218,7 +221,7 @@ mod tests {
     fn research_mode_tools() {
         let mode = research_mode();
         assert_eq!(mode.name, "research");
-        let expected = combine_tool_sets(&[READ_ONLY_TOOLS, WEB_TOOLS]);
+        let expected = combine_tool_sets(&[READ_ONLY_TOOLS, WEB_TOOLS, PLAN_READ_TOOLS]);
         assert_eq!(mode.allowed_tools, expected);
     }
 
@@ -226,7 +229,7 @@ mod tests {
     fn general_mode_tools() {
         let mode = general_mode();
         assert_eq!(mode.name, "general");
-        let expected: Vec<String> = FULL_TOOLS.iter().map(|s| s.to_string()).collect();
+        let expected = combine_tool_sets(&[FULL_TOOLS, PLAN_READ_TOOLS]);
         assert_eq!(mode.allowed_tools, expected);
     }
 

@@ -1,3 +1,5 @@
+pub mod plans;
+
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
@@ -129,6 +131,53 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["command"]
             }),
         },
+        ToolDefinition {
+            name: "plan_create".into(),
+            description:
+                "Create a new plan file in .kernel/plans/. The plan is automatically attached to the current session. Use fs_read/fs_write to iterate on the plan content afterward."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Plan title (used to generate the filename slug)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Initial plan content (markdown). Defaults to '# {title}\\n' if omitted."
+                    }
+                },
+                "required": ["title"]
+            }),
+        },
+        ToolDefinition {
+            name: "plan_search".into(),
+            description:
+                "Search for plans in the workspace. Lists plans in .kernel/plans/, optionally filtering by a text query matched against filenames and content."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Text to search for in plan filenames and content (optional — omit to list all plans)"
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "read_plan".into(),
+            description:
+                "Read the plan attached to the current session. Returns the full content of the attached plan file."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
     ]
 }
 
@@ -220,6 +269,8 @@ pub async fn execute_tool(
         "glob" => exec_glob(input, project_path).await.map(ToolOutput::text),
         "grep" => exec_grep(input, project_path).await.map(ToolOutput::text),
         "shell" => exec_shell(input, project_path).await.map(ToolOutput::text),
+        "plan_create" => plans::exec_plan_create(input, project_path).await,
+        "plan_search" => plans::exec_plan_search(input, project_path).await,
         other => {
             error!(tool = other, "unknown tool");
             Err(format!("Unknown tool: {other}"))

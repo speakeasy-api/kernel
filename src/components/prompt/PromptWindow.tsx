@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import type { Session, Mode, KernelConfig } from "../../lib/types";
 import { getModeTint } from "../../lib/modeTint";
-import { getConversationContext, type ContextMessage } from "../../lib/commands";
+import { getConversationContext, getAttachedPlan, type ContextMessage } from "../../lib/commands";
 import { SessionBar } from "./SessionBar";
 import { ModeSelector } from "./ModeSelector";
 import { ModelBadge } from "./ModelBadge";
@@ -10,6 +10,7 @@ import { ContextRing } from "./ContextRing";
 import { ToolCallBlock, ToolResultBlock } from "./ToolBlock";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { DiffView } from "./DiffView";
+import { PlanViewer } from "./PlanViewer";
 import { useLlmStream, type ChatItem } from "../../hooks/useLlmStream";
 import { cn } from "../../lib/cn";
 
@@ -91,6 +92,9 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
   const [agentContext, setAgentContext] = useState<ChatItem[] | null>(null);
   const [agentContextLoading, setAgentContextLoading] = useState(false);
 
+  const [attachedPlan, setAttachedPlan] = useState<string | null>(null);
+  const [planViewerOpen, setPlanViewerOpen] = useState(false);
+
   const busy = phase !== "idle";
 
   // Global Escape key listener (works even when textarea isn't focused)
@@ -105,6 +109,17 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [busy, cancel]);
+
+  // Fetch attached plan on mount and when agent turn completes
+  useEffect(() => {
+    getAttachedPlan(session.id).then(setAttachedPlan).catch(() => {});
+  }, [session.id]);
+
+  useEffect(() => {
+    if (phase === "idle") {
+      getAttachedPlan(session.id).then(setAttachedPlan).catch(() => {});
+    }
+  }, [phase, session.id]);
 
   // When the router resolves a mode, update the selector
   useEffect(() => {
@@ -198,6 +213,15 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     const set = new Set<string>();
     for (const item of displayItems) {
       if (item.kind === "file_change") set.add(item.toolUseId);
+    }
+    return set;
+  }, [displayItems]);
+
+  // Pre-pass: build set of plan_create tool_use_ids to suppress their results
+  const planCreateIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const item of displayItems) {
+      if (item.kind === "tool_call" && item.name === "plan_create") set.add(item.id);
     }
     return set;
   }, [displayItems]);
@@ -305,13 +329,15 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
                       key={i}
                       name={item.name}
                       input={item.input}
+                      onPlanClick={() => setPlanViewerOpen(true)}
                     />
                   );
                 }
 
                 if (item.kind === "tool_result") {
-                  // Suppress the plain text result when a file_change follows
+                  // Suppress the plain text result when a file_change or plan_create follows
                   if (fileChangeIds.has(item.id)) return null;
+                  if (planCreateIds.has(item.id)) return null;
                   return (
                     <ToolResultBlock
                       key={i}
@@ -394,6 +420,12 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
               selected={selectedMode}
               onSelect={setSelectedMode}
             />
+            {attachedPlan && (
+              <>
+                <span className="text-text-ghost mx-1">&middot;</span>
+                <PlanBadge filename={attachedPlan} onClick={() => setPlanViewerOpen(true)} />
+              </>
+            )}
             <span className="text-text-ghost mx-1">&middot;</span>
             <ModelBadge model={resolveModel(selectedMode, config)} />
           </div>
@@ -435,6 +467,15 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
           </p>
         )}
       </div>
+
+      {/* Plan viewer overlay */}
+      {planViewerOpen && attachedPlan && (
+        <PlanViewer
+          sessionId={session.id}
+          filename={attachedPlan}
+          onClose={() => setPlanViewerOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -464,6 +505,20 @@ function ViewToggle({ view, onChange }: ViewToggleProps) {
         </button>
       ))}
     </div>
+  );
+}
+
+function PlanBadge({ filename, onClick }: { filename: string; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex items-center gap-1 text-[11px] font-mono text-text-ghost tracking-tight truncate max-w-[180px] hover:text-text-secondary transition-colors cursor-pointer"
+    >
+      <svg width="10" height="10" viewBox="0 0 16 16" fill="none" className="shrink-0">
+        <path d="M4 1h5.586a1 1 0 0 1 .707.293l3.414 3.414a1 1 0 0 1 .293.707V14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1Z" stroke="currentColor" strokeWidth="1.5" />
+      </svg>
+      {filename}
+    </button>
   );
 }
 

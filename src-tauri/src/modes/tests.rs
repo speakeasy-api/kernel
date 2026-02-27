@@ -188,37 +188,43 @@ fn builtin_modes_all_have_substantial_system_prompts() {
 }
 
 #[test]
-fn plan_mode_tools_are_read_only() {
+fn plan_mode_tools_include_read_write_and_plan_write() {
     let modes = builtin::builtin_modes();
     let plan = modes.iter().find(|m| m.name == "plan").unwrap();
-    let expected: Vec<String> = READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect();
+    let expected = combine_tool_sets(&[READ_WRITE_TOOLS, PLAN_WRITE_TOOLS]);
     assert_eq!(plan.allowed_tools, expected);
+    assert!(plan.allowed_tools.contains(&"plan_create".to_string()));
+    assert!(plan.allowed_tools.contains(&"plan_search".to_string()));
+    assert!(plan.allowed_tools.contains(&"fs_write".to_string()));
 }
 
 #[test]
-fn review_mode_tools_are_read_only() {
+fn review_mode_tools_include_plan_search() {
     let modes = builtin::builtin_modes();
     let review = modes.iter().find(|m| m.name == "review").unwrap();
-    let expected: Vec<String> = READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect();
+    let expected = combine_tool_sets(&[READ_ONLY_TOOLS, PLAN_READ_TOOLS]);
     assert_eq!(review.allowed_tools, expected);
+    assert!(review.allowed_tools.contains(&"plan_search".to_string()));
 }
 
 #[test]
-fn research_mode_tools_include_web() {
+fn research_mode_tools_include_web_and_plan_search() {
     let modes = builtin::builtin_modes();
     let research = modes.iter().find(|m| m.name == "research").unwrap();
-    let expected = combine_tool_sets(&[READ_ONLY_TOOLS, WEB_TOOLS]);
+    let expected = combine_tool_sets(&[READ_ONLY_TOOLS, WEB_TOOLS, PLAN_READ_TOOLS]);
     assert_eq!(research.allowed_tools, expected);
     assert!(research.allowed_tools.contains(&"web_search".to_string()));
     assert!(research.allowed_tools.contains(&"web_fetch".to_string()));
+    assert!(research.allowed_tools.contains(&"plan_search".to_string()));
 }
 
 #[test]
-fn implement_mode_has_full_tools() {
+fn implement_mode_has_full_tools_and_plan_search() {
     let modes = builtin::builtin_modes();
     let implement = modes.iter().find(|m| m.name == "implement").unwrap();
-    let expected: Vec<String> = FULL_TOOLS.iter().map(|s| s.to_string()).collect();
+    let expected = combine_tool_sets(&[FULL_TOOLS, PLAN_READ_TOOLS]);
     assert_eq!(implement.allowed_tools, expected);
+    assert!(implement.allowed_tools.contains(&"plan_search".to_string()));
 }
 
 // ---------------------------------------------------------------------------

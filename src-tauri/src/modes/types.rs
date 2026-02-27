@@ -50,6 +50,8 @@ pub const READ_ONLY_TOOLS: &[&str] = &["fs_read", "glob", "grep"];
 pub const READ_WRITE_TOOLS: &[&str] = &["fs_read", "fs_write", "glob", "grep"];
 pub const FULL_TOOLS: &[&str] = &["fs_read", "fs_write", "glob", "grep", "shell"];
 pub const WEB_TOOLS: &[&str] = &["web_search", "web_fetch"];
+pub const PLAN_WRITE_TOOLS: &[&str] = &["plan_create", "plan_search"];
+pub const PLAN_READ_TOOLS: &[&str] = &["plan_search"];
 
 pub fn combine_tool_sets(sets: &[&[&str]]) -> Vec<String> {
     let mut tools: Vec<String> = sets
