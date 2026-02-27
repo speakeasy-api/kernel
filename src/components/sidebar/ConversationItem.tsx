@@ -52,9 +52,17 @@ export function ConversationItem({
         <p className="truncate text-[12px] font-medium leading-snug">
           {label}
         </p>
-        <p className="mt-0.5 text-[10px] font-mono text-text-ghost tabular-nums">
-          {ago}
-        </p>
+        <div className="mt-0.5 flex items-center gap-1.5">
+          <span className="text-[10px] font-mono text-text-ghost tabular-nums">
+            {ago}
+          </span>
+          {summary.hasPlan && (
+            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" className="text-text-ghost">
+              <path d="M4 1h5.586a1 1 0 0 1 .707.293l3.414 3.414a1 1 0 0 1 .293.707V14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1Z" stroke="currentColor" strokeWidth="1.5" />
+              <path d="M5.5 8h5M5.5 10.5h3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            </svg>
+          )}
+        </div>
       </div>
     </button>
   );

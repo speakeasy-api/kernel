@@ -118,6 +118,10 @@ export function getAttachedPlan(sessionId: string): Promise<string | null> {
   return invoke<string | null>("get_attached_plan", { sessionId });
 }
 
+export function readPlanContent(sessionId: string): Promise<string | null> {
+  return invoke<string | null>("read_plan_content", { sessionId });
+}
+
 // -- File Revert --
 
 export type RevertResult =

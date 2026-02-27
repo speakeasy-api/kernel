@@ -86,6 +86,7 @@ pub fn run() {
             db::commands::insert_event,
             db::commands::events_since,
             db::commands::get_attached_plan,
+            db::commands::read_plan_content,
             // Config commands
             config::commands::load_project_config,
             config::commands::get_builtin_modes,

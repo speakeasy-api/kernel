@@ -10,6 +10,7 @@ import { ContextRing } from "./ContextRing";
 import { ToolCallBlock, ToolResultBlock } from "./ToolBlock";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { DiffView } from "./DiffView";
+import { PlanViewer } from "./PlanViewer";
 import { useLlmStream, type ChatItem } from "../../hooks/useLlmStream";
 import { cn } from "../../lib/cn";
 
@@ -92,6 +93,7 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
   const [agentContextLoading, setAgentContextLoading] = useState(false);
 
   const [attachedPlan, setAttachedPlan] = useState<string | null>(null);
+  const [planViewerOpen, setPlanViewerOpen] = useState(false);
 
   const busy = phase !== "idle";
 
@@ -215,6 +217,15 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     return set;
   }, [displayItems]);
 
+  // Pre-pass: build set of plan_create tool_use_ids to suppress their results
+  const planCreateIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const item of displayItems) {
+      if (item.kind === "tool_call" && item.name === "plan_create") set.add(item.id);
+    }
+    return set;
+  }, [displayItems]);
+
   // Use real API token count when available, fall back to chars/4 estimate
   const usedTokens = useMemo(() => {
     if (contextUsage) return contextUsage.inputTokens;
@@ -318,13 +329,15 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
                       key={i}
                       name={item.name}
                       input={item.input}
+                      onPlanClick={() => setPlanViewerOpen(true)}
                     />
                   );
                 }
 
                 if (item.kind === "tool_result") {
-                  // Suppress the plain text result when a file_change follows
+                  // Suppress the plain text result when a file_change or plan_create follows
                   if (fileChangeIds.has(item.id)) return null;
+                  if (planCreateIds.has(item.id)) return null;
                   return (
                     <ToolResultBlock
                       key={i}
@@ -410,7 +423,7 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
             {attachedPlan && (
               <>
                 <span className="text-text-ghost mx-1">&middot;</span>
-                <PlanBadge filename={attachedPlan} />
+                <PlanBadge filename={attachedPlan} onClick={() => setPlanViewerOpen(true)} />
               </>
             )}
             <span className="text-text-ghost mx-1">&middot;</span>
@@ -454,6 +467,15 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
           </p>
         )}
       </div>
+
+      {/* Plan viewer overlay */}
+      {planViewerOpen && attachedPlan && (
+        <PlanViewer
+          sessionId={session.id}
+          filename={attachedPlan}
+          onClose={() => setPlanViewerOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -486,11 +508,17 @@ function ViewToggle({ view, onChange }: ViewToggleProps) {
   );
 }
 
-function PlanBadge({ filename }: { filename: string }) {
+function PlanBadge({ filename, onClick }: { filename: string; onClick: () => void }) {
   return (
-    <span className="text-[11px] font-mono text-text-ghost tracking-tight truncate max-w-[180px]">
+    <button
+      onClick={onClick}
+      className="flex items-center gap-1 text-[11px] font-mono text-text-ghost tracking-tight truncate max-w-[180px] hover:text-text-secondary transition-colors cursor-pointer"
+    >
+      <svg width="10" height="10" viewBox="0 0 16 16" fill="none" className="shrink-0">
+        <path d="M4 1h5.586a1 1 0 0 1 .707.293l3.414 3.414a1 1 0 0 1 .293.707V14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1Z" stroke="currentColor" strokeWidth="1.5" />
+      </svg>
       {filename}
-    </span>
+    </button>
   );
 }
 

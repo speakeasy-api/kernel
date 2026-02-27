@@ -124,3 +124,35 @@ pub async fn get_attached_plan(
             e.to_string()
         })
 }
+
+#[tauri::command]
+#[instrument(skip(pool))]
+pub async fn read_plan_content(
+    pool: State<'_, SqlitePool>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    debug!(session_id, "cmd: read_plan_content");
+    let filename = match queries::get_attached_plan(&pool, &session_id).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            error!(error = %e, "read_plan_content: get_attached_plan failed");
+            return Err(e.to_string());
+        }
+    };
+    let session = queries::get_session(&pool, &session_id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "read_plan_content: get_session failed");
+            e.to_string()
+        })?
+        .ok_or_else(|| "session not found".to_string())?;
+    let path = std::path::Path::new(&session.project_path)
+        .join(".kernel/plans")
+        .join(&filename);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Error reading plan: {e}")),
+    }
+}
