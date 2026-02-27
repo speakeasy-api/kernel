@@ -14,13 +14,17 @@ interface PromptInputProps {
 export function PromptInput({ value, onChange, onSubmit, busy, onCancel, pinned, onPinToggle }: PromptInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [focused, setFocused] = useState(false);
+  const [multiline, setMultiline] = useState(false);
 
   const resize = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
+    const single = parseFloat(getComputedStyle(el).lineHeight) || 24;
     const maxH = 20 * 10;
-    el.style.height = `${Math.min(el.scrollHeight, maxH)}px`;
+    const h = Math.min(el.scrollHeight, maxH);
+    el.style.height = `${h}px`;
+    setMultiline(el.scrollHeight > single * 1.5 + 28);
   }, []);
 
   useEffect(() => {
@@ -48,7 +52,7 @@ export function PromptInput({ value, onChange, onSubmit, busy, onCancel, pinned,
   return (
     <div
       className={cn(
-        "group relative rounded-2xl border bg-surface-1 transition-all duration-200",
+        "group relative grid rounded-2xl border bg-surface-1 transition-all duration-200",
         focused
           ? "shadow-[0_0_0_1px_var(--color-border-default),0_8px_40px_-12px_rgba(0,0,0,0.5)]"
           : "shadow-[0_2px_20px_-4px_rgba(0,0,0,0.3)]",
@@ -61,7 +65,10 @@ export function PromptInput({ value, onChange, onSubmit, busy, onCancel, pinned,
       }}
     >
       {/* Pin toggle */}
-      <div className="absolute left-3 bottom-3">
+      <div className={cn(
+        "absolute left-3",
+        multiline ? "top-3.5" : "top-1/2 -translate-y-1/2",
+      )}>
         <button
           type="button"
           onClick={onPinToggle}
@@ -102,7 +109,7 @@ export function PromptInput({ value, onChange, onSubmit, busy, onCancel, pinned,
         autoComplete="off"
         spellCheck={false}
         className={cn(
-          "w-full resize-none bg-transparent pl-11 pr-14 pt-4 pb-3",
+          "w-full resize-none bg-transparent pl-12 pr-14 py-3",
           "text-[15px] leading-6 text-text-primary",
           "placeholder:text-text-ghost placeholder:font-light",
           "focus:outline-none",
@@ -111,7 +118,10 @@ export function PromptInput({ value, onChange, onSubmit, busy, onCancel, pinned,
       />
 
       {/* Submit / Cancel */}
-      <div className="absolute right-3 bottom-3">
+      <div className={cn(
+        "absolute right-3",
+        multiline ? "bottom-3" : "top-1/2 -translate-y-1/2",
+      )}>
         {busy ? (
           <button
             onClick={onCancel}
