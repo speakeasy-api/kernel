@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agentkit_bridge;
 pub mod anthropic;
 mod compaction;
 pub mod config;
