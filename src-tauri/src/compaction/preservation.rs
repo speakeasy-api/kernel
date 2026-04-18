@@ -55,30 +55,6 @@ impl PreservationRules {
         facts
     }
 
-    /// Determine which messages should never be removed (only compacted in place).
-    /// Returns indices of messages that are protected.
-    #[instrument(skip_all, fields(message_count = messages.len()))]
-    pub fn protected_message_indices(&self, messages: &[Message]) -> Vec<usize> {
-        let mut indices = Vec::new();
-        for (i, msg) in messages.iter().enumerate() {
-            let role = msg.role.to_lowercase();
-            if role == "system" || role == "user" {
-                indices.push(i);
-                continue;
-            }
-            // Also protect messages containing decision records or task state
-            if !extract_decision_records(&msg.content).is_empty()
-                || !extract_task_state(&msg.content).is_empty()
-            {
-                indices.push(i);
-            }
-        }
-        debug!(
-            protected_count = indices.len(),
-            "identified protected messages"
-        );
-        indices
-    }
 }
 
 fn extract_for_pattern(pattern: &PreservedPattern, content: &str) -> Vec<String> {
