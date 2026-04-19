@@ -29,7 +29,9 @@ use self::compaction::{
     AnyOfTrigger, KernelCompactionBackend, LargeToolResultTrigger, PersistSnapshotStrategy,
     PreservePinnedStrategy, TokenBudgetTrigger, TruncateToolResultsStrategy,
 };
-use self::convert::{build_message_meta, items_to_messages, messages_to_items_with_meta};
+use self::convert::{
+    build_message_meta, item_ordinal, items_to_messages, messages_to_items_with_meta,
+};
 use self::observer::{finish_reason_str, AgentRunState, TauriEventObserver};
 use self::tool::build_registry;
 
@@ -192,14 +194,18 @@ pub async fn run_agent_loop(
     watch_handle.abort();
     let _ = watch_handle.await;
 
-    // Persist any new items the observer captured per-turn. Using observer
-    // state instead of slicing the transcript is required because deep
-    // compaction can shrink the transcript below its initial length, which
-    // would otherwise make new items unobservable.
-    let new_items: Vec<Item> = {
-        let s = state.lock().map_err(|_| "observer state poisoned".to_string())?;
-        s.run_items.clone()
-    };
+    // Persist every new transcript item. `TurnFinished` only fires when a
+    // turn ends without tool calls, so relying on the observer misses every
+    // intermediate tool round. Instead, snapshot the driver's full transcript
+    // and keep items that have no DB ordinal metadata — those are the ones
+    // produced during this run (compaction summaries are `ItemKind::Context`
+    // and filtered out inside `items_to_messages`).
+    let snapshot = driver.snapshot();
+    let new_items: Vec<Item> = snapshot
+        .transcript
+        .into_iter()
+        .filter(|item| item_ordinal(item).is_none())
+        .collect();
     let new_messages = items_to_messages(&new_items);
     for msg in &new_messages {
         let _ = append_message(pool, session_id, msg).await;

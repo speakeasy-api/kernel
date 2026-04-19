@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use tracing::{debug, info, instrument, warn};
 
 use super::classify::{classify, ClassificationError, LlmClient};
-use super::model_registry::{ModelInfo, FALLBACK_MODEL};
+use super::model_registry::{canonical_model_id, ModelInfo, FALLBACK_MODEL};
 use super::reclassify::{reclassify, ReclassificationRequest};
 use super::types::*;
 use super::user_override::{apply_override, ModeOverriddenEvent, OverrideError};
@@ -110,10 +110,12 @@ fn resolve_model(
     known_model_ids: &HashSet<String>,
     config_default: Option<&str>,
 ) -> String {
-    // 1. Try the router-selected model (validated against catalog)
+    // 1. Try the router-selected model (validated against catalog).
+    // Match by canonical form so dot/dash rename variants both succeed.
     if let Some(m) = router_model {
         if !m.is_empty() {
-            if known_model_ids.contains(m) {
+            let canonical = canonical_model_id(m);
+            if known_model_ids.contains(&canonical) || known_model_ids.contains(m) {
                 debug!(model = %m, "router model validated against catalog");
                 return m.to_string();
             }

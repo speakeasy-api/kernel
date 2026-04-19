@@ -172,6 +172,16 @@ impl CompactionStrategy for PersistSnapshotStrategy {
             return Ok(result);
         }
 
+        // Last-chance cancel check. The backend summarizer already races
+        // against the token, but the user may press Esc in the narrow window
+        // between the LLM returning and this point — in which case we skip
+        // the snapshot write so the session's DB state reflects the cancel.
+        if let Some(token) = ctx.cancellation.as_ref() {
+            if token.is_cancelled() {
+                return Err(CompactionError::Cancelled);
+            }
+        }
+
         let messages = items_to_messages(&result.transcript);
         let summary_json = serde_json::to_string(&messages)
             .map_err(|e| CompactionError::Failed(format!("serialise snapshot: {e}")))?;

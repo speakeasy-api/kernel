@@ -353,6 +353,19 @@ pub async fn get_conversation_history(
     build_conversation_history(&*pool, &session_id).await
 }
 
+/// Look up the context window size for a model via the OpenRouter-backed
+/// registry. The UI uses this on session reload to seed the context ring
+/// before the first live usage event arrives.
+#[tauri::command]
+#[instrument(skip(registry))]
+pub async fn model_context_window(
+    model: String,
+    registry: State<'_, Arc<ModelRegistry>>,
+) -> Result<Option<u64>, String> {
+    registry.ensure_warm().await;
+    Ok(registry.context_length_for_model(&model))
+}
+
 #[derive(Clone, Serialize)]
 pub struct ConversationHistory {
     pub entries: Vec<HistoryEntry>,
@@ -675,7 +688,7 @@ pub async fn submit_prompt(
         let user_override = mode_override.clone();
         let config_default = config.models.default.clone();
 
-        let h: AgentHandoff = {
+        let mut h: AgentHandoff = {
             let input = router_input.clone();
             let rm = router_model;
             let uo = user_override;
@@ -699,6 +712,17 @@ pub async fn submit_prompt(
             .map_err(|e| format!("spawn_blocking failed: {e}"))?
             .map_err(|e| e.to_string())?
         };
+
+        // Align the resolved model ID with the catalog's canonical form
+        // so downstream usage (provider call, UI badge, context window
+        // lookup) all reference the same string OpenRouter actually
+        // accepts — e.g. `claude-sonnet-4-6` → `anthropic/claude-sonnet-4.6`.
+        if let Some(canonical) = registry.resolve_catalog_id(&h.model) {
+            if canonical != h.model {
+                tracing::debug!(from = %h.model, to = %canonical, "canonicalized model id");
+                h.model = canonical;
+            }
+        }
 
         // Persist classification for subsequent turns
         let classify_data = serde_json::json!({
@@ -783,10 +807,14 @@ pub async fn submit_prompt(
     let (full_text, accumulated_usage, model) = match stream_result {
         Ok((text, usage)) => (text, usage, model),
         Err(err) if is_model_unsupported_error(&err) => {
+            let fallback_model = registry
+                .resolve_catalog_id(FALLBACK_MODEL)
+                .unwrap_or_else(|| FALLBACK_MODEL.to_string());
+
             tracing::warn!(
                 model = %model,
                 error = %err,
-                fallback = FALLBACK_MODEL,
+                fallback = %fallback_model,
                 "model unsupported, retrying with fallback"
             );
 
@@ -794,7 +822,7 @@ pub async fn submit_prompt(
                 "llm-mode-resolved",
                 LlmModeResolved {
                     mode: handoff.mode_name.clone(),
-                    model: FALLBACK_MODEL.to_string(),
+                    model: fallback_model.clone(),
                     confidence: handoff.confidence,
                 },
             );
@@ -802,13 +830,13 @@ pub async fn submit_prompt(
             cancelled.store(false, Ordering::SeqCst);
 
             let fallback_context_window = registry
-                .context_length_for_model(FALLBACK_MODEL)
+                .context_length_for_model(&fallback_model)
                 .map(|n| n as usize)
                 .unwrap_or(DEFAULT_CONTEXT_WINDOW);
             let mut fallback_working = ctx.messages.clone();
             let (text, usage) = agentkit_bridge::run_agent_loop(
                 &handoff.system_prompt,
-                FALLBACK_MODEL,
+                &fallback_model,
                 &handoff.allowed_tools,
                 &session.project_path,
                 &app,
@@ -822,7 +850,7 @@ pub async fn submit_prompt(
                 fallback_context_window,
             )
             .await?;
-            (text, usage, FALLBACK_MODEL.to_string())
+            (text, usage, fallback_model)
         }
         Err(err) => return Err(err),
     };

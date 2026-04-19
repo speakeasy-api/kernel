@@ -53,8 +53,18 @@ impl CompactionBackend for KernelCompactionBackend {
     async fn summarize(
         &self,
         request: SummaryRequest,
-        _cancellation: Option<TurnCancellation>,
+        cancellation: Option<TurnCancellation>,
     ) -> Result<SummaryResult, CompactionError> {
+        // Fast path: if we've already been cancelled by the time the strategy
+        // invokes the backend, skip the LLM call entirely. This also prevents
+        // `PersistSnapshotStrategy` from committing a snapshot the user no
+        // longer wants — it short-circuits on our `Err` before the DB write.
+        if let Some(token) = cancellation.as_ref() {
+            if token.is_cancelled() {
+                return Err(CompactionError::Cancelled);
+            }
+        }
+
         // Decode pinned items (if any) supplied by `PreservePinnedStrategy`.
         let pinned_items: Vec<Item> = request
             .metadata
@@ -112,11 +122,25 @@ impl CompactionBackend for KernelCompactionBackend {
             &pinned_refs,
         );
 
-        let response = self
-            .client
-            .complete_system_async(&system_prompt, &user_prompt, &self.model, 4096)
-            .await
-            .map_err(|e| CompactionError::Failed(format!("LLM call: {e}")))?;
+        // Race the summarizer LLM call against the cancellation token so that
+        // pressing Esc during compaction aborts promptly rather than waiting
+        // for the provider to respond. Returning `Cancelled` here causes
+        // `PersistSnapshotStrategy` to skip the snapshot write.
+        let summarize_call =
+            self.client
+                .complete_system_async(&system_prompt, &user_prompt, &self.model, 4096);
+        let response = match cancellation.as_ref() {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(CompactionError::Cancelled),
+                res = summarize_call => {
+                    res.map_err(|e| CompactionError::Failed(format!("LLM call: {e}")))?
+                }
+            },
+            None => summarize_call
+                .await
+                .map_err(|e| CompactionError::Failed(format!("LLM call: {e}")))?,
+        };
 
         let parsed = parse_compactor_response(&response)
             .map_err(|e| CompactionError::Failed(format!("parse: {e}")))?;

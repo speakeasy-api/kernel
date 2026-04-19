@@ -97,6 +97,7 @@ pub fn run() {
             prompt_router::commands::revert_file,
             prompt_router::commands::get_conversation_context,
             prompt_router::commands::get_conversation_history,
+            prompt_router::commands::model_context_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
