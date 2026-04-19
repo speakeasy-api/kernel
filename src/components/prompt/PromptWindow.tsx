@@ -80,6 +80,7 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
   const [prompt, setPrompt] = useState("");
   const [pinned, setPinned] = useState(false);
   const { items, phase, resolvedMode, error, contextUsage, sessionCost, submit, cancel } = useLlmStream(session.id);
+  const activeModel = resolvedMode?.model ?? resolveModel(selectedMode, config);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
@@ -270,8 +271,11 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
     >
       <SessionBar session={session} onClose={onClose} />
 
-      {/* View toggle — full width, content centered */}
-      {items.some((i) => i.kind === "tool_call" || i.kind === "tool_result") && (
+      {/* View toggle — full width, content centered. Always shown once a
+          session has any history so the user can compare their PoV
+          (`conversation`) against what the model sees post-compaction
+          (`agent context`). */}
+      {items.length > 0 && (
         <div className="relative z-10 flex justify-center pt-3 pb-1 shrink-0">
           <ViewToggle view={historyView} onChange={setHistoryView} />
         </div>
@@ -446,7 +450,7 @@ export function PromptWindow({ session, modes, config, onClose }: PromptWindowPr
               </>
             )}
             <span className="text-text-ghost mx-1">&middot;</span>
-            <ModelBadge model={resolveModel(selectedMode, config)} />
+            <ModelBadge model={activeModel} />
           </div>
 
           <div className="flex items-center gap-2">

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { submitPrompt, cancelPrompt, getConversationHistory, getSessionCost, eventsSince } from "../lib/commands";
+import { submitPrompt, cancelPrompt, getConversationHistory, getSessionCost, getModelContextWindow, eventsSince } from "../lib/commands";
 import type { ContextBlock } from "../lib/commands";
 
 export interface DiffHunk {
@@ -211,11 +211,20 @@ export function useLlmStream(sessionId: string) {
     setSessionCost(null);
 
     let stale = false;
-    loadHistoryItems(sessionId).then((result) => {
+    loadHistoryItems(sessionId).then(async (result) => {
       if (stale) return;
       setItems(result.items);
       if (result.lastMode) {
         setResolvedMode(result.lastMode);
+        // Seed the context ring with the last-known model's window so the
+        // total doesn't reset to the hardcoded default after a restart.
+        // Input tokens stay at 0 until the next live UsageUpdated event.
+        try {
+          const window = await getModelContextWindow(result.lastMode.model);
+          if (!stale && window != null) {
+            setContextUsage((prev) => prev ?? { inputTokens: 0, contextWindow: window });
+          }
+        } catch { /* leave fallback in place */ }
       }
     });
     getSessionCost(sessionId)

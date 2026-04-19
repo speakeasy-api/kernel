@@ -95,6 +95,10 @@ export function getConversationHistory(sessionId: string) {
   return invoke<ConversationHistory>("get_conversation_history", { sessionId });
 }
 
+export function getModelContextWindow(model: string): Promise<number | null> {
+  return invoke<number | null>("model_context_window", { model });
+}
+
 export function submitPrompt(
   sessionId: string,
   prompt: string,
