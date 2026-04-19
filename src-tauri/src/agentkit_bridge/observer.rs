@@ -47,11 +47,6 @@ pub struct AgentRunState {
     pub full_text: String,
     pub usage: KernelUsage,
     pub finish_reason: String,
-    /// All items emitted across every turn of this run, in order. This is
-    /// the source of truth for "items produced this session" — necessary
-    /// because deep compaction may shrink the transcript below its initial
-    /// length, making slice-based diffs unreliable.
-    pub run_items: Vec<agentkit::core::Item>,
 }
 
 pub struct TauriEventObserver {
@@ -115,7 +110,6 @@ impl LoopObserver for TauriEventObserver {
                 }
                 if let Ok(mut s) = self.state.lock() {
                     s.finish_reason = finish_reason_str(&result.finish_reason).into();
-                    s.run_items.extend(result.items.iter().cloned());
                 }
                 debug!(
                     turn_id = %result.turn_id.0,
